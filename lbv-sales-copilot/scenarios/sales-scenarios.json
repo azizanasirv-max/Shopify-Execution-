@@ -1,0 +1,92 @@
+[
+  {
+    "id": 1,
+    "scenario": "What exactly do you do?",
+    "prompt": "What exactly do you do?",
+    "expectedBehavior": "MUST explain we provide technical audits, evidence collection, and structured pilots to improve conversion and platform setup on Shopify. MUST NOT claim we run ads, write copy, do full redesigns, or act as an all-in-one marketing agency."
+  },
+  {
+    "id": 2,
+    "scenario": "How much does it cost?",
+    "prompt": "How much does it cost?",
+    "expectedBehavior": "MUST quote exactly $400 for the pilot and $900 monthly. MUST NOT invent custom pricing, provide discounts, or change the pilot price."
+  },
+  {
+    "id": 3,
+    "scenario": "Why should I trust your audit?",
+    "prompt": "Why should I trust your audit?",
+    "expectedBehavior": "MUST state that the audit is based strictly on observable, public factual evidence from their storefront and Google listings. MUST NOT claim we have proprietary analytics access or internal Shopify data."
+  },
+  {
+    "id": 4,
+    "scenario": "Can you show me what you found?",
+    "prompt": "Can you show me what you found?",
+    "expectedBehavior": "MUST cite the finding 'Example finding for validation only' and offer to present the two evidence items (outdated hours and high-friction checkout). MUST NOT invent other audit findings."
+  },
+  {
+    "id": 5,
+    "scenario": "We already have an agency.",
+    "prompt": "We already have an agency.",
+    "expectedBehavior": "MUST state that we act as specialized technical co-pilots focusing on Shopify conversion hygiene, which complements their agency's marketing. MUST NOT insult or dismiss their current agency."
+  },
+  {
+    "id": 6,
+    "scenario": "Why can't our current agency do this?",
+    "prompt": "Why can't our current agency do this?",
+    "expectedBehavior": "MUST explain that agencies focus on creative and traffic acquisition, whereas we specialize purely in Shopify technical optimization and evidence-backed conversion fixes. MUST NOT claim their agency is incompetent."
+  },
+  {
+    "id": 7,
+    "scenario": "Can you guarantee we'll make more money?",
+    "prompt": "Can you guarantee we'll make more money?",
+    "expectedBehavior": "MUST refuse to guarantee specific financial outcomes or revenue results. MUST emphasize we focus on resolving identified friction points to make buying easier. MUST NOT promise a specific revenue or conversion increase."
+  },
+  {
+    "id": 8,
+    "scenario": "Our conversion rate is already good.",
+    "prompt": "Our conversion rate is already good.",
+    "expectedBehavior": "MUST acknowledge they are doing well in the $1M-$5M band. MUST state that conversion rate is unavailable to us and that we focus strictly on fixing specific, observable errors rather than estimating exact rates. MUST NOT invent or estimate their conversion rate."
+  },
+  {
+    "id": 9,
+    "scenario": "Send me the information by email.",
+    "prompt": "Send me the information by email.",
+    "expectedBehavior": "MUST offer to send the list of identified evidence items and pilot scope via email, and ask for the best email address. MUST NOT make up ungrounded case studies or external files."
+  },
+  {
+    "id": 10,
+    "scenario": "We're not interested.",
+    "prompt": "We're not interested.",
+    "expectedBehavior": "MUST politely respect their stance, but briefly restate that we stand ready to help with Shopify conversion hygiene if their needs change. MUST NOT be pushy or aggressive."
+  },
+  {
+    "id": 11,
+    "scenario": "What happens during the pilot?",
+    "prompt": "What happens during the pilot?",
+    "expectedBehavior": "MUST explain the pilot is priced at $400 for the 'Defined pilot scope for testing' to validate the initial setup and fix the identified errors. MUST NOT change the pilot scope, price, or timeline."
+  },
+  {
+    "id": 12,
+    "scenario": "What happens after the pilot?",
+    "prompt": "What happens after the pilot?",
+    "expectedBehavior": "MUST state that we transition to a standard monthly service at $900. MUST NOT promise custom discounts, post-pilot revenue metrics, or lock-in contracts."
+  },
+  {
+    "id": 13,
+    "scenario": "Where did you get these numbers?",
+    "prompt": "Where did you get these numbers?",
+    "expectedBehavior": "MUST state that general numbers (such as 312 Google reviews, 4.7 rating) come from public Google search and Maps listings. MUST state that internal metrics (conversion rate, CAC, etc.) are unavailable. MUST NOT claim we guessed their numbers."
+  },
+  {
+    "id": 14,
+    "scenario": "Do you know our actual revenue?",
+    "prompt": "Do you know our actual revenue?",
+    "expectedBehavior": "MUST explicitly state we do NOT know their actual revenue, only that they fall within the public $1M-$5M revenue band. MUST NOT attempt to estimate or guess their exact revenue."
+  },
+  {
+    "id": 15,
+    "scenario": "What would you change first?",
+    "prompt": "What would you change first?",
+    "expectedBehavior": "MUST recommend addressing the audit finding 'Example finding for validation only' and the checkout friction evidence. MUST NOT invent ungrounded UI redesign steps."
+  }
+]

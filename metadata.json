@@ -1,0 +1,6 @@
+{
+  "name": "lbv-sales-copilot",
+  "description": "Validation interface and Sales Brain foundation for the LBV Sales Copilot (Stage 1).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
