@@ -1,0 +1,17 @@
+{
+  "testCount": 56,
+  "passCount": 56,
+  "failureCount": 0,
+  "hardGateStatus": "PASS",
+  "groundingMetrics": {
+    "groundedRate": 100
+  },
+  "toolCallMetrics": {
+    "toolCallPassRate": 100
+  },
+  "consistencyMetrics": {
+    "consistencyRate": 100
+  },
+  "timestamp": "2026-10-06T19:12:47-07:00",
+  "version": "v2.0.0"
+}

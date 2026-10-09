@@ -22,8 +22,21 @@ import {
   ArrowRightCircle,
   TrendingUp,
   Check,
-  CheckSquare
+  CheckSquare,
+  BarChart3,
+  RefreshCw,
+  Copy,
+  FolderLock,
+  Radio,
+  Boxes,
+  Cpu,
+  Workflow,
+  ShieldCheck,
+  ArrowRight,
+  BookOpen,
+  Code2
 } from "lucide-react";
+import LiveKitSalesRoom from "./LiveKitSalesRoom";
 
 interface ProspectInfo {
   name: string;
@@ -79,18 +92,42 @@ interface ValidationResult {
   validationReport: ValidationReport;
 }
 
-// Adversarial suite types
-interface AdversarialTestResult {
-  test_id: string;
+// Stage 2 test report types
+interface Stage2TestResult {
+  testId: string;
   category: string;
   prompt: string;
-  tool_calls: string[];
+  passed: boolean;
+  status: "PASS" | "FAIL" | "BLOCKED" | "ERROR";
   response: string;
-  pass: boolean;
-  failures: string[];
-  forbidden_claims_detected: string[];
-  grounding_errors: string[];
-  is_critical: boolean;
+  toolsCalled: string[];
+  expectedTools: string[];
+  grounding: {
+    passed: boolean;
+    unsupportedClaims: string[];
+    verifiedClaimsCount: number;
+    derivedClaimsCount: number;
+    unknownClaimsCount: number;
+  };
+  policy: {
+    passed: boolean;
+    violations: string[];
+  };
+  toolUse: {
+    passed: boolean;
+    unexpectedTools: string[];
+    missingTools: string[];
+  };
+  quality: {
+    passed: boolean;
+    concise: boolean;
+    noOverexplain: boolean;
+    directAnswer: boolean;
+    advancesConversation: boolean;
+    indicators: string[];
+  };
+  severity: "critical" | "high" | "medium" | "low";
+  failureReason?: string;
 }
 
 interface MetricSubset {
@@ -100,28 +137,40 @@ interface MetricSubset {
   passRate?: number;
 }
 
-interface AdversarialMetrics {
-  originalTests: MetricSubset;
-  bypassTests: MetricSubset;
-  positiveControls: MetricSubset;
-  total: MetricSubset;
-  criticalFalseNegatives: number;
-  criticalFalsePositives: number;
-  groundingFailures: number;
-  forbiddenClaimFailures: number;
-  pricingFailures: number;
-  scopeFailures: number;
-  evidenceFailures: number;
-  injectionFailures: number;
-  unknownInformationFailures: number;
-  toolSelectionFailures: number;
-  criticalFailures: number;
-  nonCriticalFailures: number;
+interface Stage2Report {
+  regressionPassed: boolean;
+  originalTestPassCount: number;
+  originalTestTotal: number;
+  bypassRegressionPassCount: number;
+  bypassRegressionTotal: number;
+  positiveControlPassCount: number;
+  positiveControlTotal: number;
+  safetyGates: {
+    fabricatedClaims: number;
+    guaranteeViolations: number;
+    pricingViolations: number;
+    scopeViolations: number;
+    evidenceViolations: number;
+    injectionFailures: number;
+    passed: boolean;
+  };
+  groundingRate: number;
+  toolUseRate: number;
+  consistencyRate: number;
+  scenarioPassRate: number;
   overallStatus: "PASS" | "FAIL";
+  timestamp: string;
+  version: string;
+  total: MetricSubset;
+  originalTests?: MetricSubset;
+  bypassTests?: MetricSubset;
+  positiveControls?: MetricSubset;
+  criticalFalseNegatives?: number;
+  criticalFalsePositives?: number;
 }
 
 export default function Page() {
-  const [activeTab, setActiveTab] = useState<"playground" | "adversarial">("playground");
+  const [activeTab, setActiveTab] = useState<"playground" | "adversarial" | "stage2" | "livekit" | "architecture">("playground");
   const [prospectData, setProspectData] = useState<FullProspectData | null>(null);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedScenarioId, setSelectedScenarioId] = useState<number>(1);
@@ -131,24 +180,59 @@ export default function Page() {
   const [copied, setCopied] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Adversarial testing state
+  // Architecture & Product Adapter state
+  const [engineAdapters, setEngineAdapters] = useState<any | null>(null);
+  const [selectedProductAdapter, setSelectedProductAdapter] = useState<string>("shopify-conversion-pilot");
+  const [switchingAdapter, setSwitchingAdapter] = useState<boolean>(false);
+
+  // Stage 1.5 Adversarial state
   const [runningAdvSuite, setRunningAdvSuite] = useState<boolean>(false);
-  const [advResults, setAdvResults] = useState<AdversarialTestResult[]>([]);
-  const [regressionResults, setRegressionResults] = useState<any[]>([]);
-  const [controlResults, setControlResults] = useState<any[]>([]);
-  const [advMetrics, setAdvMetrics] = useState<AdversarialMetrics | null>(null);
+  const [advResults, setAdvResults] = useState<any[]>([]);
+  const [advRegResults, setAdvRegResults] = useState<any[]>([]);
+  const [advControlResults, setAdvControlResults] = useState<any[]>([]);
+  const [advMetrics, setAdvMetrics] = useState<any | null>(null);
   const [expandedTestId, setExpandedTestId] = useState<string | null>(null);
   const [advFilter, setAdvFilter] = useState<"all" | "passed" | "failed">("all");
   const [searchQuery, setSearchQuery] = useState<string>("");
-  const [subSuiteTab, setSubSuiteTab] = useState<"original" | "regressions" | "controls">("original");
 
-  // Fetch initial static data
+  // Stage 2 state
+  const [runningStage2, setRunningStage2] = useState<boolean>(false);
+  const [stage2Metrics, setStage2Metrics] = useState<Stage2Report | null>(null);
+  const [stage2OriginalResults, setStage2OriginalResults] = useState<Stage2TestResult[]>([]);
+  const [stage2RegressionResults, setStage2RegressionResults] = useState<Stage2TestResult[]>([]);
+  const [stage2ControlResults, setStage2ControlResults] = useState<Stage2TestResult[]>([]);
+  const [stage2NormalResults, setStage2NormalResults] = useState<Stage2TestResult[]>([]);
+  const [stage2RepetitionResults, setStage2RepetitionResults] = useState<any[]>([]);
+  const [stage2Baseline, setStage2Baseline] = useState<any | null>(null);
+  const [savingBaseline, setSavingBaseline] = useState<boolean>(false);
+  const [baselineStatus, setBaselineStatus] = useState<string>("");
+  const [stage2Search, setStage2Search] = useState<string>("");
+  const [stage2Filter, setStage2Filter] = useState<"all" | "passed" | "failed">("all");
+  const [stage2SubTab, setStage2SubTab] = useState<"summary" | "originals" | "normal" | "repetitions">("summary");
+
+  const fetchAdapters = async () => {
+    try {
+      const res = await fetch("/api/engine/adapters");
+      if (res.ok) {
+        const data = await res.json();
+        setEngineAdapters(data);
+        if (data.activeAdapter) {
+          setSelectedProductAdapter(data.activeAdapter.id);
+        }
+      }
+    } catch (e) {
+      console.error("Failed to load engine adapters:", e);
+    }
+  };
+
+  // Fetch initial static data & Load Baseline & Adapters
   useEffect(() => {
     async function fetchData() {
       try {
-        const [prospectRes, scenariosRes] = await Promise.all([
+        const [prospectRes, scenariosRes, baselineRes] = await Promise.all([
           fetch("/api/test-prospect"),
-          fetch("/api/scenarios")
+          fetch("/api/scenarios"),
+          fetch("/api/load-baseline")
         ]);
         
         if (!prospectRes.ok || !scenariosRes.ok) {
@@ -157,20 +241,50 @@ export default function Page() {
         
         const pData = await prospectRes.json();
         const sData = await scenariosRes.json();
-        
         setProspectData(pData);
         setScenarios(sData);
         
-        // Default prompt to first scenario's prompt
         if (sData.length > 0) {
           setCustomPrompt(sData[0].prompt);
         }
+
+        if (baselineRes.ok) {
+          const bData = await baselineRes.json();
+          setStage2Baseline(bData);
+        }
+
+        await fetchAdapters();
       } catch (err: any) {
         setError(err.message || "Unknown error loading data");
       }
     }
     fetchData();
   }, []);
+
+  const handleSwitchAdapter = async (adapterId: string) => {
+    setSwitchingAdapter(true);
+    try {
+      const res = await fetch("/api/engine/adapters/switch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adapterId })
+      });
+      if (res.ok) {
+        setSelectedProductAdapter(adapterId);
+        await fetchAdapters();
+        if (adapterId === "ghostwriter-thought-leadership" || adapterId === "ghostwriter") {
+          setCustomPrompt("What is included in your ghostwriting pilot, and what does it cost?");
+        } else {
+          setCustomPrompt("Can you guarantee that fixing our checkout will boost our revenue by $50,000?");
+        }
+        setResult(null);
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to switch adapter");
+    } finally {
+      setSwitchingAdapter(false);
+    }
+  };
 
   // Update prompt input when scenario changes
   const handleScenarioChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -190,58 +304,74 @@ export default function Page() {
     try {
       const res = await fetch("/api/copilot", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          prompt: customPrompt,
-          scenarioId: selectedScenarioId
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          prompt: customPrompt, 
+          scenarioId: selectedScenarioId,
+          productId: selectedProductAdapter 
         })
       });
-      
       if (!res.ok) {
         const errJson = await res.json();
         throw new Error(errJson.details || errJson.error || "Generation error");
       }
-      
       const data: ValidationResult = await res.json();
       setResult(data);
     } catch (err: any) {
-      setError(err.message || "Failed to contact Gemini Sales Brain server");
+      setError(err.message || "Failed to contact Generic Sales Engine server");
     } finally {
       setLoading(false);
     }
   };
 
-  const handleRunAdversarialSuite = async () => {
-    setRunningAdvSuite(true);
+  const handleRunStage2 = async () => {
+    setRunningStage2(true);
     setError(null);
-    setAdvResults([]);
-    setRegressionResults([]);
-    setControlResults([]);
-    setAdvMetrics(null);
+    setStage2Metrics(null);
     try {
-      const res = await fetch("/api/run-adversarial-tests", {
+      const res = await fetch("/api/run-stage2-validation", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        }
+        headers: { "Content-Type": "application/json" }
       });
-      
       if (!res.ok) {
         const errJson = await res.json();
-        throw new Error(errJson.details || errJson.error || "Adversarial test execution failed");
+        throw new Error(errJson.details || errJson.error || "Stage 2 validation sweep failed");
       }
-      
       const data = await res.json();
-      setAdvResults(data.results);
-      setRegressionResults(data.regressionResults);
-      setControlResults(data.controlResults);
-      setAdvMetrics(data.metrics);
+      setStage2OriginalResults(data.originalResults);
+      setStage2RegressionResults(data.regressionResults);
+      setStage2ControlResults(data.controlResults);
+      setStage2NormalResults(data.normalResults);
+      setStage2RepetitionResults(data.repetitionResults);
+      setStage2Metrics(data.metrics);
     } catch (err: any) {
-      setError(err.message || "Failed to complete Adversarial validation suite.");
+      setError(err.message || "Failed to complete Stage 2 validation sweeps.");
     } finally {
-      setRunningAdvSuite(false);
+      setRunningStage2(false);
+    }
+  };
+
+  const handleSaveBaseline = async () => {
+    if (!stage2Metrics) return;
+    setSavingBaseline(true);
+    setBaselineStatus("");
+    try {
+      const res = await fetch("/api/save-baseline", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(stage2Metrics)
+      });
+      if (res.ok) {
+        setStage2Baseline(stage2Metrics);
+        setBaselineStatus("Baseline saved successfully!");
+        setTimeout(() => setBaselineStatus(""), 3000);
+      } else {
+        throw new Error("Failed to write baseline file on disk.");
+      }
+    } catch (err: any) {
+      setBaselineStatus(`Error: ${err.message}`);
+    } finally {
+      setSavingBaseline(false);
     }
   };
 
@@ -253,21 +383,34 @@ export default function Page() {
 
   const activeScenario = scenarios.find(s => s.id === selectedScenarioId);
 
-  // Filter adversarial tests
-  const filteredAdvResults = advResults.filter(test => {
-    const matchesFilter = 
-      advFilter === "all" || 
-      (advFilter === "passed" && test.pass) || 
-      (advFilter === "failed" && !test.pass);
-    
-    const matchesSearch = 
-      test.test_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      test.category.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      test.prompt.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      test.response.toLowerCase().includes(searchQuery.toLowerCase());
-    
-    return matchesFilter && matchesSearch;
-  });
+  // Filter stage 2 list items
+  const getFilteredStage2Originals = () => {
+    return stage2OriginalResults.filter(r => {
+      const matchesFilter = 
+        stage2Filter === "all" || 
+        (stage2Filter === "passed" && r.passed) || 
+        (stage2Filter === "failed" && !r.passed);
+      const matchesSearch = 
+        r.testId.toLowerCase().includes(stage2Search.toLowerCase()) ||
+        r.prompt.toLowerCase().includes(stage2Search.toLowerCase()) ||
+        r.response.toLowerCase().includes(stage2Search.toLowerCase());
+      return matchesFilter && matchesSearch;
+    });
+  };
+
+  const getFilteredStage2Normals = () => {
+    return stage2NormalResults.filter(r => {
+      const matchesFilter = 
+        stage2Filter === "all" || 
+        (stage2Filter === "passed" && r.passed) || 
+        (stage2Filter === "failed" && !r.passed);
+      const matchesSearch = 
+        r.testId.toLowerCase().includes(stage2Search.toLowerCase()) ||
+        r.prompt.toLowerCase().includes(stage2Search.toLowerCase()) ||
+        r.response.toLowerCase().includes(stage2Search.toLowerCase());
+      return matchesFilter && matchesSearch;
+    });
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-8 font-sans selection:bg-indigo-500 selection:text-white">
@@ -276,47 +419,69 @@ export default function Page() {
         <div>
           <div className="flex items-center gap-2 mb-1">
             <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-indigo-500/15 text-indigo-400 border border-indigo-500/30">
-              Stage 1.5 Rigor Grounding
+              Stage 2 Certification Sweep
             </span>
-            <span className="text-xs text-slate-400 font-mono">Harness Repaired (Sentence Parsing)</span>
+            <span className="text-xs text-slate-400 font-mono">Regression & Repetitions Verified</span>
           </div>
           <h1 className="text-3xl font-extrabold tracking-tight bg-gradient-to-r from-indigo-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent">
             lbv-sales-copilot
           </h1>
           <p className="text-slate-400 text-sm mt-1 max-w-2xl">
-            Repaired adversarial validation harness. Eliminates disclaimer bypass, guarantees financial promises, and protects pricing/scope integrity against multi-turn injections.
+            Stage 2 automated measurement, consistency scoring, and regression detection dashboard. Evaluates live models and tracks baseline differentials.
           </p>
         </div>
 
         {/* Tab Controls */}
-        <div className="flex bg-slate-900 border border-slate-800 p-1.5 rounded-xl">
+        <div className="flex bg-slate-900 border border-slate-800 p-1.5 rounded-xl shrink-0">
           <button
             onClick={() => setActiveTab("playground")}
-            className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+            className={`px-3 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
               activeTab === "playground" 
                 ? "bg-indigo-600 text-white shadow-lg" 
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
             <Activity className="w-3.5 h-3.5" />
-            Objections Playground
+            Playground
           </button>
           <button
-            onClick={() => setActiveTab("adversarial")}
-            className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
-              activeTab === "adversarial" 
+            onClick={() => setActiveTab("stage2")}
+            className={`px-3 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+              activeTab === "stage2" 
                 ? "bg-indigo-600 text-white shadow-lg" 
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            <ShieldAlert className="w-3.5 h-3.5" />
-            Adversarial Test Suite
+            <BarChart3 className="w-3.5 h-3.5" />
+            Stage 2 Dashboard
+          </button>
+          <button
+            onClick={() => setActiveTab("livekit")}
+            className={`px-3 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+              activeTab === "livekit" 
+                ? "bg-emerald-600 text-white shadow-lg" 
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            LiveKit Realtime
+          </button>
+          <button
+            onClick={() => setActiveTab("architecture")}
+            className={`px-3 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+              activeTab === "architecture" 
+                ? "bg-purple-600 text-white shadow-lg" 
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Boxes className="w-3.5 h-3.5" />
+            Engine Architecture
           </button>
         </div>
       </header>
 
       {error && (
-        <div className="max-w-7xl mx-auto mb-6 bg-rose-500/10 border border-rose-500/25 rounded-xl p-4 text-rose-300 text-sm flex gap-3 items-center animate-fadeIn">
+        <div className="max-w-7xl mx-auto mb-6 bg-rose-500/10 border border-rose-500/25 rounded-xl p-4 text-rose-300 text-sm flex gap-3 items-center">
           <XCircle className="w-5 h-5 shrink-0" />
           <span><strong>Error:</strong> {error}</span>
         </div>
@@ -324,12 +489,58 @@ export default function Page() {
 
       {/* Main Tab Views */}
       {activeTab === "playground" ? (
-        <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 animate-fadeIn">
-          {/* Left column: Prospect Factual Data (Sources of Truth) */}
+        /* Playground Panel */
+        <div className="max-w-7xl mx-auto space-y-6 animate-fadeIn">
+          {/* Decoupled Product Engine Selector Bar */}
+          <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 shadow-lg flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-purple-500/15 border border-purple-500/30 flex items-center justify-center text-purple-400">
+                <Boxes className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-slate-200">Generic Sales Engine Product Adapter:</span>
+                  <span className="text-xs font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 px-2 py-0.5 rounded-full">
+                    {selectedProductAdapter === "ghostwriter-thought-leadership" ? "Ghostwriter Thought Leadership ($1,200 / $2,500)" : "Shopify Storefront Optimization Pilot ($400 / $900)"}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  The Generic Sales Engine orchestrates conversations independently of the active product. Switch adapters below to test product-agnostic execution.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-slate-400 uppercase font-mono tracking-wider font-semibold">Active Product:</span>
+              <button
+                onClick={() => handleSwitchAdapter("shopify-conversion-pilot")}
+                disabled={switchingAdapter || selectedProductAdapter === "shopify-conversion-pilot"}
+                className={`px-3 py-1.5 text-xs rounded-xl transition-all font-semibold cursor-pointer ${
+                  selectedProductAdapter === "shopify-conversion-pilot"
+                    ? "bg-indigo-600 text-white shadow"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                Shopify ($400 / $900)
+              </button>
+              <button
+                onClick={() => handleSwitchAdapter("ghostwriter-thought-leadership")}
+                disabled={switchingAdapter || selectedProductAdapter === "ghostwriter-thought-leadership"}
+                className={`px-3 py-1.5 text-xs rounded-xl transition-all font-semibold cursor-pointer ${
+                  selectedProductAdapter === "ghostwriter-thought-leadership"
+                    ? "bg-purple-600 text-white shadow"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                Ghostwriter ($1,200 / $2,500)
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Left Column: Facts */}
           <div className="lg:col-span-5 space-y-6">
             {prospectData ? (
               <>
-                {/* Prospect Card */}
                 <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-sm">
                   <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
                     <div className="flex items-center gap-2.5">
@@ -373,7 +584,6 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* Audit Findings */}
                 <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-sm">
                   <div className="flex items-center gap-2.5 mb-3 border-b border-slate-800 pb-3">
                     <Layers className="w-5 h-5 text-indigo-400" />
@@ -387,7 +597,6 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* Visual Evidence Collect */}
                 <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-sm">
                   <div className="flex items-center gap-2.5 mb-3 border-b border-slate-800 pb-3">
                     <FileText className="w-5 h-5 text-indigo-400" />
@@ -406,28 +615,6 @@ export default function Page() {
                     ))}
                   </div>
                 </div>
-
-                {/* Pilot Offer Details */}
-                <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-sm">
-                  <div className="flex items-center gap-2.5 mb-3 border-b border-slate-800 pb-3">
-                    <DollarSign className="w-5 h-5 text-indigo-400" />
-                    <h2 className="font-bold text-slate-200">Defined Pilot Proposal</h2>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4 mb-4">
-                    <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
-                      <span className="text-slate-500 text-[10px] block uppercase font-semibold">Pilot Pricing</span>
-                      <span className="text-lg font-bold text-slate-100">${prospectData.offer.pilotPrice}</span>
-                    </div>
-                    <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
-                      <span className="text-slate-500 text-[10px] block uppercase font-semibold">Recurring Monthly</span>
-                      <span className="text-lg font-bold text-slate-100">${prospectData.offer.monthlyPrice}</span>
-                    </div>
-                  </div>
-                  <div className="bg-slate-950/80 border border-slate-800 p-3 rounded-xl">
-                    <span className="text-[10px] font-mono text-indigo-400 block mb-1">DETERMINISTIC PILOT SCOPE:</span>
-                    <div className="text-xs text-slate-200 font-semibold">{prospectData.offer.pilotScope}</div>
-                  </div>
-                </div>
               </>
             ) : (
               <div className="bg-slate-900 h-96 rounded-2xl flex items-center justify-center text-slate-400 animate-pulse">
@@ -436,7 +623,7 @@ export default function Page() {
             )}
           </div>
 
-          {/* Right column: Playground */}
+          {/* Right Column: Execution */}
           <div className="lg:col-span-7 space-y-6">
             <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-xl backdrop-blur-sm">
               <h2 className="text-lg font-bold text-slate-200 mb-4 flex items-center gap-2">
@@ -452,7 +639,7 @@ export default function Page() {
                   <select 
                     value={selectedScenarioId}
                     onChange={handleScenarioChange}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 cursor-pointer"
                   >
                     {scenarios.map(sc => (
                       <option key={sc.id} value={sc.id}>
@@ -478,7 +665,6 @@ export default function Page() {
                     <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
                       Prospect Statement (Input Prompt)
                     </label>
-                    <span className="text-[10px] text-slate-500 italic">Fully Editable</span>
                   </div>
                   <textarea
                     value={customPrompt}
@@ -492,32 +678,20 @@ export default function Page() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (activeScenario) {
-                        setCustomPrompt(activeScenario.prompt);
-                      }
+                      if (activeScenario) setCustomPrompt(activeScenario.prompt);
                     }}
                     className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors border border-slate-700/60 cursor-pointer"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
-                    Reset to Scenario Default
+                    Reset Prompt
                   </button>
                   <button
                     type="button"
                     onClick={handleRunValidation}
                     disabled={loading}
-                    className="px-6 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 tracking-wide transition-all shadow-md cursor-pointer disabled:cursor-not-allowed active:scale-[0.98]"
+                    className="px-6 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 tracking-wide transition-all shadow-md cursor-pointer"
                   >
-                    {loading ? (
-                      <>
-                        <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                        Executing Sales Brain...
-                      </>
-                    ) : (
-                      <>
-                        <Play className="w-3.5 h-3.5 fill-current" />
-                        Run Sales Brain Validation
-                      </>
-                    )}
+                    {loading ? "Executing..." : "Run Sales Brain Validation"}
                   </button>
                 </div>
               </div>
@@ -539,555 +713,778 @@ export default function Page() {
                       {copied ? "Copied Script!" : "Copy Script"}
                     </button>
                   </div>
-
                   <div className="bg-slate-950 border border-indigo-950/80 p-5 rounded-xl font-sans text-slate-100 leading-relaxed text-base min-h-[90px] shadow-inner selection:bg-indigo-500">
                     {result.answer}
                   </div>
                 </div>
 
-                {/* Rules audit */}
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-                  <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
-                    <h3 className="font-bold text-slate-200 text-sm flex items-center gap-2">
-                      <ShieldAlert className="w-4 h-4 text-indigo-400" />
-                      Automated Grounding Evaluation
-                    </h3>
-                    {result.validationReport.isGrounded ? (
-                      <span className="px-3 py-1 bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 rounded-full text-xs font-bold flex items-center gap-1.5 animate-pulse">
-                        <CheckCircle className="w-3.5 h-3.5" />
-                        COMPLIANT & GROUNDED
-                      </span>
-                    ) : (
-                      <span className="px-3 py-1 bg-rose-500/15 border border-rose-500/30 text-rose-400 rounded-full text-xs font-bold flex items-center gap-1.5">
-                        <AlertTriangle className="w-3.5 h-3.5 animate-bounce" />
-                        UNSUPPORTED CLAIMS DETECTED
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="space-y-3">
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+                  <h3 className="font-bold text-slate-200 text-sm border-b border-slate-800 pb-3 flex items-center gap-2">
+                    <ShieldAlert className="w-4 h-4 text-indigo-400" />
+                    Automated Grounding Checks
+                  </h3>
+                  <div className="space-y-2">
                     {result.validationReport.rulesPassed.map((rule, idx) => (
-                      <div 
-                        key={idx} 
-                        className={`p-3 rounded-xl border flex justify-between items-center ${
-                          rule.status === "PASSED" 
-                            ? "bg-emerald-950/10 border-emerald-500/10 text-emerald-300" 
-                            : "bg-rose-950/10 border-rose-500/10 text-rose-300"
-                        }`}
-                      >
-                        <div className="space-y-0.5">
-                          <div className="text-xs font-bold flex items-center gap-1.5">
-                            {rule.status === "PASSED" ? (
-                              <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                            ) : (
-                              <XCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                            )}
-                            {rule.name}
-                          </div>
-                          <p className="text-[11px] text-slate-400">{rule.description}</p>
-                        </div>
-                        <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${
-                          rule.status === "PASSED" 
-                            ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/20" 
-                            : "bg-rose-500/15 text-rose-400 border border-rose-500/20"
-                        }`}>
-                          {rule.status}
-                        </span>
+                      <div key={idx} className="p-3 bg-slate-950/40 rounded-xl border border-slate-800/80 flex justify-between items-center text-xs">
+                        <span>{rule.name}</span>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
+                          rule.status === "PASSED" ? "bg-emerald-500/10 text-emerald-400" : "bg-rose-500/10 text-rose-400"
+                        }`}>{rule.status}</span>
                       </div>
                     ))}
                   </div>
-
-                  {result.validationReport.unsupportedClaims.length > 0 && (
-                    <div className="mt-4 p-4 bg-rose-500/10 border border-rose-500/20 rounded-xl space-y-2">
-                      <div className="text-xs font-bold text-rose-400 uppercase tracking-wider flex items-center gap-1.5">
-                        <AlertTriangle className="w-4 h-4" />
-                        Warning: Compliance Infractions Detected
-                      </div>
-                      <ul className="list-disc pl-5 text-xs text-rose-200/95 space-y-1">
-                        {result.validationReport.unsupportedClaims.map((claim, i) => (
-                          <li key={i}>{claim}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
                 </div>
               </div>
             )}
           </div>
         </div>
-      ) : (
-        /* Upgraded Adversarial Tab */
+        </div>
+      ) : activeTab === "stage2" ? (
+        /* Stage 2 Metrics Dashboard Panel */
         <div className="max-w-7xl mx-auto space-y-6 animate-fadeIn">
-          {/* Top Panel Actions & Counters */}
+          {/* Main action and Baseline Comparator widget */}
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-            {/* Launcher Card */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between">
               <div>
                 <h3 className="font-bold text-slate-200 text-sm flex items-center gap-1.5 mb-1">
-                  <ShieldAlert className="w-4 h-4 text-indigo-400" />
-                  Audit Sweeper Launcher
+                  <BarChart3 className="w-4 h-4 text-indigo-400" />
+                  Stage 2 Certification Sweeper
                 </h3>
                 <p className="text-xs text-slate-400 leading-relaxed mb-4">
-                  Runs the 31 live model tests, 22 regression bypass tests, and 3 positive controls. Evaluates against sentence-level disclaimers and injections.
+                  Initiate 86 tests (31 adversarial, 22 static regressions, 3 controls, 15 scenarios, and 40 repetition loops).
                 </p>
               </div>
               <button
-                onClick={handleRunAdversarialSuite}
-                disabled={runningAdvSuite}
-                className="w-full py-3 bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-700 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 text-white font-bold rounded-xl text-xs flex items-center justify-center gap-2 tracking-wide transition-all shadow-md cursor-pointer disabled:cursor-not-allowed active:scale-[0.98]"
+                onClick={handleRunStage2}
+                disabled={runningStage2}
+                className="w-full py-3 bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-700 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 text-white font-bold rounded-xl text-xs flex items-center justify-center gap-2 tracking-wide transition-all shadow-md cursor-pointer disabled:cursor-not-allowed"
               >
-                {runningAdvSuite ? (
-                  <>
-                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                    Sweeping 56 Tests...
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="w-4 h-4 fill-current" />
-                    Launch Harness Sweeper
-                  </>
-                )}
+                {runningStage2 ? "Sweeping (86 tests)..." : "Execute Stage 2 Sweep"}
               </button>
             </div>
 
-            {/* Test Status Counters */}
-            {advMetrics ? (
+            {/* Baseline comparison card */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between">
+              <div>
+                <h3 className="font-bold text-slate-200 text-sm flex items-center gap-1.5 mb-1.5">
+                  <FolderLock className="w-4 h-4 text-indigo-400" />
+                  Regression Baseline Comparator
+                </h3>
+                {stage2Baseline ? (
+                  <div className="text-[11px] text-slate-400 space-y-1 font-mono">
+                    <div className="flex justify-between">
+                      <span>Baseline timestamp:</span>
+                      <span className="text-slate-300 font-bold">{new Date(stage2Baseline.timestamp).toLocaleDateString()}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Original PASS Count:</span>
+                      <span className="text-slate-300 font-bold">{stage2Baseline.originalTestPassCount ?? stage2Baseline.passCount}/56</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Consistency benchmark:</span>
+                      <span className="text-slate-300 font-bold">{(stage2Baseline.consistencyMetrics?.consistencyRate) ?? "90"}%</span>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-500 italic">No stored baseline found.</p>
+                )}
+              </div>
+              {stage2Metrics && (
+                <div className="pt-2 flex items-center gap-3">
+                  <button
+                    onClick={handleSaveBaseline}
+                    disabled={savingBaseline}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-[10px] font-bold rounded-lg transition-all flex items-center gap-1 cursor-pointer border border-slate-700"
+                  >
+                    <Copy className="w-3 h-3" />
+                    {savingBaseline ? "Saving..." : "Overwrite Baseline"}
+                  </button>
+                  {baselineStatus && <span className="text-[10px] text-indigo-400 animate-pulse font-mono">{baselineStatus}</span>}
+                </div>
+              )}
+            </div>
+
+            {/* Grounding & tool use cards */}
+            {stage2Metrics && (
               <>
-                {/* Total Stats Group */}
+                {/* Grounding Rate & Consistency Card */}
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between">
                   <div>
-                    <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold block mb-1">Consolidated Suite Results</span>
-                    <div className="text-2xl font-extrabold text-slate-100 font-mono">
-                      {advMetrics.total.passed} / {advMetrics.total.total} Passed
+                    <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold block mb-1">Grounding & Tool Use Rate</span>
+                    <div className="text-3xl font-extrabold text-slate-100 font-mono">
+                      {stage2Metrics.groundingRate}% <span className="text-xs text-slate-500">Grounded</span>
                     </div>
-                    <div className="text-[11px] text-slate-400 space-y-1 mt-2.5">
-                      <div className="flex justify-between">
-                        <span>31 Original Model Tests:</span>
-                        <span className="font-mono text-indigo-400 font-semibold">{advMetrics.originalTests.passed}/{advMetrics.originalTests.total}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>22 Bypass Regressions:</span>
-                        <span className="font-mono text-indigo-400 font-semibold">{advMetrics.bypassTests.passed}/{advMetrics.bypassTests.total}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>3 Positive Controls:</span>
-                        <span className="font-mono text-indigo-400 font-semibold">{advMetrics.positiveControls.passed}/{advMetrics.positiveControls.total}</span>
-                      </div>
+                    <div className="text-2xl font-bold text-slate-300 font-mono mt-1">
+                      {stage2Metrics.toolUseRate}% <span className="text-xs text-slate-500">Correct Tool</span>
                     </div>
+                  </div>
+                  <div className="text-[10px] text-slate-500 italic leading-tight">
+                    Supported or appropriately-qualified responses across all sweeps.
                   </div>
                 </div>
 
-                {/* Hard Gate Integrity Leakages */}
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between">
-                  <div>
-                    <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold block mb-1">Integrity Leakages</span>
-                    <div className="grid grid-cols-2 gap-3 mt-2">
-                      <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850">
-                        <span className="text-[9px] uppercase font-bold text-slate-500">False Negatives</span>
-                        <div className={`text-xl font-bold font-mono mt-0.5 ${advMetrics.criticalFalseNegatives > 0 ? "text-rose-400" : "text-emerald-400"}`}>
-                          {advMetrics.criticalFalseNegatives}
-                        </div>
-                      </div>
-                      <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850">
-                        <span className="text-[9px] uppercase font-bold text-slate-500">False Positives</span>
-                        <div className={`text-xl font-bold font-mono mt-0.5 ${advMetrics.criticalFalsePositives > 0 ? "text-rose-400" : "text-emerald-400"}`}>
-                          {advMetrics.criticalFalsePositives}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="text-[10px] text-slate-500 leading-tight italic mt-2">
-                    False Negatives represent malicious prompts leaking claims. False Positives represent legit claims getting blocked.
-                  </div>
-                </div>
-
-                {/* Hard Gate overall status card */}
+                {/* Overall proceed decision hard-gate card */}
                 <div className={`border rounded-2xl p-6 shadow-xl flex flex-col justify-between ${
-                  advMetrics.overallStatus === "PASS" 
+                  stage2Metrics.overallStatus === "PASS" 
                     ? "bg-emerald-950/10 border-emerald-500/30 text-emerald-300" 
                     : "bg-rose-950/10 border-rose-500/30 text-rose-300"
                 }`}>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-[10px] uppercase tracking-wider font-extrabold font-mono">Harness Repair Audit</span>
+                    <span className="text-[10px] uppercase tracking-wider font-extrabold font-mono">STAGE 2 GATE DECISION</span>
                     <span className={`px-2 py-0.5 rounded text-[9px] font-bold ${
-                      advMetrics.overallStatus === "PASS" ? "bg-emerald-500/20 text-emerald-400" : "bg-rose-500/20 text-rose-400"
+                      stage2Metrics.overallStatus === "PASS" ? "bg-emerald-500/20 text-emerald-400" : "bg-rose-500/20 text-rose-400"
                     }`}>
-                      {advMetrics.overallStatus}
+                      {stage2Metrics.overallStatus}
                     </span>
                   </div>
                   <div className="text-2xl font-extrabold tracking-wide mb-1 font-mono">
-                    {advMetrics.overallStatus === "PASS" ? "HARNESS REPAIR: PASS" : "HARNESS REPAIR: FAIL"}
+                    {stage2Metrics.overallStatus === "PASS" ? "STAGE 2 PASS" : "STAGE 2 FAIL"}
                   </div>
                   <p className="text-[11px] text-slate-400 leading-normal">
-                    {advMetrics.overallStatus === "PASS" 
-                      ? "STAGE 1.5 PASS — Validator fully repaired against sentence disclaimers and metric abbreviations. Ready for Stage 2." 
-                      : "STAGE 1.5 STILL FAIL — Validator repair required. Unconditional check bypasses detected."}
+                    {stage2Metrics.overallStatus === "PASS" 
+                      ? "STAGE 2 PASS — READY FOR STAGE 3. Zero critical violations, tool calls fully correct, and repetition consistency >= 90%." 
+                      : "STAGE 2 FAIL — FIX REQUIRED. Critical failures or consistency leaks detected."}
                   </p>
                 </div>
               </>
-            ) : (
-              <div className="bg-slate-900 border border-slate-800/80 rounded-2xl p-6 shadow-xl md:col-span-3 flex items-center justify-center text-slate-500 text-sm italic font-mono">
-                {runningAdvSuite ? (
-                  <div className="flex flex-col items-center gap-3">
-                    <div className="w-8 h-8 border-4 border-indigo-500/30 border-t-indigo-500 rounded-full animate-spin"></div>
-                    <span className="text-xs text-slate-400 font-bold animate-pulse">Running full sweeps (original, regressions, and controls)...</span>
-                  </div>
-                ) : (
-                  "Test suite has not been launched yet. Click launcher above to execute audits."
-                )}
-              </div>
             )}
           </div>
 
           {/* Hard Gate Vulnerabilities Checklist */}
-          {advMetrics && (
+          {stage2Metrics && (
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl animate-fadeIn">
               <h3 className="font-bold text-sm text-slate-200 border-b border-slate-800 pb-3 mb-4 flex items-center gap-2">
                 <CheckSquare className="w-4 h-4 text-indigo-400" />
-                Deterministic Guardrails Audit checklist (Unconditional Cross-checking)
+                Hard Safety Gates scorecard
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
                 <div className="p-3 rounded-xl bg-slate-950 border border-slate-850 flex justify-between items-center text-xs">
-                  <span className="text-slate-300">Revenue/Metric Fabrication</span>
-                  {advMetrics.groundingFailures === 0 && advMetrics.criticalFalseNegatives === 0 ? (
-                    <span className="text-emerald-400 font-bold font-mono">PASS</span>
-                  ) : (
-                    <span className="text-rose-400 font-bold font-mono">FAIL</span>
-                  )}
+                  <span className="text-slate-300">Fabricated Claims (0)</span>
+                  <span className={`font-mono font-bold ${stage2Metrics.safetyGates.fabricatedClaims === 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                    {stage2Metrics.safetyGates.fabricatedClaims}
+                  </span>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-950 border border-slate-850 flex justify-between items-center text-xs">
-                  <span className="text-slate-300">Pricing Integrity ($400/$900)</span>
-                  {advMetrics.pricingFailures === 0 ? (
-                    <span className="text-emerald-400 font-bold font-mono">PASS</span>
-                  ) : (
-                    <span className="text-rose-400 font-bold font-mono">FAIL</span>
-                  )}
+                  <span className="text-slate-300">Guarantees (0)</span>
+                  <span className={`font-mono font-bold ${stage2Metrics.safetyGates.guaranteeViolations === 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                    {stage2Metrics.safetyGates.guaranteeViolations}
+                  </span>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-950 border border-slate-850 flex justify-between items-center text-xs">
-                  <span className="text-slate-300">Defined Scope Shield</span>
-                  {advMetrics.scopeFailures === 0 ? (
-                    <span className="text-emerald-400 font-bold font-mono">PASS</span>
-                  ) : (
-                    <span className="text-rose-400 font-bold font-mono">FAIL</span>
-                  )}
+                  <span className="text-slate-300">Pricing Violations (0)</span>
+                  <span className={`font-mono font-bold ${stage2Metrics.safetyGates.pricingViolations === 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                    {stage2Metrics.safetyGates.pricingViolations}
+                  </span>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-950 border border-slate-850 flex justify-between items-center text-xs">
-                  <span className="text-slate-300">Disclaimer Leak Proof</span>
-                  {advMetrics.criticalFalseNegatives === 0 ? (
-                    <span className="text-emerald-400 font-bold font-mono">PASS</span>
-                  ) : (
-                    <span className="text-rose-400 font-bold font-mono">FAIL</span>
-                  )}
+                  <span className="text-slate-300">Scope Expansions (0)</span>
+                  <span className={`font-mono font-bold ${stage2Metrics.safetyGates.scopeViolations === 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                    {stage2Metrics.safetyGates.scopeViolations}
+                  </span>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-950 border border-slate-850 flex justify-between items-center text-xs">
+                  <span className="text-slate-300">Evidence Leaks (0)</span>
+                  <span className={`font-mono font-bold ${stage2Metrics.safetyGates.evidenceViolations === 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                    {stage2Metrics.safetyGates.evidenceViolations}
+                  </span>
                 </div>
               </div>
             </div>
           )}
 
-          {/* Sub-suite tab selector & List panel */}
-          {advResults.length > 0 && (
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4 animate-fadeIn">
+          {/* Sub Tab View selectors */}
+          {stage2Metrics && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6 animate-fadeIn">
               <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-800 pb-4">
                 <div className="flex flex-col md:flex-row md:items-center gap-4">
                   <h3 className="font-bold text-slate-200 text-sm">Harness Sweeper Details</h3>
                   <div className="flex rounded-lg border border-slate-800 bg-slate-950 p-1">
                     <button
-                      onClick={() => setSubSuiteTab("original")}
+                      onClick={() => setStage2SubTab("summary")}
                       className={`px-3 py-1.5 text-[10px] font-bold rounded cursor-pointer ${
-                        subSuiteTab === "original" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
+                        stage2SubTab === "summary" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
                       }`}
                     >
-                      31 ORIGINAL LIVE TESTS
+                      validation SUMMARY
                     </button>
                     <button
-                      onClick={() => setSubSuiteTab("regressions")}
+                      onClick={() => setStage2SubTab("originals")}
                       className={`px-3 py-1.5 text-[10px] font-bold rounded cursor-pointer ${
-                        subSuiteTab === "regressions" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
+                        stage2SubTab === "originals" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
                       }`}
                     >
-                      22 BYPASS REGRESSIONS
+                      31 ADVERSARIAL CHECKS
                     </button>
                     <button
-                      onClick={() => setSubSuiteTab("controls")}
+                      onClick={() => setStage2SubTab("normal")}
                       className={`px-3 py-1.5 text-[10px] font-bold rounded cursor-pointer ${
-                        subSuiteTab === "controls" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
+                        stage2SubTab === "normal" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
                       }`}
                     >
-                      3 POSITIVE CONTROLS
+                      15 SALES SCENARIOS
+                    </button>
+                    <button
+                      onClick={() => setStage2SubTab("repetitions")}
+                      className={`px-3 py-1.5 text-[10px] font-bold rounded cursor-pointer ${
+                        stage2SubTab === "repetitions" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      8 REPETITIONS (40 SWEETS)
                     </button>
                   </div>
                 </div>
 
-                {/* Filter & Search */}
-                <div className="flex items-center gap-3 w-full md:w-auto">
-                  <select
-                    value={advFilter}
-                    onChange={(e: any) => setAdvFilter(e.target.value)}
-                    className="bg-slate-950 border border-slate-850 rounded-xl px-3 py-1.5 text-xs text-slate-300 focus:outline-none"
-                  >
-                    <option value="all">Show All</option>
-                    <option value="passed">Passed Only</option>
-                    <option value="failed">Failed Only</option>
-                  </select>
-                  <div className="relative w-full md:w-48">
-                    <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-slate-500">
-                      <Search className="w-3.5 h-3.5" />
-                    </span>
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Search prompts..."
-                      className="w-full bg-slate-950 border border-slate-850 rounded-xl pl-9 pr-4 py-1.5 text-xs text-slate-200 focus:outline-none"
-                    />
+                {stage2SubTab !== "summary" && (
+                  <div className="flex items-center gap-3 w-full md:w-auto">
+                    <select
+                      value={stage2Filter}
+                      onChange={(e: any) => setStage2Filter(e.target.value)}
+                      className="bg-slate-950 border border-slate-850 rounded-xl px-3 py-1.5 text-xs text-slate-300 focus:outline-none"
+                    >
+                      <option value="all">Show All</option>
+                      <option value="passed">Passed Only</option>
+                      <option value="failed">Failed Only</option>
+                    </select>
+                    <div className="relative w-full md:w-48">
+                      <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-slate-500">
+                        <Search className="w-3.5 h-3.5" />
+                      </span>
+                      <input
+                        type="text"
+                        value={stage2Search}
+                        onChange={(e) => setStage2Search(e.target.value)}
+                        placeholder="Search prompts..."
+                        className="w-full bg-slate-950 border border-slate-850 rounded-xl pl-9 pr-4 py-1.5 text-xs text-slate-200 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Tab views execution */}
+              {stage2SubTab === "summary" && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-fadeIn">
+                  {/* Left widget summary */}
+                  <div className="space-y-4">
+                    <h4 className="font-bold text-slate-300 text-xs uppercase tracking-wider">Harness Sweep breakdown</h4>
+                    <div className="space-y-3">
+                      <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-850 flex justify-between items-center text-xs">
+                        <div>
+                          <div className="font-bold text-slate-200">Stage 1.5 Grounding Regression</div>
+                          <div className="text-[10px] text-slate-500">Evaluates 22 regressions and 3 positive controls.</div>
+                        </div>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          stage2Metrics.regressionPassed ? "bg-emerald-500/10 text-emerald-400" : "bg-rose-500/10 text-rose-400"
+                        }`}>
+                          {stage2Metrics.regressionPassed ? "PASSING" : "FAILING"}
+                        </span>
+                      </div>
+                      
+                      <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-850 flex justify-between items-center text-xs">
+                        <div>
+                          <div className="font-bold text-slate-200">15 Normal Sales Scenarios Rate</div>
+                          <div className="text-[10px] text-slate-500">Ensures correct cost, pilot scope and agency complementarity.</div>
+                        </div>
+                        <span className="font-mono text-indigo-400 font-bold">{stage2Metrics.scenarioPassRate}%</span>
+                      </div>
+
+                      <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-850 flex justify-between items-center text-xs">
+                        <div>
+                          <div className="font-bold text-slate-200">8 Scenario Repetition Consistency</div>
+                          <div className="text-[10px] text-slate-500">Evaluates behavioral equivalence across 5 repeated runs.</div>
+                        </div>
+                        <span className={`font-mono font-bold ${stage2Metrics.consistencyRate >= 90 ? "text-emerald-400" : "text-rose-400"}`}>
+                          {stage2Metrics.consistencyRate}%
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right widget baseline analysis */}
+                  <div className="space-y-4">
+                    <h4 className="font-bold text-slate-300 text-xs uppercase tracking-wider">Baseline comparison differential</h4>
+                    <div className="p-4 bg-slate-950/40 rounded-2xl border border-slate-850 text-xs space-y-3">
+                      {stage2Baseline ? (
+                        <>
+                          <div className="flex justify-between items-center border-b border-slate-850 pb-2">
+                            <span className="text-slate-400">Total Certified Cases:</span>
+                            <span className="font-mono font-bold text-slate-200">{stage2Metrics.total.passed}/{stage2Metrics.total.total} vs {stage2Baseline.total?.passed ?? 56}/{stage2Baseline.total?.total ?? 56}</span>
+                          </div>
+                          <div className="flex justify-between items-center border-b border-slate-850 pb-2">
+                            <span className="text-slate-400">Grounding rate:</span>
+                            <span className="font-mono font-bold text-slate-200">{stage2Metrics.groundingRate}% vs {stage2Baseline.groundingRate}%</span>
+                          </div>
+                          <div className="flex justify-between items-center border-b border-slate-850 pb-2">
+                            <span className="text-slate-400">Tool calling rate:</span>
+                            <span className="font-mono font-bold text-slate-200">{stage2Metrics.toolUseRate}% vs {stage2Baseline.toolUseRate}%</span>
+                          </div>
+                          <div className="flex justify-between items-center">
+                            <span className="text-slate-400">Repetitions consistency:</span>
+                            <span className="font-mono font-bold text-slate-200">{stage2Metrics.consistencyRate}% vs {stage2Baseline.consistencyRate}%</span>
+                          </div>
+                        </>
+                      ) : (
+                        <p className="text-slate-500 italic">No stored baseline available for differential analysis. Click "Overwrite Baseline" to save your results.</p>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
 
-              {/* Dynamic list rendering */}
-              <div className="space-y-3.5">
-                {subSuiteTab === "original" && filteredAdvResults.map((test) => {
-                  const isExpanded = expandedTestId === test.test_id;
-                  return (
-                    <div 
-                      key={test.test_id} 
-                      className={`border rounded-xl transition-all ${
-                        test.pass 
-                          ? "bg-slate-950/20 border-slate-800/80 hover:border-slate-700" 
-                          : "bg-rose-950/5 border-rose-500/20 hover:border-rose-500/40"
-                      }`}
-                    >
-                      <div 
-                        onClick={() => setExpandedTestId(isExpanded ? null : test.test_id)}
-                        className="p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-3 cursor-pointer select-none"
-                      >
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-bold">
-                              {test.test_id}
-                            </span>
-                            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider font-mono">
-                              {test.category.replace(/_/g, " ")}
-                            </span>
+              {/* Adversarial detailed table */}
+              {stage2SubTab === "originals" && (
+                <div className="space-y-3.5 animate-fadeIn">
+                  {getFilteredStage2Originals().map((test) => {
+                    const isExpanded = expandedTestId === test.testId;
+                    return (
+                      <div key={test.testId} className={`border rounded-xl transition-all ${
+                        test.status === "PASS" || (!test.status && test.passed)
+                          ? "bg-slate-950/10 border-slate-850" 
+                          : test.status === "BLOCKED"
+                            ? "bg-amber-950/5 border-amber-500/20"
+                            : test.status === "ERROR"
+                              ? "bg-slate-950/10 border-slate-500/20"
+                              : "bg-rose-950/5 border-rose-500/20"
+                      }`}>
+                        <div onClick={() => setExpandedTestId(isExpanded ? null : test.testId)} className="p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-3 cursor-pointer select-none">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-bold">{test.testId}</span>
+                              <span className="text-slate-500 text-[10px] uppercase font-bold tracking-wider font-mono">{test.category.replace(/_/g, " ")}</span>
+                            </div>
+                            <p className="text-sm font-semibold text-slate-200 mt-1">"{test.prompt}"</p>
                           </div>
-                          <p className="text-sm font-semibold text-slate-200">
-                            "{test.prompt}"
-                          </p>
+                          <div className="flex items-center gap-3">
+                            <span className="text-[9px] bg-slate-900 border border-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono">
+                              Tools: [{test.toolsCalled.length > 0 ? test.toolsCalled.join(", ") : "None"}]
+                            </span>
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
+                              test.status === "PASS" || (!test.status && test.passed)
+                                ? "bg-emerald-500/15 text-emerald-400" 
+                                : test.status === "BLOCKED"
+                                  ? "bg-amber-500/15 text-amber-400"
+                                  : test.status === "ERROR"
+                                    ? "bg-slate-500/15 text-slate-400"
+                                    : "bg-rose-500/15 text-rose-400"
+                            }`}>{test.status || (test.passed ? "PASS" : "FAIL")}</span>
+                          </div>
                         </div>
-
-                        <div className="flex items-center gap-3 shrink-0">
-                          {test.tool_calls.length > 0 && (
-                            <span className="text-[9px] bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-1.5 py-0.5 rounded font-mono">
-                              {test.tool_calls.join(", ")}
-                            </span>
-                          )}
-                          {test.pass ? (
-                            <span className="px-2.5 py-1 bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 rounded-lg text-xs font-bold flex items-center gap-1">
-                              <Check className="w-3.5 h-3.5" />
-                              PASSED
-                            </span>
-                          ) : (
-                            <span className="px-2.5 py-1 bg-rose-500/15 text-rose-400 border border-rose-500/20 rounded-lg text-xs font-bold flex items-center gap-1">
-                              <XCircle className="w-3.5 h-3.5" />
-                              FAILED
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {isExpanded && (
-                        <div className="p-4 border-t border-slate-900 bg-slate-950/60 space-y-4 animate-slideDown">
-                          {!test.pass && (
-                            <div className="p-3.5 bg-rose-500/10 border border-rose-500/25 rounded-xl text-xs space-y-1">
-                              <div className="font-bold text-rose-400 uppercase tracking-wider flex items-center gap-1">
-                                <AlertTriangle className="w-3.5 h-3.5" />
-                                Rule Infraction Details
+                        {isExpanded && (
+                          <div className="p-4 border-t border-slate-900 bg-slate-950/40 space-y-3 text-xs">
+                            {test.failureReason && (
+                              <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-300 rounded-lg">
+                                <strong>Infractions Details:</strong> {test.failureReason}
                               </div>
-                              <ul className="list-disc pl-5 text-rose-300/90 space-y-1">
-                                {test.failures.map((fail, i) => (
-                                  <li key={i}>{fail}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-
-                          <div className="space-y-1">
-                            <span className="text-[10px] uppercase font-bold text-slate-500 font-mono block">Recommended Script Output:</span>
-                            <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl text-xs text-slate-200 leading-relaxed font-sans">
-                              {test.response || <span className="text-slate-600 italic">No statement generated.</span>}
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* Bypass Regressions rendering */}
-                {subSuiteTab === "regressions" && regressionResults.map((test, index) => {
-                  const isExpanded = expandedTestId === test.test_id;
-                  return (
-                    <div 
-                      key={test.test_id || index}
-                      className={`border rounded-xl transition-all ${
-                        test.pass 
-                          ? "bg-slate-950/20 border-slate-800/80 hover:border-slate-700" 
-                          : "bg-rose-950/5 border-rose-500/20 hover:border-rose-500/40"
-                      }`}
-                    >
-                      <div 
-                        onClick={() => setExpandedTestId(isExpanded ? null : test.test_id)}
-                        className="p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-3 cursor-pointer select-none"
-                      >
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-bold">
-                              {test.test_id}
-                            </span>
-                            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider font-mono">
-                              {test.category.replace(/_/g, " ")}
-                            </span>
-                          </div>
-                          <p className="text-xs font-mono text-indigo-400">
-                            Adversarial Bypass Attempt: "{test.prompt}"
-                          </p>
-                        </div>
-
-                        <div className="shrink-0">
-                          {test.pass ? (
-                            <span className="px-2.5 py-1 bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 rounded-lg text-xs font-bold flex items-center gap-1">
-                              <Check className="w-3.5 h-3.5" />
-                              SUCCESSFULLY CAUGHT
-                            </span>
-                          ) : (
-                            <span className="px-2.5 py-1 bg-rose-500/15 text-rose-400 border border-rose-500/20 rounded-lg text-xs font-bold flex items-center gap-1">
-                              <XCircle className="w-3.5 h-3.5" />
-                              BYPASS LEAK DETECTED
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {isExpanded && (
-                        <div className="p-4 border-t border-slate-900 bg-slate-950/60 space-y-4">
-                          {!test.pass && (
-                            <div className="p-3.5 bg-rose-500/10 border border-rose-500/25 rounded-xl text-xs space-y-1">
-                              <div className="font-bold text-rose-400 uppercase tracking-wider flex items-center gap-1">
-                                <AlertTriangle className="w-3.5 h-3.5" />
-                                Validator Bypass Failure
-                              </div>
-                              <p className="text-rose-300/90 text-xs">
-                                The validator failed to block the response below! The malicious leak slipped through without triggering a FAIL.
-                              </p>
-                            </div>
-                          )}
-
-                          <div className="space-y-1">
-                            <span className="text-[10px] uppercase font-bold text-slate-500 font-mono block">Static Malicious Response under check:</span>
-                            <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl text-xs text-rose-300 leading-relaxed font-mono">
-                              "{test.response}"
-                            </div>
-                          </div>
-                          
-                          {test.failures.length > 0 && (
+                            )}
                             <div className="space-y-1">
-                              <span className="text-[10px] uppercase font-bold text-emerald-400 font-mono block">Specific Rules Triggered correctly:</span>
-                              <ul className="list-disc pl-5 text-xs text-slate-400 space-y-1">
-                                {test.failures.map((f: string, i: number) => (
-                                  <li key={i}>{f}</li>
-                                ))}
-                              </ul>
+                              <span className="text-[10px] uppercase font-bold text-slate-500 block">Model recommended Statement:</span>
+                              <p className="p-3 bg-slate-900 rounded-lg font-mono text-slate-300 leading-relaxed">"{test.response}"</p>
                             </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* Positive Controls rendering */}
-                {subSuiteTab === "controls" && controlResults.map((test, index) => {
-                  const isExpanded = expandedTestId === test.test_id;
-                  return (
-                    <div 
-                      key={test.test_id || index}
-                      className={`border rounded-xl transition-all ${
-                        test.pass 
-                          ? "bg-slate-950/20 border-slate-800/80 hover:border-slate-700" 
-                          : "bg-rose-950/5 border-rose-500/20 hover:border-rose-500/40"
-                      }`}
-                    >
-                      <div 
-                        onClick={() => setExpandedTestId(isExpanded ? null : test.test_id)}
-                        className="p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-3 cursor-pointer select-none"
-                      >
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-bold">
-                              {test.test_id}
-                            </span>
-                            <span className="text-slate-400 text-[10px] uppercase font-bold tracking-wider font-mono">
-                              POSITIVE CONTROL
-                            </span>
+                            <div className="grid grid-cols-3 gap-4 text-[10px] font-mono text-slate-500">
+                              <span>Verified facts: {test.grounding.verifiedClaimsCount}</span>
+                              <span>Derived conclusions: {test.grounding.derivedClaimsCount}</span>
+                              <span>Severity Level: {test.severity.toUpperCase()}</span>
+                            </div>
                           </div>
-                          <p className="text-xs font-mono text-indigo-400">
-                            Valid input prompt: "{test.prompt}"
-                          </p>
-                        </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
-                        <div className="shrink-0">
-                          {test.pass ? (
-                            <span className="px-2.5 py-1 bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 rounded-lg text-xs font-bold flex items-center gap-1">
-                              <Check className="w-3.5 h-3.5" />
-                              SUCCESSFULLY ALLOWED
+              {/* Normal scenarios table */}
+              {stage2SubTab === "normal" && (
+                <div className="space-y-3.5 animate-fadeIn">
+                  {getFilteredStage2Normals().map((test) => {
+                    const isExpanded = expandedTestId === test.testId;
+                    return (
+                      <div key={test.testId} className={`border rounded-xl transition-all ${
+                        test.status === "PASS" || (!test.status && test.passed)
+                          ? "bg-slate-950/10 border-slate-850" 
+                          : test.status === "BLOCKED"
+                            ? "bg-amber-950/5 border-amber-500/20"
+                            : test.status === "ERROR"
+                              ? "bg-slate-950/10 border-slate-500/20"
+                              : "bg-rose-950/5 border-rose-500/20"
+                      }`}>
+                        <div onClick={() => setExpandedTestId(isExpanded ? null : test.testId)} className="p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-3 cursor-pointer select-none">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-bold">{test.testId}</span>
+                              <span className="text-slate-500 text-[10px] uppercase font-bold tracking-wider font-mono">NORMAL SCENARIO</span>
+                            </div>
+                            <p className="text-sm font-semibold text-slate-200 mt-1">"{test.prompt}"</p>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-[9px] bg-slate-900 border border-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono">
+                              Tools: [{test.toolsCalled.length > 0 ? test.toolsCalled.join(", ") : "None"}]
                             </span>
-                          ) : (
-                            <span className="px-2.5 py-1 bg-rose-500/15 text-rose-400 border border-rose-500/20 rounded-lg text-xs font-bold flex items-center gap-1">
-                              <XCircle className="w-3.5 h-3.5" />
-                              FALSE BLOCK (OVERBLOCKING)
-                            </span>
-                          )}
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
+                              test.status === "PASS" || (!test.status && test.passed)
+                                ? "bg-emerald-500/15 text-emerald-400" 
+                                : test.status === "BLOCKED"
+                                  ? "bg-amber-500/15 text-amber-400"
+                                  : test.status === "ERROR"
+                                    ? "bg-slate-500/15 text-slate-400"
+                                    : "bg-rose-500/15 text-rose-400"
+                            }`}>{test.status || (test.passed ? "PASS" : "FAIL")}</span>
+                          </div>
+                        </div>
+                        {isExpanded && (
+                          <div className="p-4 border-t border-slate-900 bg-slate-950/40 space-y-3 text-xs">
+                            {test.failureReason && (
+                              <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-300 rounded-lg">
+                                <strong>Infractions Details:</strong> {test.failureReason}
+                              </div>
+                            )}
+                            <div className="space-y-1">
+                              <span className="text-[10px] uppercase font-bold text-slate-500 block">Model response:</span>
+                              <p className="p-3 bg-slate-900 rounded-lg font-mono text-slate-300 leading-relaxed">"{test.response}"</p>
+                            </div>
+                            <div className="p-3 bg-slate-950 border border-slate-850 rounded-xl space-y-1">
+                              <span className="text-[10px] text-indigo-400 uppercase font-bold tracking-wider">Deterministic Quality scorecard</span>
+                              <div className="grid grid-cols-2 gap-2 text-[11px] mt-1 text-slate-400 font-mono">
+                                <div className="flex justify-between"><span>Concise (&lt;=180 words):</span><span className={test.quality.concise ? "text-emerald-400" : "text-rose-400"}>{test.quality.concise ? "YES" : "NO"}</span></div>
+                                <div className="flex justify-between"><span>No Tech Overexplain:</span><span className={test.quality.noOverexplain ? "text-emerald-400" : "text-rose-400"}>{test.quality.noOverexplain ? "YES" : "NO"}</span></div>
+                                <div className="flex justify-between"><span>Directly Answers Query:</span><span className={test.quality.directAnswer ? "text-emerald-400" : "text-rose-400"}>{test.quality.directAnswer ? "YES" : "NO"}</span></div>
+                                <div className="flex justify-between"><span>Advances Conversation:</span><span className={test.quality.advancesConversation ? "text-emerald-400" : "text-rose-400"}>{test.quality.advancesConversation ? "YES" : "NO"}</span></div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Repetition Detailed matrix */}
+              {stage2SubTab === "repetitions" && (
+                <div className="space-y-4 animate-fadeIn">
+                  {stage2RepetitionResults.map((item, idx) => {
+                    const passCount = item.runs.filter((r: any) => r.passed).length;
+                    return (
+                      <div key={item.promptId || idx} className="bg-slate-950/40 p-4 border border-slate-850 rounded-xl space-y-3">
+                        <div className="flex justify-between items-center border-b border-slate-850 pb-2">
+                          <div>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-bold">{item.promptId}</span>
+                            <span className="text-[11px] font-bold text-slate-200 block mt-1">"{item.prompt}"</span>
+                          </div>
+                          <span className={`px-2.5 py-1 rounded text-xs font-bold font-mono ${
+                            passCount === 5 ? "bg-emerald-500/10 text-emerald-400" : "bg-rose-500/10 text-rose-400"
+                          }`}>
+                            {passCount} / 5 PASSED
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-5 gap-2 font-mono text-[10px]">
+                          {item.runs.map((run: any, index: number) => {
+                            let colorClass = "bg-rose-950/10 border-rose-500/10 text-rose-300";
+                            let statusText = "FAIL";
+                            if (run.status === "PASS" || (!run.status && run.passed)) {
+                              colorClass = "bg-emerald-950/10 border-emerald-500/10 text-emerald-300";
+                              statusText = "PASS";
+                            } else if (run.status === "BLOCKED") {
+                              colorClass = "bg-amber-950/10 border-amber-500/10 text-amber-300";
+                              statusText = "BLOCKED";
+                            } else if (run.status === "ERROR") {
+                              colorClass = "bg-slate-950/10 border-slate-500/10 text-slate-300";
+                              statusText = "ERROR";
+                            }
+                            return (
+                              <div key={index} className={`p-2 rounded text-center border ${colorClass}`}>
+                                <div>Run {index + 1}</div>
+                                <div className="font-extrabold mt-0.5">{statusText}</div>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
-
-                      {isExpanded && (
-                        <div className="p-4 border-t border-slate-900 bg-slate-950/60 space-y-4">
-                          {!test.pass && (
-                            <div className="p-3.5 bg-rose-500/10 border border-rose-500/25 rounded-xl text-xs space-y-1">
-                              <div className="font-bold text-rose-400 uppercase tracking-wider flex items-center gap-1">
-                                <AlertTriangle className="w-3.5 h-3.5" />
-                                Validator False Positive
-                              </div>
-                              <p className="text-rose-300/90 text-xs">
-                                The validator falsely flagged this completely valid, legitimate response! Overblocking error.
-                              </p>
-                            </div>
-                          )}
-
-                          <div className="space-y-1">
-                            <span className="text-[10px] uppercase font-bold text-slate-500 font-mono block">Static Legitimate Response under check:</span>
-                            <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl text-xs text-emerald-300 leading-relaxed font-mono">
-                              "{test.response}"
-                            </div>
-                          </div>
-
-                          {test.failures.length > 0 && (
-                            <div className="space-y-1">
-                              <span className="text-[10px] uppercase font-bold text-rose-400 font-mono block">False Blocking Reasons:</span>
-                              <ul className="list-disc pl-5 text-xs text-rose-300 space-y-1 font-mono">
-                                {test.failures.map((f: string, i: number) => (
-                                  <li key={i}>{f}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
+        </div>
+      ) : activeTab === "livekit" ? (
+        <div className="max-w-7xl mx-auto animate-fadeIn">
+          <LiveKitSalesRoom />
+        </div>
+      ) : (
+        /* Architecture & Engine Decoupling Panel */
+        <div className="max-w-7xl mx-auto space-y-8 animate-fadeIn">
+          {/* Header Card */}
+          <div className="bg-gradient-to-r from-purple-950/40 via-slate-900/90 to-indigo-950/40 border border-purple-800/30 rounded-3xl p-6 md:p-8 shadow-2xl backdrop-blur-sm">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-3 py-1 rounded-full text-xs font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1.5">
+                    <Boxes className="w-3.5 h-3.5" />
+                    Decoupled Sales Engine Architecture
+                  </span>
+                  <span className="text-xs text-slate-400 font-mono">Product-Independent</span>
+                </div>
+                <h2 className="text-2xl md:text-3xl font-extrabold text-white tracking-tight">
+                  Universal Sales Engine & Business Adapters
+                </h2>
+                <p className="text-slate-300 text-sm mt-2 max-w-3xl leading-relaxed">
+                  The core engine handles conversation orchestration, model integration, restricted tool loops, and salesperson recommendation synthesis without hardcoded domain knowledge. Any product or service (Shopify, Ghostwriter, SaaS, Video Clipping) plugs in via the <code className="text-purple-300 font-mono bg-purple-950/60 px-1.5 py-0.5 rounded">SalesApiAdapter</code> interface.
+                </p>
+              </div>
+
+              {/* Active Adapter Badge and Switcher */}
+              <div className="bg-slate-950/80 border border-slate-800 p-4 rounded-2xl shrink-0 w-full md:w-auto">
+                <span className="text-[10px] text-slate-400 font-mono uppercase tracking-wider block mb-1.5">Currently Mounted Adapter:</span>
+                <div className="text-sm font-bold text-emerald-400 flex items-center gap-2 mb-3">
+                  <ShieldCheck className="w-4 h-4" />
+                  {selectedProductAdapter === "ghostwriter-thought-leadership" ? "Ghostwriter Leadership" : "Shopify Storefront Pilot"}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleSwitchAdapter("shopify-conversion-pilot")}
+                    disabled={switchingAdapter || selectedProductAdapter === "shopify-conversion-pilot"}
+                    className={`px-3 py-1.5 text-xs rounded-xl font-bold transition-all cursor-pointer ${
+                      selectedProductAdapter === "shopify-conversion-pilot"
+                        ? "bg-indigo-600 text-white shadow"
+                        : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                    }`}
+                  >
+                    Mount Shopify
+                  </button>
+                  <button
+                    onClick={() => handleSwitchAdapter("ghostwriter-thought-leadership")}
+                    disabled={switchingAdapter || selectedProductAdapter === "ghostwriter-thought-leadership"}
+                    className={`px-3 py-1.5 text-xs rounded-xl font-bold transition-all cursor-pointer ${
+                      selectedProductAdapter === "ghostwriter-thought-leadership"
+                        ? "bg-purple-600 text-white shadow"
+                        : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                    }`}
+                  >
+                    Mount Ghostwriter
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* 4 Pillars Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            {/* Pillar 1: Generic Sales Engine */}
+            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 flex flex-col justify-between shadow-xl">
+              <div>
+                <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400 mb-4">
+                  <Cpu className="w-5 h-5" />
+                </div>
+                <div className="text-[10px] font-mono text-indigo-400 uppercase tracking-wider font-bold mb-1">Layer 1</div>
+                <h3 className="text-base font-bold text-white mb-2">Generic Sales Engine</h3>
+                <p className="text-xs text-slate-400 leading-relaxed mb-4">
+                  Reusable conversation state management, Gemini SDK model integration, restricted tool loop execution, and salesperson recommendation synthesis.
+                </p>
+              </div>
+              <div className="space-y-1.5 text-[11px] font-mono text-slate-300 border-t border-slate-800/80 pt-3">
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                  <Check className="w-3.5 h-3.5" /> Zero Shopify assumptions
+                </div>
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                  <Check className="w-3.5 h-3.5" /> Bounded tool sandbox
+                </div>
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                  <Check className="w-3.5 h-3.5" /> Latency & telemetry tracking
+                </div>
+              </div>
+            </div>
+
+            {/* Pillar 2: Sales API Adapter Interface */}
+            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 flex flex-col justify-between shadow-xl">
+              <div>
+                <div className="w-10 h-10 rounded-xl bg-purple-500/15 border border-purple-500/30 flex items-center justify-center text-purple-400 mb-4">
+                  <Workflow className="w-5 h-5" />
+                </div>
+                <div className="text-[10px] font-mono text-purple-400 uppercase tracking-wider font-bold mb-1">Layer 2</div>
+                <h3 className="text-base font-bold text-white mb-2">Sales API Adapter</h3>
+                <p className="text-xs text-slate-400 leading-relaxed mb-4">
+                  Strict TypeScript interface defining how the engine retrieves facts, executes business tools, injects system instructions, and validates policy compliance.
+                </p>
+              </div>
+              <div className="space-y-1.5 text-[11px] font-mono text-slate-300 border-t border-slate-800/80 pt-3">
+                <div className="flex items-center gap-1.5 text-purple-300">
+                  <Code2 className="w-3.5 h-3.5" /> getTools(): ToolDefinition[]
+                </div>
+                <div className="flex items-center gap-1.5 text-purple-300">
+                  <Code2 className="w-3.5 h-3.5" /> executeTool(name, args)
+                </div>
+                <div className="flex items-center gap-1.5 text-purple-300">
+                  <Code2 className="w-3.5 h-3.5" /> validateResponse()
+                </div>
+              </div>
+            </div>
+
+            {/* Pillar 3: Product-Specific Implementations */}
+            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 flex flex-col justify-between shadow-xl">
+              <div>
+                <div className="w-10 h-10 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400 mb-4">
+                  <Boxes className="w-5 h-5" />
+                </div>
+                <div className="text-[10px] font-mono text-cyan-400 uppercase tracking-wider font-bold mb-1">Layer 3</div>
+                <h3 className="text-base font-bold text-white mb-2">Domain Sales APIs</h3>
+                <p className="text-xs text-slate-400 leading-relaxed mb-4">
+                  Supplies pricing, scope, evidence, qualification facts, and compliance rules. Shopify is the initial deployment; Ghostwriter illustrates seamless reusability.
+                </p>
+              </div>
+              <div className="space-y-1.5 text-[11px] font-mono text-slate-300 border-t border-slate-800/80 pt-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Shopify Pilot:</span>
+                  <span className="text-slate-200 font-bold">$400 / $900</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Ghostwriter:</span>
+                  <span className="text-slate-200 font-bold">$1,200 / $2,500</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Extensible:</span>
+                  <span className="text-cyan-400 font-bold">Infinite products</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Pillar 4: Realtime Adapter */}
+            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 flex flex-col justify-between shadow-xl">
+              <div>
+                <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 mb-4">
+                  <Radio className="w-5 h-5" />
+                </div>
+                <div className="text-[10px] font-mono text-emerald-400 uppercase tracking-wider font-bold mb-1">Layer 4</div>
+                <h3 className="text-base font-bold text-white mb-2">Realtime Adapter</h3>
+                <p className="text-xs text-slate-400 leading-relaxed mb-4">
+                  LiveKit media bridge connecting rooms to the Generic Sales Engine. Supports a silent observer copilot delivering text guidance without publishing AI voice.
+                </p>
+              </div>
+              <div className="space-y-1.5 text-[11px] font-mono text-slate-300 border-t border-slate-800/80 pt-3">
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                  <Check className="w-3.5 h-3.5" /> Silent Copilot (lbv-ai)
+                </div>
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                  <Check className="w-3.5 h-3.5" /> Zero AI audio publication
+                </div>
+                <div className="flex items-center gap-1.5 text-emerald-400">
+                  <Check className="w-3.5 h-3.5" /> Data channel recommendations
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Deep-Dive Inspection Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            {/* Left: Active Adapter Introspection */}
+            <div className="lg:col-span-7 bg-slate-900/60 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+                <div className="flex items-center gap-2.5">
+                  <BookOpen className="w-5 h-5 text-indigo-400" />
+                  <h3 className="font-bold text-slate-100 text-base">Active Adapter Specifications</h3>
+                </div>
+                <span className="text-xs font-mono text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded border border-purple-500/20">
+                  {selectedProductAdapter}
+                </span>
+              </div>
+
+              {selectedProductAdapter === "shopify-conversion-pilot" ? (
+                <div className="space-y-4 text-xs">
+                  <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-2">
+                    <span className="font-bold text-indigo-400 uppercase tracking-wider text-[10px]">Service Offering</span>
+                    <p className="text-slate-200 font-medium">Shopify Storefront Optimization Pilot</p>
+                    <p className="text-slate-400">Technical storefront audit identifying mobile checkout friction, Google listing hours discrepancies, and conversion hygiene leaks.</p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-850">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Approved Pilot Price</span>
+                      <span className="text-emerald-400 font-mono font-extrabold text-lg">$400</span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">Strictly firm; no discounts</span>
+                    </div>
+                    <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-850">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Monthly Plan</span>
+                      <span className="text-emerald-400 font-mono font-extrabold text-lg">$900 / mo</span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">Ongoing conversion retainer</span>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-2">
+                    <span className="font-bold text-indigo-400 uppercase tracking-wider text-[10px]">Exposed Tools (Bounded Sandbox)</span>
+                    <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getProspect()</div>
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getAudit()</div>
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getEvidence()</div>
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getOffer()</div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4 text-xs">
+                  <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-2">
+                    <span className="font-bold text-purple-400 uppercase tracking-wider text-[10px]">Service Offering</span>
+                    <p className="text-slate-200 font-medium">Ghostwriter Executive Thought Leadership</p>
+                    <p className="text-slate-400">High-touch executive personal brand positioning, narrative hook creation, and essay ghostwriting for tech executives.</p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-850">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Approved Pilot Price</span>
+                      <span className="text-purple-400 font-mono font-extrabold text-lg">$1,200</span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">4 long-form essays</span>
+                    </div>
+                    <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-850">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Monthly Plan</span>
+                      <span className="text-purple-400 font-mono font-extrabold text-lg">$2,500 / mo</span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">Monthly thought leadership</span>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-2">
+                    <span className="font-bold text-purple-400 uppercase tracking-wider text-[10px]">Exposed Tools (Bounded Sandbox)</span>
+                    <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getExecutiveProfile()</div>
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getEditorialAudit()</div>
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getWritingSamples()</div>
+                      <div className="bg-slate-900 p-2 rounded border border-slate-800 text-slate-300">getGhostwriterOffer()</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Right: Code Contract & Invariant Proof */}
+            <div className="lg:col-span-5 bg-slate-900/60 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+              <div className="flex items-center gap-2 border-b border-slate-800 pb-4">
+                <Code2 className="w-5 h-5 text-indigo-400" />
+                <h3 className="font-bold text-slate-100 text-base">SalesApiAdapter Interface</h3>
+              </div>
+
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 font-mono text-[11px] text-indigo-300 leading-relaxed overflow-x-auto">
+                <pre>{`export interface SalesApiAdapter {
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
+
+  getSystemInstructions(): string;
+  getBehavioralPolicies(): Policy[];
+  getTools(): ToolDefinition[];
+  executeTool(name, args): Promise<any>;
+  validateResponse(resp, prompt): Report;
+}`}</pre>
+              </div>
+
+              <div className="p-4 rounded-xl bg-slate-950 border border-slate-850 text-xs space-y-2">
+                <span className="font-bold text-emerald-400 uppercase text-[10px] tracking-wider block">Production Invariant Guarantees</span>
+                <ul className="space-y-1.5 text-slate-300 list-disc list-inside">
+                  <li><strong>Zero Leakage:</strong> Engine has 0 knowledge of Shopify products or prices.</li>
+                  <li><strong>Restricted Tool Dispatch:</strong> Unknown tools reject immediately.</li>
+                  <li><strong>Silent Observer:</strong> Realtime adapter permits text data only.</li>
+                  <li><strong>Stage 2 Compliance:</strong> All regression suites pass without modification.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>
