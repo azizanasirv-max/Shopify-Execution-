@@ -277,6 +277,32 @@ export async function runRealtimeValidationTests(): Promise<{ passed: number; fa
   assert(recommendationReceived.statement === "Realtime test recommendation", "Recommendation statement delivered as text payload");
   assert(recommendationReceived.status === "APPROVED", "Recommendation status is APPROVED");
 
+  // Test interim transcript suppression (Defect B1)
+  let interimReceived = false;
+  await salesEngine.handleRealtimeTranscript(
+    {
+      speaker: "prospect",
+      text: "What is the pilot...",
+      isFinal: false,
+      timestamp: Date.now()
+    },
+    () => { interimReceived = true; }
+  );
+  assert(!interimReceived, "Interim transcript events do not invoke recommendation model");
+
+  // Test salesperson speech suppression (Defect B2)
+  let salespersonReceived = false;
+  await salesEngine.handleRealtimeTranscript(
+    {
+      speaker: "salesperson",
+      text: "Our pilot price is $400.",
+      isFinal: true,
+      timestamp: Date.now()
+    },
+    () => { salespersonReceived = true; }
+  );
+  assert(!salespersonReceived, "Salesperson transcripts do not trigger prospect recommendations");
+
   console.log("--------------------------------------------------");
   console.log(`Realtime Validation Tests Summary: Passed: ${passed} | Failed: ${failed} | Total: ${passed + failed}`);
   console.log("==================================================");

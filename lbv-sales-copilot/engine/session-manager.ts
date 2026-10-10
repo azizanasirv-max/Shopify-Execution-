@@ -684,7 +684,7 @@ export class SessionManager {
       if (!session) {
         throw new SessionNotFoundError(sessionId);
       }
-      if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+      if (!providedAuthToken || providedAuthToken !== session.authToken) {
         throw new UnauthorizedSessionAccessError(sessionId);
       }
       for (const t of turns) {
@@ -701,7 +701,7 @@ export class SessionManager {
     if (!session) {
       throw new SessionNotFoundError(sessionId);
     }
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     session.conversationHistory.push(turn);
@@ -721,7 +721,7 @@ export class SessionManager {
     if (!session) {
       throw new SessionNotFoundError(sessionId);
     }
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     session.conversationHistory = [];
@@ -749,7 +749,7 @@ export class SessionManager {
   public async deleteSessionAsync(sessionId: string, providedAuthToken?: string): Promise<boolean> {
     const session = await this.getSessionAsync(sessionId);
     if (!session) return false;
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     const res = this.store.delete(sessionId);
@@ -759,7 +759,7 @@ export class SessionManager {
   public deleteSession(sessionId: string, providedAuthToken?: string): boolean {
     const session = this.getSession(sessionId);
     if (!session) return false;
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     return this.store.delete(sessionId) as boolean;

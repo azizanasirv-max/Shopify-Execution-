@@ -1124,13 +1124,24 @@ app.post("/api/livekit/transcript", async (req, res) => {
       return res.status(403).json({ error: "Unauthorized access: Valid session authorization token is required.", code: "UNAUTHORIZED_SESSION_ACCESS" });
     }
 
+    if (typeof isFinal !== "boolean") {
+      return res.status(400).json({ error: "isFinal must be an explicit boolean value.", code: "INVALID_FINAL_STATUS" });
+    }
+
+    if (speaker !== "prospect" && speaker !== "salesperson") {
+      return res.status(400).json({ error: "Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", code: "INVALID_SPEAKER" });
+    }
+
     if (!text || typeof text !== "string" || !text.trim()) {
       return res.status(400).json({ error: "Non-empty transcript text is required.", code: "INVALID_TRANSCRIPT" });
     }
+    if (text.length > 4000) {
+      return res.status(400).json({ error: "Transcript text exceeds maximum allowed length of 4000 characters.", code: "TRANSCRIPT_TOO_LONG" });
+    }
 
     const targetAdapter = adapterRegistry.resolve(session.productId);
-    const transcriptSpeaker = speaker === "salesperson" ? "salesperson" : "prospect";
-    const finalFlag = isFinal !== false;
+    const transcriptSpeaker = speaker;
+    const finalFlag = isFinal === true;
 
     let recommendation: any = null;
 

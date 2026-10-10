@@ -238,7 +238,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   // -------------------------------------------------------------
   // TEST 8: Production Startup Failure Enforcement (No Memory Fallback)
   // -------------------------------------------------------------
-  console.log("\n[8/8] Testing production startup failure enforcement...");
+  console.log("\n[8/9] Testing production startup failure enforcement...");
   const prodEnvWithoutDb: Env = {
     NODE_ENV: "production"
   };
@@ -253,6 +253,48 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   const prodErrData = await prodRes.json() as any;
   assert(prodErrData.code === "STARTUP_ERROR", "Error code is STARTUP_ERROR");
   assert(prodErrData.error.includes("Refusing insecure fallback to memory"), "Refuses fallback to local memory in production");
+
+  // -------------------------------------------------------------
+  // TEST 9: Transcript Ingress Validation Checks (Defects A1-A4)
+  // -------------------------------------------------------------
+  console.log("\n[9/9] Testing transcript ingress validation checks...");
+  // Non-boolean isFinal rejected
+  const nonBoolFinalReq = new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Token": sessionData.sessionToken
+    },
+    body: JSON.stringify({
+      sessionId: sessionData.sessionId,
+      text: "Hello",
+      isFinal: "true",
+      speaker: "prospect"
+    })
+  });
+  const nonBoolFinalRes = await worker.fetch(nonBoolFinalReq, testEnv);
+  assert(nonBoolFinalRes.status === 400, "Non-boolean isFinal rejected with 400");
+  const nonBoolData = await nonBoolFinalRes.json() as any;
+  assert(nonBoolData.code === "INVALID_FINAL_STATUS", "Error code is INVALID_FINAL_STATUS");
+
+  // Invalid speaker rejected (must not default unknown speaker to prospect)
+  const invalidSpeakerReq = new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Token": sessionData.sessionToken
+    },
+    body: JSON.stringify({
+      sessionId: sessionData.sessionId,
+      text: "Hello",
+      isFinal: true,
+      speaker: "unknown_bot"
+    })
+  });
+  const invalidSpeakerRes = await worker.fetch(invalidSpeakerReq, testEnv);
+  assert(invalidSpeakerRes.status === 400, "Invalid speaker value rejected with 400");
+  const invSpeakerData = await invalidSpeakerRes.json() as any;
+  assert(invSpeakerData.code === "INVALID_SPEAKER", "Error code is INVALID_SPEAKER");
 
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);

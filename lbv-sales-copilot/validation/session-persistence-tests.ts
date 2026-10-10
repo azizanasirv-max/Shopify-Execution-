@@ -64,7 +64,7 @@ export async function runSessionPersistenceTests() {
   const fileStore1 = new FileSessionStore(testFilePath);
   const smFile1 = new SessionManager({ store: fileStore1 });
   const persistentSess = smFile1.createSession("ghostwriter", { project: "Book Beta" });
-  smFile1.addTurn(persistentSess.id, { role: "user", text: "Hello ghostwriter", timestamp: Date.now() });
+  smFile1.addTurn(persistentSess.id, { role: "user", text: "Hello ghostwriter", timestamp: Date.now() }, persistentSess.authToken);
 
   // Create second FileSessionStore instance pointing to the same file (simulating server restart)
   const fileStore2 = new FileSessionStore(testFilePath);
@@ -92,11 +92,11 @@ export async function runSessionPersistenceTests() {
   const turn2: ConversationTurn = { role: "user", text: "Turn 2 concurrent", timestamp: Date.now() + 1 };
   const turn3: ConversationTurn = { role: "model", text: "Turn 3 model", timestamp: Date.now() + 2 };
 
-  // Fire concurrent async updates using addTurnAsync
+  // Fire concurrent async updates using addTurnAsync with session authorization token
   await Promise.all([
-    smConc.addTurnAsync(concSess.id, turn1),
-    smConc.addTurnAsync(concSess.id, turn2),
-    smConc.addTurnAsync(concSess.id, turn3)
+    smConc.addTurnAsync(concSess.id, turn1, concSess.authToken),
+    smConc.addTurnAsync(concSess.id, turn2, concSess.authToken),
+    smConc.addTurnAsync(concSess.id, turn3, concSess.authToken)
   ]);
 
   const updatedSess = smConc.getSession(concSess.id);

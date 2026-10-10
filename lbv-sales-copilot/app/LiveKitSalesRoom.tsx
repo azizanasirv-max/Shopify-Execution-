@@ -341,17 +341,37 @@ export default function LiveKitSalesRoom({
         room.on((RoomEvent as any).TranscriptionReceived, async (transcriptions: any[], participant?: RemoteParticipant | LocalParticipant) => {
           if (!transcriptions || transcriptions.length === 0) return;
           for (const publication of transcriptions) {
-            const isFinal = publication.isFinal ?? publication.final ?? true;
+            // Defect B1: Only explicitly final segments (isFinal === true)
+            const isFinal = publication.isFinal === true || publication.final === true;
             const text = publication.text || publication.transcript || "";
-            const segmentId = publication.id || publication.segmentId || `${text}_${publication.firstReceivedTime || Date.now()}`;
-            const speakerIdentity = participant?.identity || publication.participantIdentity || "prospect";
 
-            // Process only final prospect speech segments and deduplicate
-            if (isFinal && text.trim().length > 0 && !speakerIdentity.includes("salesperson") && !speakerIdentity.includes("lbv-ai")) {
+            // Defect B4: Use stable segment identifier, fallback to hash of text and publication identity
+            const segmentId = publication.id || publication.segmentId || `${publication.participantIdentity || participant?.identity || 'p'}_${text}`;
+
+            // Defect B2: Trustworthy participant identity resolution. Do not default unknown speakers to prospect!
+            const rawIdentity = participant?.identity || publication.participantIdentity;
+            let speakerRole: "prospect" | "salesperson" | "other" = "other";
+            if (rawIdentity) {
+              const lower = rawIdentity.toLowerCase();
+              if (lower === "prospect" || lower.startsWith("prospect_")) {
+                speakerRole = "prospect";
+              } else if (lower === "salesperson" || lower.startsWith("salesperson_")) {
+                speakerRole = "salesperson";
+              }
+            }
+
+            // Defect B1, B2, B3: Process strictly final prospect transcripts only, deduplicated by segment ID
+            if (isFinal && text.trim().length > 0 && speakerRole === "prospect") {
               if (processedSegmentIdsRef.current.has(segmentId)) continue;
               processedSegmentIdsRef.current.add(segmentId);
 
+              // Defect B7: Request sequence counter for stale response rejection
+              const currentReqSequence = Date.now();
+              (room as any)._latestReqSeq = currentReqSequence;
+
               setIsProcessingTranscript(true);
+              setErrorMessage(null);
+
               try {
                 const transcriptRes = await fetch("/api/livekit/transcript", {
                   method: "POST",
@@ -368,9 +388,14 @@ export default function LiveKitSalesRoom({
                   })
                 });
 
-                if (transcriptRes.ok) {
+                if (!transcriptRes.ok) {
+                  const errData = await transcriptRes.json().catch(() => ({}));
+                  // Defect B6: Visible error state on HTTP/network failures
+                  setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
+                } else {
                   const data = await transcriptRes.json();
-                  if (data.recommendation) {
+                  // Defect B7: Reject stale response if a newer request was dispatched while waiting
+                  if ((room as any)._latestReqSeq === currentReqSequence && data.recommendation) {
                     setCurrentRecommendation({
                       statement: data.recommendation.statement,
                       status: data.recommendation.status,
@@ -379,10 +404,13 @@ export default function LiveKitSalesRoom({
                     });
                   }
                 }
-              } catch (txErr) {
+              } catch (txErr: any) {
                 console.error("Failed to process LiveKit transcript:", txErr);
+                setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
               } finally {
-                setIsProcessingTranscript(false);
+                if ((room as any)._latestReqSeq === currentReqSequence) {
+                  setIsProcessingTranscript(false);
+                }
               }
             }
           }

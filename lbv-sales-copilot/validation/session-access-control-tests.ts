@@ -345,7 +345,7 @@ export async function runSessionAccessControlTests() {
     role: "user",
     text: "Confidential store context",
     timestamp: Date.now()
-  });
+  }, user1Session.authToken);
   assert(user1Session.conversationHistory.length === 1, "Session turn added for user 1");
 
   let unauthorizedClearRejected = false;

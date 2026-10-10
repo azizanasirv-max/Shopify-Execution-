@@ -771,13 +771,27 @@ export default {
           return errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
         }
 
+        // Defect A1 & A2: Strict boolean isFinal check
+        if (typeof isFinal !== "boolean") {
+          return errorResponse("isFinal must be an explicit boolean value.", "INVALID_FINAL_STATUS", 400, corsHeaders);
+        }
+
+        // Defect A3: Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)
+        if (speaker !== "prospect" && speaker !== "salesperson") {
+          return errorResponse("Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", "INVALID_SPEAKER", 400, corsHeaders);
+        }
+
+        // Defect A4: Validate text length and format (non-empty string <= 4000 characters)
         if (!text || typeof text !== "string" || !text.trim()) {
           return errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders);
         }
+        if (text.length > 4000) {
+          return errorResponse("Transcript text exceeds maximum allowed length of 4000 characters.", "TRANSCRIPT_TOO_LONG", 400, corsHeaders);
+        }
 
         const targetAdapter = adapterRegistry.resolve(session.productId);
-        const transcriptSpeaker = speaker === "salesperson" ? "salesperson" : "prospect";
-        const finalFlag = isFinal !== false;
+        const transcriptSpeaker = speaker;
+        const finalFlag = isFinal === true;
 
         let recommendation: any = null;
 
