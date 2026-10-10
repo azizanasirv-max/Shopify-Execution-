@@ -8,10 +8,10 @@
  * 4. Automatic TTL session expiration and cleanup.
  */
 
+import { FileSessionStore } from "../engine/file-session-store.js";
 import {
   SessionManager,
   InMemorySessionStore,
-  FileSessionStore,
   SessionNotFoundError
 } from "../engine/session-manager.js";
 import { ConversationTurn } from "../engine/types.js";

@@ -14,7 +14,8 @@ import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwrit
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
 import { SalesApiAdapter } from "./lbv-sales-copilot/engine/types.js";
 import { AdapterRegistry, UnknownProductError } from "./lbv-sales-copilot/engine/adapter-registry.js";
-import { SessionManager, SessionNotFoundError, MismatchedSessionProductError, UnauthorizedSessionAccessError, FileSessionStore, InMemorySessionStore, CloudflareDOSessionStore, CloudflareD1SessionStore, SessionDurableObject, SessionStore } from "./lbv-sales-copilot/engine/session-manager.js";
+import { FileSessionStore } from "./lbv-sales-copilot/engine/file-session-store.js";
+import { SessionManager, SessionNotFoundError, MismatchedSessionProductError, UnauthorizedSessionAccessError, InMemorySessionStore, CloudflareDOSessionStore, CloudflareD1SessionStore, SessionDurableObject, SessionStore } from "./lbv-sales-copilot/engine/session-manager.js";
 
 dotenv.config();
 
