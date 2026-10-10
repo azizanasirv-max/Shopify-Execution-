@@ -1,0 +1,331 @@
+diff --git a/lbv-sales-copilot/engine/session-manager.ts b/lbv-sales-copilot/engine/session-manager.ts
+index c78bec6..492ff4c 100644
+--- a/lbv-sales-copilot/engine/session-manager.ts
++++ b/lbv-sales-copilot/engine/session-manager.ts
+@@ -427,7 +427,8 @@ export class CloudflareD1SessionStore implements SessionStore {
+   public async addTurnAsync(
+     sessionId: string,
+     turn: ConversationTurn,
+-    providedAuthToken?: string
++    providedAuthToken?: string,
++    expectedVersion?: number
+   ): Promise<SalesSession> {
+     const db = this.ensureDb();
+     const sessionRow = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionId).first();
+@@ -439,21 +440,27 @@ export class CloudflareD1SessionStore implements SessionStore {
+       throw new UnauthorizedSessionAccessError(sessionId);
+     }
+ 
++    const currentVersion = Number(sessionRow.version);
++    if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
++      throw new Error(`[CloudflareD1SessionStore] Optimistic concurrency conflict on session '${sessionId}'. Version mismatch.`);
++    }
++
++    const versionToMatch = expectedVersion !== undefined ? expectedVersion : currentVersion;
++
+     // Get current turn count for sequential indexing
+     const countRow = await db.prepare("SELECT COUNT(*) as count FROM conversation_turns WHERE session_id = ?").bind(sessionId).first();
+     const turnIndex = Number(countRow?.count || 0);
+     const now = Date.now();
+     const toolCallsJson = turn.toolCalls ? JSON.stringify(turn.toolCalls) : null;
+-    const currentVersion = Number(sessionRow.version);
+ 
+-    // Atomic batch: insert turn AND update session last_activity_at + increment version
++    // Atomic batch: insert turn AND update session last_activity_at + increment version conditionally
+     const batchRes = await db.batch([
+       db.prepare(
+-        "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) VALUES (?, ?, ?, ?, ?, ?)"
+-      ).bind(sessionId, turnIndex, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now),
++        "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND version = ?)"
++      ).bind(sessionId, turnIndex, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now, sessionId, versionToMatch),
+       db.prepare(
+         "UPDATE sessions SET last_activity_at = ?, version = version + 1 WHERE id = ? AND version = ?"
+-      ).bind(now, sessionId, currentVersion)
++      ).bind(now, sessionId, versionToMatch)
+     ]);
+ 
+     const updateRes = batchRes[1];
+@@ -781,8 +788,9 @@ export class SessionManager {
+       createdAt: Date.now(),
+       lastActivityAt: Date.now(),
+       conversationHistory: [],
+-      metadata: { ...metadata }
+-    };
++      metadata: { ...metadata },
++      version: 1
++    } as any;
+ 
+     const res = this.store.set(id, session);
+     if (res instanceof Promise) await res;
+@@ -795,10 +803,11 @@ export class SessionManager {
+   public async addTurnAsync(
+     sessionId: string,
+     turn: ConversationTurn,
+-    providedAuthToken?: string
++    providedAuthToken?: string,
++    expectedVersion?: number
+   ): Promise<void> {
+     if (this.store instanceof CloudflareD1SessionStore) {
+-      await this.store.addTurnAsync(sessionId, turn, providedAuthToken);
++      await this.store.addTurnAsync(sessionId, turn, providedAuthToken, expectedVersion);
+       return;
+     }
+     if (this.store instanceof CloudflareDOSessionStore) {
+diff --git a/lbv-sales-copilot/sales-api/shopify-adapter.ts b/lbv-sales-copilot/sales-api/shopify-adapter.ts
+index 62d57c6..ae03b31 100644
+--- a/lbv-sales-copilot/sales-api/shopify-adapter.ts
++++ b/lbv-sales-copilot/sales-api/shopify-adapter.ts
+@@ -12,8 +12,6 @@
+  * - Policy validation via validateResponse
+  */
+ 
+-import fs from "fs";
+-import path from "path";
+ import {
+   SalesApiAdapter,
+   ToolDefinition,
+@@ -25,31 +23,63 @@ import {
+   validateResponse as validateShopifyResponse
+ } from "../lib/sales-context.js";
+ 
++const DEFAULT_PROSPECT_DATA = {
++  prospect: {
++    name: "Example Fashion Store",
++    industry: "Fashion",
++    platform: "Shopify",
++    revenueBand: "$1M-$5M",
++    googleReviews: 312,
++    googleRating: 4.7,
++    websiteStatus: "active"
++  },
++  audit: {
++    finding: "Example finding for validation only"
++  },
++  evidence: [
++    {
++      id: "audit-screenshot-01",
++      type: "outdated_listing",
++      description: "Google Maps Listing shows incorrect Saturday business hours, conflicting with active Shopify site announcement.",
++      impact: "Potential lost walk-in traffic and negative customer service friction"
++    },
++    {
++      id: "audit-screenshot-02",
++      type: "conversion_friction",
++      description: "Checkout flow has high friction due to missing express checkout options on mobile devices.",
++      impact: "Decreased mobile purchase completion rates"
++    }
++  ],
++  offer: {
++    pilotPrice: 400,
++    monthlyPrice: 900,
++    pilotScope: "Defined pilot scope for testing"
++  },
++  unsupportedMetrics: {
++    actualRevenue: "UNAVAILABLE",
++    conversionRate: "UNAVAILABLE",
++    profit: "UNAVAILABLE",
++    cac: "UNAVAILABLE",
++    customerCount: "UNAVAILABLE"
++  }
++};
++
+ export class ShopifySalesAdapter implements SalesApiAdapter {
+   public readonly id = "shopify-conversion-pilot";
+   public readonly name = "Shopify Storefront Optimization Pilot";
+   public readonly description = "Storefront conversion hygiene audit and rapid mobile friction remediation for Shopify merchants.";
+ 
+-  private prospectData: any = null;
++  private prospectData: any = DEFAULT_PROSPECT_DATA;
+ 
+-  constructor(customDataPath?: string) {
+-    this.loadData(customDataPath);
++  constructor(customData?: any) {
++    if (customData) {
++      this.prospectData = customData;
++    }
+   }
+ 
+-  private loadData(customPath?: string): void {
+-    try {
+-      const targetPath = customPath || path.resolve(process.cwd(), "lbv-sales-copilot/sales-api/data/test-prospect.json");
+-      if (fs.existsSync(targetPath)) {
+-        this.prospectData = JSON.parse(fs.readFileSync(targetPath, "utf-8"));
+-      } else {
+-        // Fallback relative search
+-        const altPath = path.resolve("lbv-sales-copilot/sales-api/data/test-prospect.json");
+-        if (fs.existsSync(altPath)) {
+-          this.prospectData = JSON.parse(fs.readFileSync(altPath, "utf-8"));
+-        }
+-      }
+-    } catch (err) {
+-      console.error("[ShopifySalesAdapter] Failed to load prospect data:", err);
++  private loadData(): void {
++    if (!this.prospectData) {
++      this.prospectData = DEFAULT_PROSPECT_DATA;
+     }
+   }
+ 
+diff --git a/lbv-sales-copilot/validation/d1-persistence-tests.ts b/lbv-sales-copilot/validation/d1-persistence-tests.ts
+index e86e307..332d0e2 100644
+--- a/lbv-sales-copilot/validation/d1-persistence-tests.ts
++++ b/lbv-sales-copilot/validation/d1-persistence-tests.ts
+@@ -158,6 +158,22 @@ export class MockD1PreparedStatement {
+     }
+ 
+     if (trimmed.startsWith("INSERT INTO conversation_turns")) {
++      if (trimmed.includes("WHERE EXISTS")) {
++        const [session_id, turn_index, role, text, tool_calls_json, timestamp, checkId, checkVersion] = this.params;
++        const s = this.db.sessions.get(checkId);
++        if (!s || s.version !== checkVersion) {
++          return { success: true, meta: { changes: 0 } };
++        }
++        this.db.turns.push({
++          session_id,
++          turn_index,
++          role,
++          text,
++          tool_calls_json,
++          timestamp
++        });
++        return { success: true, meta: { changes: 1 } };
++      }
+       const [session_id, turn_index, role, text, tool_calls_json, timestamp] = this.params;
+       this.db.turns.push({
+         session_id,
+@@ -339,7 +355,7 @@ export async function runD1PersistenceTests(): Promise<{ passed: number; failed:
+   // -------------------------------------------------------------
+   // TEST 6: D1 Failure Propagation (No Silent Fallback)
+   // -------------------------------------------------------------
+-  console.log("\n[6/6] Testing failure propagation on D1 errors...");
++  console.log("\n[6/8] Testing failure propagation on D1 errors...");
+   mockDb.shouldFail = true;
+   let failurePropagated = false;
+   try {
+@@ -350,6 +366,47 @@ export async function runD1PersistenceTests(): Promise<{ passed: number; failed:
+   assert(failurePropagated, "D1 query failure propagates error instead of silent memory fallback");
+   mockDb.shouldFail = false;
+ 
++  // -------------------------------------------------------------
++  // TEST 7: Multi-Statement Concurrency Conflict (Zero Orphan Turns)
++  // -------------------------------------------------------------
++  console.log("\n[7/8] Testing multi-statement atomic conflict safety (no orphan turns)...");
++  const turnCountBefore = mockDb.turns.length;
++  const conflictSession = await smD1.createSessionAsync("shopify");
++  // Set version to 999 to simulate conflict on update
++  const rawConf = mockDb.sessions.get(conflictSession.id);
++  rawConf.version = 999;
++
++  let conflictTurnFailed = false;
++  try {
++    await smD1.addTurnAsync(
++      conflictSession.id,
++      { role: "user", text: "Orphan check turn", timestamp: Date.now() },
++      conflictSession.authToken,
++      (conflictSession as any).version
++    );
++  } catch (err: any) {
++    if (err.message.includes("Optimistic concurrency conflict")) {
++      conflictTurnFailed = true;
++    }
++  }
++  assert(conflictTurnFailed, "Conflicted addTurnAsync throws optimistic concurrency error");
++  const orphanTurns = mockDb.turns.filter(t => t.text === "Orphan check turn");
++  assert(orphanTurns.length === 0, "No orphan turn written when version conflict occurs");
++
++  // -------------------------------------------------------------
++  // TEST 8: Atomic Batch Error Handling (Transaction Integrity)
++  // -------------------------------------------------------------
++  console.log("\n[8/8] Testing batch execution failure propagation...");
++  mockDb.shouldFail = true;
++  let batchErrorCaught = false;
++  try {
++    await smD1.addTurnAsync(conflictSession.id, { role: "user", text: "Batch fail turn", timestamp: Date.now() }, conflictSession.authToken);
++  } catch (err: any) {
++    batchErrorCaught = true;
++  }
++  assert(batchErrorCaught, "Batch execution failure throws error to caller");
++  mockDb.shouldFail = false;
++
+   console.log("\n--------------------------------------------------");
+   console.log(`D1 Persistence Tests Summary: Passed: ${passed}, Failed: ${failed}`);
+   console.log("==================================================");
+diff --git a/lbv-sales-copilot/validation/worker-integration-tests.ts b/lbv-sales-copilot/validation/worker-integration-tests.ts
+index ab82aa7..4924332 100644
+--- a/lbv-sales-copilot/validation/worker-integration-tests.ts
++++ b/lbv-sales-copilot/validation/worker-integration-tests.ts
+@@ -209,9 +209,9 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
+   assert(legitTokenData.identity === "salesperson", "Token identity is salesperson");
+ 
+   // -------------------------------------------------------------
+-  // TEST 7: Protected Admin Endpoints
++  // TEST 7: Protected Admin Endpoints & Production Exposure
+   // -------------------------------------------------------------
+-  console.log("\n[7/8] Testing protected admin endpoints...");
++  console.log("\n[7/8] Testing protected admin endpoints and production exposure...");
+   const unauthAdminReq = new Request("https://worker.local/api/run-adversarial-tests", {
+     method: "POST"
+   });
+@@ -220,6 +220,21 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
+   const adminErrData = await unauthAdminRes.json() as any;
+   assert(adminErrData.code === "ADMIN_AUTHORIZATION_REQUIRED", "Error code is ADMIN_AUTHORIZATION_REQUIRED");
+ 
++  // In production, internal test endpoints are completely disabled (404)
++  const prodTestEnv: Env = {
++    DB: mockDb,
++    ADMIN_API_KEY: "admin_secret_token_12345",
++    NODE_ENV: "production"
++  };
++  const prodAdminReq = new Request("https://worker.local/api/run-adversarial-tests", {
++    method: "POST",
++    headers: { "X-Admin-Token": "admin_secret_token_12345" }
++  });
++  const prodAdminRes = await worker.fetch(prodAdminReq, prodTestEnv);
++  assert(prodAdminRes.status === 404, "Internal test endpoints disabled in production with 404");
++  const prodAdminData = await prodAdminRes.json() as any;
++  assert(prodAdminData.code === "ENDPOINT_DISABLED_IN_PRODUCTION", "Error code is ENDPOINT_DISABLED_IN_PRODUCTION");
++
+   // -------------------------------------------------------------
+   // TEST 8: Production Startup Failure Enforcement (No Memory Fallback)
+   // -------------------------------------------------------------
+diff --git a/worker.ts b/worker.ts
+index feb7350..474998a 100644
+--- a/worker.ts
++++ b/worker.ts
+@@ -715,13 +715,23 @@ export default {
+       }
+ 
+       // =========================================================================
+-      // ROUTE: Protected Admin Test Endpoints (Requires ADMIN_API_KEY)
++      // ROUTE: Protected Admin Test Endpoints (Disabled in production)
+       // =========================================================================
+       if (
+         pathname === "/api/run-adversarial-tests" ||
+         pathname === "/api/run-stage2-validation" ||
+-        pathname === "/api/save-baseline"
++        pathname === "/api/save-baseline" ||
++        pathname === "/api/load-baseline"
+       ) {
++        if (env.NODE_ENV === "production") {
++          return errorResponse(
++            "Internal test and evaluation endpoints are disabled in production.",
++            "ENDPOINT_DISABLED_IN_PRODUCTION",
++            404,
++            corsHeaders
++          );
++        }
++
+         const adminToken =
+           request.headers.get("x-admin-token") ||
+           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+diff --git a/wrangler.toml b/wrangler.toml
+index 2645546..6d458ef 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -1,6 +1,7 @@
+ name = "lbv-sales-copilot"
+ main = "worker.ts"
+ compatibility_date = "2024-03-20"
++compatibility_flags = ["nodejs_compat"]
+ 
+ [site]
+ bucket = "dist"

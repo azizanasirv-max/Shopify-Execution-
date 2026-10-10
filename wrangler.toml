@@ -15,11 +15,6 @@ database_name = "lbv-sales-sessions"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-[[kv_namespaces]]
-binding = "LBV_SESSIONS_KV"
-id = "lbv_sessions_kv_placeholder_id"
-production_id = "lbv_sessions_kv_production_id"
-
 [durable_objects]
 bindings = [
   { name = "SESSION_DO", class_name = "SessionDurableObject" }

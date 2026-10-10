@@ -14,7 +14,7 @@ import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwrit
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
 import { SalesApiAdapter } from "./lbv-sales-copilot/engine/types.js";
 import { AdapterRegistry, UnknownProductError } from "./lbv-sales-copilot/engine/adapter-registry.js";
-import { SessionManager, SessionNotFoundError, MismatchedSessionProductError, UnauthorizedSessionAccessError, FileSessionStore, InMemorySessionStore, CloudflareKVSessionStore, CloudflareDOSessionStore, CloudflareD1SessionStore, SessionDurableObject, SessionStore } from "./lbv-sales-copilot/engine/session-manager.js";
+import { SessionManager, SessionNotFoundError, MismatchedSessionProductError, UnauthorizedSessionAccessError, FileSessionStore, InMemorySessionStore, CloudflareDOSessionStore, CloudflareD1SessionStore, SessionDurableObject, SessionStore } from "./lbv-sales-copilot/engine/session-manager.js";
 
 dotenv.config();
 
@@ -42,11 +42,9 @@ adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-c
 adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
 
 // Isolated Session Manager with Production Store Selection & Startup Failure enforcement
-const requirePersistentStore = isProd || process.env.LBV_SESSION_STORE === "file" || process.env.LBV_SESSION_STORE === "cloudflare-kv";
+const requirePersistentStore = isProd || process.env.LBV_SESSION_STORE === "file";
 let sessionStore: SessionStore;
-if (process.env.LBV_SESSION_STORE === "cloudflare-kv") {
-  sessionStore = new CloudflareKVSessionStore();
-} else if (requirePersistentStore) {
+if (requirePersistentStore) {
   try {
     const sessionFilePath = path.resolve(process.env.LBV_SESSION_FILE_PATH || "./data/sessions.json");
     sessionStore = new FileSessionStore(sessionFilePath);

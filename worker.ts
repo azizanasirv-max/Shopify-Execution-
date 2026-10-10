@@ -25,7 +25,6 @@ import {
   InMemorySessionStore,
   CloudflareD1SessionStore,
   CloudflareDOSessionStore,
-  CloudflareKVSessionStore,
   SessionDurableObject,
   SessionStore
 } from "./lbv-sales-copilot/engine/session-manager.js";
@@ -36,7 +35,6 @@ export { SessionDurableObject };
 export interface Env {
   DB?: any; // Cloudflare D1
   SESSION_DO?: any; // Cloudflare Durable Object
-  LBV_SESSIONS_KV?: any; // Cloudflare KV
   GEMINI_API_KEY?: string;
   ADMIN_API_KEY?: string;
   NODE_ENV?: string;
@@ -153,8 +151,6 @@ export function createWorkerServices(env: Env) {
     sessionStore = new CloudflareD1SessionStore(env.DB);
   } else if (env.SESSION_DO) {
     sessionStore = new CloudflareDOSessionStore(env.SESSION_DO);
-  } else if (env.LBV_SESSIONS_KV) {
-    sessionStore = new CloudflareKVSessionStore(env.LBV_SESSIONS_KV);
   } else if (isProd || env.LBV_SESSION_STORE === "cloudflare-d1") {
     throw new Error(
       "[Production Error] Cloudflare D1 persistent database binding 'DB' is required in production Cloudflare Workers mode. Refusing insecure fallback to memory."
