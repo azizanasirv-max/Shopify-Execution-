@@ -265,6 +265,9 @@ export class LiveKitRealtimeAdapter {
     }
 
     // 6. Token generation (Real vs Simulated)
+    const isProd =
+      (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
+
     const shouldUseReal = this.isConfigured() && !forceSimulated;
     if (shouldUseReal) {
       const at = new AccessToken(this.apiKey!, this.apiSecret!, {
@@ -293,7 +296,13 @@ export class LiveKitRealtimeAdapter {
         expiresIn: 3600
       };
     } else {
-      // Hardened simulated mode
+      if (isProd) {
+        throw new Error(
+          "[Production Error] LiveKit Cloud environment configuration (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET) is missing in production mode. Refusing simulated room token issuance."
+        );
+      }
+
+      // Hardened simulated mode for local development and test automation
       const simPayload = {
         sub: identity,
         name:

@@ -1141,6 +1141,19 @@ app.post("/api/livekit/transcript", async (req, res) => {
         history: session.conversationHistory
       });
 
+      if (session.conversationHistory.length >= 2) {
+        const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
+        const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
+        if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
+          try {
+            await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
+          } catch (persistErr: any) {
+            console.error("[Server Realtime] Atomic persistence error:", persistErr);
+            return res.status(500).json({ error: "Failed to persist session conversation turn.", code: "PERSISTENCE_ERROR" });
+          }
+        }
+      }
+
       const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
       delete (sanitizedMetadata as any).rawUnapprovedStatement;
 

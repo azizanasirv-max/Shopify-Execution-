@@ -369,16 +369,15 @@ export default {
           history: session.conversationHistory
         });
 
-        // Ensure new conversation turns created in-memory during recommendation generation are explicitly persisted back to D1 / store
-        if (session.conversationHistory.length > 0) {
+        // Ensure new conversation turns created in-memory during recommendation generation are atomically persisted back to D1 / store
+        if (session.conversationHistory.length >= 2) {
           const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
           const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
           if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
             try {
-              await sessionManager.addTurnAsync(session.id, lastUserTurn, session.authToken);
-              await sessionManager.addTurnAsync(session.id, lastModelTurn, session.authToken);
+              await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
             } catch (persistErr: any) {
-              console.error("[Worker] D1 Turn persistence error:", persistErr);
+              console.error("[Worker] D1 Turn atomic persistence error:", persistErr);
               return errorResponse("Failed to persist session conversation turn.", "PERSISTENCE_ERROR", 500, corsHeaders);
             }
           }
@@ -789,16 +788,16 @@ export default {
             history: session.conversationHistory
           });
 
-          // Explicitly persist new turns to session store / D1
-          if (session.conversationHistory.length > 0) {
+          // Explicitly persist new turns atomically to session store / D1
+          if (session.conversationHistory.length >= 2) {
             const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
             const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
             if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
               try {
-                await sessionManager.addTurnAsync(session.id, lastUserTurn, session.authToken);
-                await sessionManager.addTurnAsync(session.id, lastModelTurn, session.authToken);
+                await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
               } catch (persistErr: any) {
-                console.error("[Worker Realtime] Persistence error:", persistErr);
+                console.error("[Worker Realtime] Atomic persistence error:", persistErr);
+                return errorResponse("Failed to persist session conversation turn.", "PERSISTENCE_ERROR", 500, corsHeaders);
               }
             }
           }

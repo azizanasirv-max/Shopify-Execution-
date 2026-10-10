@@ -113,6 +113,16 @@ export default function LiveKitSalesRoom({
   } | null>(null);
   const [checkingConfig, setCheckingConfig] = useState(true);
 
+  // Realtime "SAY THIS NEXT" recommendation state
+  const [currentRecommendation, setCurrentRecommendation] = useState<{
+    statement: string;
+    status: "APPROVED" | "RECOVERY_REQUIRED" | "BLOCKED";
+    timestamp: number;
+    toolsUsed?: any[];
+  } | null>(null);
+  const [isProcessingTranscript, setIsProcessingTranscript] = useState<boolean>(false);
+  const processedSegmentIdsRef = useRef<Set<string>>(new Set());
+
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
@@ -325,6 +335,59 @@ export default function LiveKitSalesRoom({
           setConnectionState(ConnectionState.Disconnected);
           setParticipants([]);
         });
+
+      // Wire RoomEvent.TranscriptionReceived to convert prospect speech transcripts to recommendations
+      if ((RoomEvent as any).TranscriptionReceived) {
+        room.on((RoomEvent as any).TranscriptionReceived, async (transcriptions: any[], participant?: RemoteParticipant | LocalParticipant) => {
+          if (!transcriptions || transcriptions.length === 0) return;
+          for (const publication of transcriptions) {
+            const isFinal = publication.isFinal ?? publication.final ?? true;
+            const text = publication.text || publication.transcript || "";
+            const segmentId = publication.id || publication.segmentId || `${text}_${publication.firstReceivedTime || Date.now()}`;
+            const speakerIdentity = participant?.identity || publication.participantIdentity || "prospect";
+
+            // Process only final prospect speech segments and deduplicate
+            if (isFinal && text.trim().length > 0 && !speakerIdentity.includes("salesperson") && !speakerIdentity.includes("lbv-ai")) {
+              if (processedSegmentIdsRef.current.has(segmentId)) continue;
+              processedSegmentIdsRef.current.add(segmentId);
+
+              setIsProcessingTranscript(true);
+              try {
+                const transcriptRes = await fetch("/api/livekit/transcript", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
+                  },
+                  body: JSON.stringify({
+                    sessionId: currentSessionId,
+                    sessionToken: currentSessionToken,
+                    text: text.trim(),
+                    isFinal: true,
+                    speaker: "prospect"
+                  })
+                });
+
+                if (transcriptRes.ok) {
+                  const data = await transcriptRes.json();
+                  if (data.recommendation) {
+                    setCurrentRecommendation({
+                      statement: data.recommendation.statement,
+                      status: data.recommendation.status,
+                      timestamp: Date.now(),
+                      toolsUsed: data.recommendation.toolsUsed
+                    });
+                  }
+                }
+              } catch (txErr) {
+                console.error("Failed to process LiveKit transcript:", txErr);
+              } finally {
+                setIsProcessingTranscript(false);
+              }
+            }
+          }
+        });
+      }
 
       // 3. Connect to LiveKit Room
       await room.connect(serverUrl, token);
@@ -587,6 +650,45 @@ export default function LiveKitSalesRoom({
         <div className="mt-4 bg-rose-500/10 border border-rose-500/30 rounded-xl p-3 text-xs text-rose-300 flex gap-2.5 items-center">
           <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
           <span>{errorMessage}</span>
+        </div>
+      )}
+
+      {/* Live "SAY THIS NEXT" Silent Copilot Banner */}
+      {(currentRecommendation || isProcessingTranscript) && (
+        <div className="mt-5 bg-gradient-to-r from-indigo-950/80 via-slate-900 to-purple-950/80 border border-indigo-500/40 rounded-2xl p-5 shadow-2xl animate-fadeIn">
+          <div className="flex items-center justify-between mb-3 border-b border-indigo-500/20 pb-2.5">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-400" />
+              <span className="text-xs font-bold text-indigo-300 uppercase tracking-wider">
+                Silent Sales Copilot Guidance
+              </span>
+            </div>
+            {currentRecommendation && (
+              <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono border ${
+                currentRecommendation.status === "BLOCKED"
+                  ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
+                  : "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+              }`}>
+                {currentRecommendation.status === "BLOCKED" ? "BLOCKED (SAFE FALLBACK)" : "APPROVED"}
+              </span>
+            )}
+          </div>
+
+          <div className="space-y-1">
+            <span className="text-[10px] uppercase tracking-widest text-slate-400 font-extrabold block">
+              SAY THIS NEXT
+            </span>
+            <div className="text-base font-bold text-slate-100 bg-slate-950/90 border border-slate-800 p-4 rounded-xl leading-relaxed">
+              {isProcessingTranscript ? (
+                <span className="text-indigo-300 flex items-center gap-2 animate-pulse text-sm">
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  Analyzing prospect utterance and evaluating deterministic compliance gate...
+                </span>
+              ) : (
+                currentRecommendation?.statement
+              )}
+            </div>
+          </div>
         </div>
       )}
 
