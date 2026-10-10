@@ -12,8 +12,6 @@
  * - Policy validation via validateResponse
  */
 
-import fs from "fs";
-import path from "path";
 import {
   SalesApiAdapter,
   ToolDefinition,
@@ -25,31 +23,63 @@ import {
   validateResponse as validateShopifyResponse
 } from "../lib/sales-context.js";
 
+const DEFAULT_PROSPECT_DATA = {
+  prospect: {
+    name: "Example Fashion Store",
+    industry: "Fashion",
+    platform: "Shopify",
+    revenueBand: "$1M-$5M",
+    googleReviews: 312,
+    googleRating: 4.7,
+    websiteStatus: "active"
+  },
+  audit: {
+    finding: "Example finding for validation only"
+  },
+  evidence: [
+    {
+      id: "audit-screenshot-01",
+      type: "outdated_listing",
+      description: "Google Maps Listing shows incorrect Saturday business hours, conflicting with active Shopify site announcement.",
+      impact: "Potential lost walk-in traffic and negative customer service friction"
+    },
+    {
+      id: "audit-screenshot-02",
+      type: "conversion_friction",
+      description: "Checkout flow has high friction due to missing express checkout options on mobile devices.",
+      impact: "Decreased mobile purchase completion rates"
+    }
+  ],
+  offer: {
+    pilotPrice: 400,
+    monthlyPrice: 900,
+    pilotScope: "Defined pilot scope for testing"
+  },
+  unsupportedMetrics: {
+    actualRevenue: "UNAVAILABLE",
+    conversionRate: "UNAVAILABLE",
+    profit: "UNAVAILABLE",
+    cac: "UNAVAILABLE",
+    customerCount: "UNAVAILABLE"
+  }
+};
+
 export class ShopifySalesAdapter implements SalesApiAdapter {
   public readonly id = "shopify-conversion-pilot";
   public readonly name = "Shopify Storefront Optimization Pilot";
   public readonly description = "Storefront conversion hygiene audit and rapid mobile friction remediation for Shopify merchants.";
 
-  private prospectData: any = null;
+  private prospectData: any = DEFAULT_PROSPECT_DATA;
 
-  constructor(customDataPath?: string) {
-    this.loadData(customDataPath);
+  constructor(customData?: any) {
+    if (customData) {
+      this.prospectData = customData;
+    }
   }
 
-  private loadData(customPath?: string): void {
-    try {
-      const targetPath = customPath || path.resolve(process.cwd(), "lbv-sales-copilot/sales-api/data/test-prospect.json");
-      if (fs.existsSync(targetPath)) {
-        this.prospectData = JSON.parse(fs.readFileSync(targetPath, "utf-8"));
-      } else {
-        // Fallback relative search
-        const altPath = path.resolve("lbv-sales-copilot/sales-api/data/test-prospect.json");
-        if (fs.existsSync(altPath)) {
-          this.prospectData = JSON.parse(fs.readFileSync(altPath, "utf-8"));
-        }
-      }
-    } catch (err) {
-      console.error("[ShopifySalesAdapter] Failed to load prospect data:", err);
+  private loadData(): void {
+    if (!this.prospectData) {
+      this.prospectData = DEFAULT_PROSPECT_DATA;
     }
   }
 

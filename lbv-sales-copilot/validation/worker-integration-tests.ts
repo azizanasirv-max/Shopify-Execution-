@@ -209,9 +209,9 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(legitTokenData.identity === "salesperson", "Token identity is salesperson");
 
   // -------------------------------------------------------------
-  // TEST 7: Protected Admin Endpoints
+  // TEST 7: Protected Admin Endpoints & Production Exposure
   // -------------------------------------------------------------
-  console.log("\n[7/8] Testing protected admin endpoints...");
+  console.log("\n[7/8] Testing protected admin endpoints and production exposure...");
   const unauthAdminReq = new Request("https://worker.local/api/run-adversarial-tests", {
     method: "POST"
   });
@@ -219,6 +219,21 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(unauthAdminRes.status === 403, "Unauthenticated access to internal test endpoints rejected with 403");
   const adminErrData = await unauthAdminRes.json() as any;
   assert(adminErrData.code === "ADMIN_AUTHORIZATION_REQUIRED", "Error code is ADMIN_AUTHORIZATION_REQUIRED");
+
+  // In production, internal test endpoints are completely disabled (404)
+  const prodTestEnv: Env = {
+    DB: mockDb,
+    ADMIN_API_KEY: "admin_secret_token_12345",
+    NODE_ENV: "production"
+  };
+  const prodAdminReq = new Request("https://worker.local/api/run-adversarial-tests", {
+    method: "POST",
+    headers: { "X-Admin-Token": "admin_secret_token_12345" }
+  });
+  const prodAdminRes = await worker.fetch(prodAdminReq, prodTestEnv);
+  assert(prodAdminRes.status === 404, "Internal test endpoints disabled in production with 404");
+  const prodAdminData = await prodAdminRes.json() as any;
+  assert(prodAdminData.code === "ENDPOINT_DISABLED_IN_PRODUCTION", "Error code is ENDPOINT_DISABLED_IN_PRODUCTION");
 
   // -------------------------------------------------------------
   // TEST 8: Production Startup Failure Enforcement (No Memory Fallback)

@@ -715,13 +715,23 @@ export default {
       }
 
       // =========================================================================
-      // ROUTE: Protected Admin Test Endpoints (Requires ADMIN_API_KEY)
+      // ROUTE: Protected Admin Test Endpoints (Disabled in production)
       // =========================================================================
       if (
         pathname === "/api/run-adversarial-tests" ||
         pathname === "/api/run-stage2-validation" ||
-        pathname === "/api/save-baseline"
+        pathname === "/api/save-baseline" ||
+        pathname === "/api/load-baseline"
       ) {
+        if (env.NODE_ENV === "production") {
+          return errorResponse(
+            "Internal test and evaluation endpoints are disabled in production.",
+            "ENDPOINT_DISABLED_IN_PRODUCTION",
+            404,
+            corsHeaders
+          );
+        }
+
         const adminToken =
           request.headers.get("x-admin-token") ||
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");

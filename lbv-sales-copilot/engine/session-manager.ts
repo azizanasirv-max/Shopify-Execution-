@@ -427,7 +427,8 @@ export class CloudflareD1SessionStore implements SessionStore {
   public async addTurnAsync(
     sessionId: string,
     turn: ConversationTurn,
-    providedAuthToken?: string
+    providedAuthToken?: string,
+    expectedVersion?: number
   ): Promise<SalesSession> {
     const db = this.ensureDb();
     const sessionRow = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionId).first();
@@ -439,21 +440,27 @@ export class CloudflareD1SessionStore implements SessionStore {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
 
+    const currentVersion = Number(sessionRow.version);
+    if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
+      throw new Error(`[CloudflareD1SessionStore] Optimistic concurrency conflict on session '${sessionId}'. Version mismatch.`);
+    }
+
+    const versionToMatch = expectedVersion !== undefined ? expectedVersion : currentVersion;
+
     // Get current turn count for sequential indexing
     const countRow = await db.prepare("SELECT COUNT(*) as count FROM conversation_turns WHERE session_id = ?").bind(sessionId).first();
     const turnIndex = Number(countRow?.count || 0);
     const now = Date.now();
     const toolCallsJson = turn.toolCalls ? JSON.stringify(turn.toolCalls) : null;
-    const currentVersion = Number(sessionRow.version);
 
-    // Atomic batch: insert turn AND update session last_activity_at + increment version
+    // Atomic batch: insert turn AND update session last_activity_at + increment version conditionally
     const batchRes = await db.batch([
       db.prepare(
-        "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind(sessionId, turnIndex, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now),
+        "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND version = ?)"
+      ).bind(sessionId, turnIndex, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now, sessionId, versionToMatch),
       db.prepare(
         "UPDATE sessions SET last_activity_at = ?, version = version + 1 WHERE id = ? AND version = ?"
-      ).bind(now, sessionId, currentVersion)
+      ).bind(now, sessionId, versionToMatch)
     ]);
 
     const updateRes = batchRes[1];
@@ -781,8 +788,9 @@ export class SessionManager {
       createdAt: Date.now(),
       lastActivityAt: Date.now(),
       conversationHistory: [],
-      metadata: { ...metadata }
-    };
+      metadata: { ...metadata },
+      version: 1
+    } as any;
 
     const res = this.store.set(id, session);
     if (res instanceof Promise) await res;
@@ -795,10 +803,11 @@ export class SessionManager {
   public async addTurnAsync(
     sessionId: string,
     turn: ConversationTurn,
-    providedAuthToken?: string
+    providedAuthToken?: string,
+    expectedVersion?: number
   ): Promise<void> {
     if (this.store instanceof CloudflareD1SessionStore) {
-      await this.store.addTurnAsync(sessionId, turn, providedAuthToken);
+      await this.store.addTurnAsync(sessionId, turn, providedAuthToken, expectedVersion);
       return;
     }
     if (this.store instanceof CloudflareDOSessionStore) {

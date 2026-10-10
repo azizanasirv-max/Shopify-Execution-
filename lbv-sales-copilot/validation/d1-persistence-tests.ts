@@ -158,6 +158,22 @@ export class MockD1PreparedStatement {
     }
 
     if (trimmed.startsWith("INSERT INTO conversation_turns")) {
+      if (trimmed.includes("WHERE EXISTS")) {
+        const [session_id, turn_index, role, text, tool_calls_json, timestamp, checkId, checkVersion] = this.params;
+        const s = this.db.sessions.get(checkId);
+        if (!s || s.version !== checkVersion) {
+          return { success: true, meta: { changes: 0 } };
+        }
+        this.db.turns.push({
+          session_id,
+          turn_index,
+          role,
+          text,
+          tool_calls_json,
+          timestamp
+        });
+        return { success: true, meta: { changes: 1 } };
+      }
       const [session_id, turn_index, role, text, tool_calls_json, timestamp] = this.params;
       this.db.turns.push({
         session_id,
@@ -339,7 +355,7 @@ export async function runD1PersistenceTests(): Promise<{ passed: number; failed:
   // -------------------------------------------------------------
   // TEST 6: D1 Failure Propagation (No Silent Fallback)
   // -------------------------------------------------------------
-  console.log("\n[6/6] Testing failure propagation on D1 errors...");
+  console.log("\n[6/8] Testing failure propagation on D1 errors...");
   mockDb.shouldFail = true;
   let failurePropagated = false;
   try {
@@ -348,6 +364,47 @@ export async function runD1PersistenceTests(): Promise<{ passed: number; failed:
     failurePropagated = true;
   }
   assert(failurePropagated, "D1 query failure propagates error instead of silent memory fallback");
+  mockDb.shouldFail = false;
+
+  // -------------------------------------------------------------
+  // TEST 7: Multi-Statement Concurrency Conflict (Zero Orphan Turns)
+  // -------------------------------------------------------------
+  console.log("\n[7/8] Testing multi-statement atomic conflict safety (no orphan turns)...");
+  const turnCountBefore = mockDb.turns.length;
+  const conflictSession = await smD1.createSessionAsync("shopify");
+  // Set version to 999 to simulate conflict on update
+  const rawConf = mockDb.sessions.get(conflictSession.id);
+  rawConf.version = 999;
+
+  let conflictTurnFailed = false;
+  try {
+    await smD1.addTurnAsync(
+      conflictSession.id,
+      { role: "user", text: "Orphan check turn", timestamp: Date.now() },
+      conflictSession.authToken,
+      (conflictSession as any).version
+    );
+  } catch (err: any) {
+    if (err.message.includes("Optimistic concurrency conflict")) {
+      conflictTurnFailed = true;
+    }
+  }
+  assert(conflictTurnFailed, "Conflicted addTurnAsync throws optimistic concurrency error");
+  const orphanTurns = mockDb.turns.filter(t => t.text === "Orphan check turn");
+  assert(orphanTurns.length === 0, "No orphan turn written when version conflict occurs");
+
+  // -------------------------------------------------------------
+  // TEST 8: Atomic Batch Error Handling (Transaction Integrity)
+  // -------------------------------------------------------------
+  console.log("\n[8/8] Testing batch execution failure propagation...");
+  mockDb.shouldFail = true;
+  let batchErrorCaught = false;
+  try {
+    await smD1.addTurnAsync(conflictSession.id, { role: "user", text: "Batch fail turn", timestamp: Date.now() }, conflictSession.authToken);
+  } catch (err: any) {
+    batchErrorCaught = true;
+  }
+  assert(batchErrorCaught, "Batch execution failure throws error to caller");
   mockDb.shouldFail = false;
 
   console.log("\n--------------------------------------------------");
