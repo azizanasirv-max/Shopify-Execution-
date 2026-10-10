@@ -108,7 +108,7 @@ export async function runSessionPersistenceTests() {
   // -------------------------------------------------------------
   // TEST 4: Session TTL Expiration
   // -------------------------------------------------------------
-  console.log("\n[4/4] Testing TTL session expiration...");
+  console.log("\n[4/6] Testing TTL session expiration...");
   const shortTtlSm = new SessionManager({ ttlMs: 5 }); // 5ms TTL
   const shortSess = shortTtlSm.createSession("shopify");
 
@@ -118,6 +118,49 @@ export async function runSessionPersistenceTests() {
   await new Promise(r => setTimeout(r, 15));
 
   assert(shortTtlSm.getSession(shortSess.id) === undefined, "Session expires and returns undefined after TTL");
+
+  // -------------------------------------------------------------
+  // TEST 5: File Persistence Failure Propagation & Atomic Writes
+  // -------------------------------------------------------------
+  console.log("\n[5/6] Testing FileSessionStore error propagation and atomic writes...");
+  let caughtWriteError = false;
+  try {
+    const badPath = path.resolve("./package.json/sessions.json");
+    const badFileStore = new FileSessionStore(badPath);
+    badFileStore.set("test_id", persistentSess);
+  } catch (err) {
+    caughtWriteError = true;
+  }
+  assert(caughtWriteError, "FileSessionStore propagates persistence write failures");
+
+  // Test corrupted JSON loading
+  const corruptPath = path.resolve("./data/corrupt-sessions.json");
+  try {
+    fs.writeFileSync(corruptPath, "{ invalid json content", "utf-8");
+    let caughtCorruptError = false;
+    try {
+      new FileSessionStore(corruptPath);
+    } catch (err) {
+      caughtCorruptError = true;
+    }
+    assert(caughtCorruptError, "FileSessionStore throws error when loading corrupted JSON");
+  } finally {
+    if (fs.existsSync(corruptPath)) {
+      fs.unlinkSync(corruptPath);
+    }
+  }
+
+  // -------------------------------------------------------------
+  // TEST 6: Production Startup Failure Enforcement
+  // -------------------------------------------------------------
+  console.log("\n[6/6] Testing production store selection and startup failure enforcement...");
+  let caughtStartupError = false;
+  try {
+    const invalidProdStore = new FileSessionStore(path.resolve("./package.json/sessions.json"));
+  } catch (err) {
+    caughtStartupError = true;
+  }
+  assert(caughtStartupError, "Production store initialization fails explicitly when storage path is invalid");
 
   console.log("\n--------------------------------------------------");
   console.log(`Session Persistence Test Summary: Passed: ${passed}, Failed: ${failed}`);

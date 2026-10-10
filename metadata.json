@@ -1,6 +1,6 @@
 {
-  "name": "lbv-sales-copilot",
-  "description": "Validation interface and Sales Brain foundation for the LBV Sales Copilot (Stage 1).",
+  "name": "LBV Sales Copilot - Technical Command Center",
+  "description": "Technical Command Center for the LBV Sales Copilot engine, architecture, and live validation.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

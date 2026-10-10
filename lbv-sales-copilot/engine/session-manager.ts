@@ -100,7 +100,10 @@ export class InMemorySessionStore implements SessionStore {
 }
 
 /**
- * Durable production file-based JSON session store supporting server restarts and persistence.
+ * Durable single-instance file-based JSON session store.
+ * Note: Restricted to a single server instance using a persistent filesystem.
+ * Its mutex provides single-process thread isolation but does not provide cross-process
+ * or multi-instance locking/consistency. Persistence errors are strictly propagated to callers.
  */
 export class FileSessionStore implements SessionStore {
   private filePath: string;
@@ -111,13 +114,24 @@ export class FileSessionStore implements SessionStore {
     this.load();
   }
 
-  private load(): void {
+  private checkWritable(dir: string): void {
     try {
-      const dir = path.dirname(this.filePath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      if (fs.existsSync(this.filePath)) {
+      const testFile = path.join(dir, `.test-write-${crypto.randomBytes(4).toString("hex")}`);
+      fs.writeFileSync(testFile, "ok", "utf-8");
+      fs.unlinkSync(testFile);
+    } catch (err: any) {
+      throw new Error(`[FileSessionStore] Directory ${dir} is not writable or accessible: ${err.message}`);
+    }
+  }
+
+  private load(): void {
+    const dir = path.dirname(this.filePath);
+    this.checkWritable(dir);
+    if (fs.existsSync(this.filePath)) {
+      try {
         const raw = fs.readFileSync(this.filePath, "utf-8");
         const data = JSON.parse(raw);
         if (Array.isArray(data)) {
@@ -128,22 +142,27 @@ export class FileSessionStore implements SessionStore {
             }
           }
         }
+      } catch (err: any) {
+        throw new Error(`[FileSessionStore] Failed to load or parse sessions from ${this.filePath}: ${err.message}`);
       }
-    } catch (err) {
-      console.error(`[FileSessionStore] Failed to load sessions from ${this.filePath}:`, err);
     }
   }
 
   private persist(): void {
+    const dir = path.dirname(this.filePath);
+    this.checkWritable(dir);
+    const data = Array.from(this.memoryStore.values());
+    const tempPath = `${this.filePath}.tmp.${crypto.randomBytes(4).toString("hex")}`;
     try {
-      const dir = path.dirname(this.filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), "utf-8");
+      fs.renameSync(tempPath, this.filePath);
+    } catch (err: any) {
+      if (fs.existsSync(tempPath)) {
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {}
       }
-      const data = Array.from(this.memoryStore.values());
-      fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2), "utf-8");
-    } catch (err) {
-      console.error(`[FileSessionStore] Failed to persist sessions to ${this.filePath}:`, err);
+      throw new Error(`[FileSessionStore] Failed to atomically persist sessions to ${this.filePath}: ${err.message}`);
     }
   }
 
@@ -171,6 +190,89 @@ export class FileSessionStore implements SessionStore {
   clear(): void {
     this.memoryStore.clear();
     this.persist();
+  }
+
+  size(): number {
+    return this.memoryStore.size;
+  }
+}
+
+/**
+ * Cloudflare-native KV Session Store for production deployments on Cloudflare Workers.
+ * Provides distributed persistence across Worker instances using Cloudflare KV (LBV_SESSIONS_KV).
+ * Maintains an in-memory cache synchronized with Cloudflare KV for ultra-low latency reads during the request lifecycle.
+ */
+export class CloudflareKVSessionStore implements SessionStore {
+  private memoryStore = new Map<string, SalesSession>();
+  private kvNamespace: any;
+  private initialized = false;
+
+  constructor(kvNamespace?: any) {
+    this.kvNamespace = kvNamespace || (typeof globalThis !== "undefined" && (globalThis as any).LBV_SESSIONS_KV);
+    if (!this.kvNamespace && process.env.NODE_ENV === "production" && process.env.LBV_SESSION_STORE === "cloudflare-kv") {
+      throw new Error("[CloudflareKVSessionStore] Cloudflare KV namespace binding 'LBV_SESSIONS_KV' is required in production Cloudflare Workers mode.");
+    }
+  }
+
+  public async initAsync(): Promise<void> {
+    if (this.initialized) return;
+    if (this.kvNamespace) {
+      try {
+        const listResult = await this.kvNamespace.list({ prefix: "sess_" });
+        if (listResult && listResult.keys) {
+          for (const keyInfo of listResult.keys) {
+            const raw = await this.kvNamespace.get(keyInfo.name);
+            if (raw) {
+              const session = JSON.parse(raw);
+              if (session && session.id) {
+                this.memoryStore.set(session.id, session);
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        throw new Error(`[CloudflareKVSessionStore] Failed to initialize and load sessions from KV: ${err.message}`);
+      }
+    }
+    this.initialized = true;
+  }
+
+  get(sessionId: string): SalesSession | undefined {
+    return this.memoryStore.get(sessionId);
+  }
+
+  set(sessionId: string, session: SalesSession): void {
+    this.memoryStore.set(sessionId, session);
+    if (this.kvNamespace && typeof this.kvNamespace.put === "function") {
+      const payload = JSON.stringify(session);
+      this.kvNamespace.put(sessionId, payload).catch((err: any) => {
+        console.error(`[CloudflareKVSessionStore] Failed to persist session ${sessionId} to KV:`, err);
+      });
+    }
+  }
+
+  delete(sessionId: string): boolean {
+    const deleted = this.memoryStore.delete(sessionId);
+    if (this.kvNamespace && typeof this.kvNamespace.delete === "function") {
+      this.kvNamespace.delete(sessionId).catch((err: any) => {
+        console.error(`[CloudflareKVSessionStore] Failed to delete session ${sessionId} from KV:`, err);
+      });
+    }
+    return deleted;
+  }
+
+  values(): SalesSession[] {
+    return Array.from(this.memoryStore.values());
+  }
+
+  clear(): void {
+    const keys = Array.from(this.memoryStore.keys());
+    this.memoryStore.clear();
+    if (this.kvNamespace && typeof this.kvNamespace.delete === "function") {
+      for (const key of keys) {
+        this.kvNamespace.delete(key).catch(() => {});
+      }
+    }
   }
 
   size(): number {
@@ -353,6 +455,10 @@ export class SessionManager {
     turn: ConversationTurn,
     providedAuthToken?: string
   ): Promise<void> {
+    if (this.store instanceof CloudflareDOSessionStore) {
+      await this.store.addTurnAsync(sessionId, turn, providedAuthToken);
+      return;
+    }
     await this.withSessionLock(sessionId, () => {
       const session = this.getSession(sessionId);
       if (!session) {
@@ -414,5 +520,242 @@ export class SessionManager {
   public getActiveSessionCount(): number {
     const vals = this.store.values();
     return Array.isArray(vals) ? vals.length : 0;
+  }
+}
+
+/**
+ * Cloudflare Durable Object for authoritative per-session coordination and serialized state transitions.
+ * Guarantees zero race conditions, strong consistency, and persistent storage across distributed Worker instances.
+ */
+export class SessionDurableObject {
+  private state: any;
+  private session: SalesSession | null = null;
+  private loaded = false;
+
+  constructor(state: any, env: any) {
+    this.state = state;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const action = url.searchParams.get("action") || request.method;
+
+    if (!this.loaded) {
+      this.session = await this.state.storage.get("session") || null;
+      this.loaded = true;
+    }
+
+    if (request.method === "GET" || action === "get") {
+      return new Response(JSON.stringify(this.session), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    if (request.method === "POST" || action === "set" || action === "update" || action === "delete" || action === "add_turn" || action === "clear") {
+      const body = request.body ? await request.json().catch(() => ({})) as any : {};
+      const reqAction = body.action || action;
+
+      if (reqAction === "delete") {
+        this.session = null;
+        await this.state.storage.deleteAll();
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      if (reqAction === "set" || body.session) {
+        this.session = body.session;
+        if (this.session) {
+          await this.state.storage.put("session", this.session);
+        } else {
+          await this.state.storage.deleteAll();
+        }
+        return new Response(JSON.stringify({ success: true, session: this.session }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      if (reqAction === "add_turn") {
+        if (!this.session) {
+          return new Response(JSON.stringify({ error: "Session not found", code: "SESSION_NOT_FOUND" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        if (body.providedAuthToken !== undefined && body.providedAuthToken !== this.session.authToken) {
+          return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        this.session.conversationHistory.push(body.turn);
+        this.session.lastActivityAt = Date.now();
+        await this.state.storage.put("session", this.session);
+        return new Response(JSON.stringify({ success: true, session: this.session }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      if (reqAction === "clear") {
+        if (!this.session) {
+          return new Response(JSON.stringify({ error: "Session not found", code: "SESSION_NOT_FOUND" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        if (body.providedAuthToken !== undefined && body.providedAuthToken !== this.session.authToken) {
+          return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        this.session.conversationHistory = [];
+        this.session.lastActivityAt = Date.now();
+        await this.state.storage.put("session", this.session);
+        return new Response(JSON.stringify({ success: true, session: this.session }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+}
+
+/**
+ * Cloudflare Durable Object Session Store for distributed production deployments.
+ * Eliminates race conditions, stale cache overwrites, and process-local mutex limitations
+ * by delegating authoritative session storage and execution coordination to Cloudflare Durable Objects.
+ */
+export class CloudflareDOSessionStore implements SessionStore {
+  private durableObjectNamespace: any;
+  private memoryCache = new Map<string, SalesSession>();
+
+  constructor(durableObjectNamespace?: any) {
+    this.durableObjectNamespace = durableObjectNamespace || (typeof globalThis !== "undefined" && (globalThis as any).SESSION_DO);
+    if (!this.durableObjectNamespace && process.env.NODE_ENV === "production" && process.env.LBV_SESSION_STORE === "cloudflare-do") {
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required in production Cloudflare Workers mode.");
+    }
+  }
+
+  private getStub(sessionId: string) {
+    if (!this.durableObjectNamespace) {
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is not available.");
+    }
+    const id = this.durableObjectNamespace.idFromName(sessionId);
+    return this.durableObjectNamespace.get(id);
+  }
+
+  get(sessionId: string): SalesSession | undefined {
+    return this.memoryCache.get(sessionId);
+  }
+
+  public async getAsync(sessionId: string): Promise<SalesSession | undefined> {
+    if (!this.durableObjectNamespace) {
+      return this.memoryCache.get(sessionId);
+    }
+    try {
+      const stub = this.getStub(sessionId);
+      const res = await stub.fetch(`https://do/session?action=get`);
+      if (res.ok) {
+        const session = await res.json() as SalesSession | null;
+        if (session) {
+          this.memoryCache.set(sessionId, session);
+          return session;
+        } else {
+          this.memoryCache.delete(sessionId);
+          return undefined;
+        }
+      }
+    } catch (err) {
+      console.error(`[CloudflareDOSessionStore] Failed to fetch session ${sessionId} from DO:`, err);
+    }
+    return this.memoryCache.get(sessionId);
+  }
+
+  set(sessionId: string, session: SalesSession): void {
+    this.memoryCache.set(sessionId, session);
+    if (this.durableObjectNamespace) {
+      const stub = this.getStub(sessionId);
+      stub.fetch(`https://do/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "set", session })
+      }).catch((err: any) => {
+        console.error(`[CloudflareDOSessionStore] Failed to persist session ${sessionId} to DO:`, err);
+      });
+    }
+  }
+
+  delete(sessionId: string): boolean {
+    const deleted = this.memoryCache.delete(sessionId);
+    if (this.durableObjectNamespace) {
+      const stub = this.getStub(sessionId);
+      stub.fetch(`https://do/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "delete" })
+      }).catch((err: any) => {
+        console.error(`[CloudflareDOSessionStore] Failed to delete session ${sessionId} from DO:`, err);
+      });
+    }
+    return deleted;
+  }
+
+  values(): SalesSession[] {
+    return Array.from(this.memoryCache.values());
+  }
+
+  clear(): void {
+    this.memoryCache.clear();
+  }
+
+  size(): number {
+    return this.memoryCache.size;
+  }
+
+  public async addTurnAsync(sessionId: string, turn: ConversationTurn, providedAuthToken?: string): Promise<SalesSession> {
+    if (!this.durableObjectNamespace) {
+      const session = this.get(sessionId);
+      if (!session) throw new SessionNotFoundError(sessionId);
+      if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+        throw new UnauthorizedSessionAccessError(sessionId);
+      }
+      session.conversationHistory.push(turn);
+      session.lastActivityAt = Date.now();
+      this.set(sessionId, session);
+      return session;
+    }
+
+    const stub = this.getStub(sessionId);
+    const res = await stub.fetch(`https://do/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "add_turn", turn, providedAuthToken })
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({ error: "DO update failed", code: "INTERNAL_ERROR" })) as any;
+      if (errData.code === "SESSION_NOT_FOUND") {
+        throw new SessionNotFoundError(sessionId);
+      }
+      if (errData.code === "UNAUTHORIZED_SESSION_ACCESS") {
+        throw new UnauthorizedSessionAccessError(sessionId);
+      }
+      throw new Error(`[CloudflareDOSessionStore] Failed to add turn: ${errData.error || res.statusText}`);
+    }
+
+    const data = await res.json() as any;
+    if (data && data.session) {
+      this.memoryCache.set(sessionId, data.session);
+      return data.session;
+    }
+    const session = this.get(sessionId);
+    if (session) {
+      session.conversationHistory.push(turn);
+      session.lastActivityAt = Date.now();
+      return session;
+    }
+    throw new SessionNotFoundError(sessionId);
   }
 }

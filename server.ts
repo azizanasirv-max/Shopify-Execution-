@@ -14,7 +14,7 @@ import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwrit
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
 import { SalesApiAdapter } from "./lbv-sales-copilot/engine/types.js";
 import { AdapterRegistry, UnknownProductError } from "./lbv-sales-copilot/engine/adapter-registry.js";
-import { SessionManager, SessionNotFoundError, MismatchedSessionProductError } from "./lbv-sales-copilot/engine/session-manager.js";
+import { SessionManager, SessionNotFoundError, MismatchedSessionProductError, FileSessionStore, InMemorySessionStore, CloudflareKVSessionStore, CloudflareDOSessionStore, SessionDurableObject, SessionStore } from "./lbv-sales-copilot/engine/session-manager.js";
 
 dotenv.config();
 
@@ -41,8 +41,23 @@ const adapterRegistry = new AdapterRegistry();
 adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
 adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
 
-// Isolated Session Manager
-const sessionManager = new SessionManager();
+// Isolated Session Manager with Production Store Selection & Startup Failure enforcement
+const requirePersistentStore = isProd || process.env.LBV_SESSION_STORE === "file" || process.env.LBV_SESSION_STORE === "cloudflare-kv";
+let sessionStore: SessionStore;
+if (process.env.LBV_SESSION_STORE === "cloudflare-kv") {
+  sessionStore = new CloudflareKVSessionStore();
+} else if (requirePersistentStore) {
+  try {
+    const sessionFilePath = path.resolve(process.env.LBV_SESSION_FILE_PATH || "./data/sessions.json");
+    sessionStore = new FileSessionStore(sessionFilePath);
+  } catch (err: any) {
+    console.error("[Startup Error] Failed to initialize FileSessionStore in production/durable mode:", err);
+    throw new Error(`Production startup failure: Durable session store initialization failed: ${err.message}`);
+  }
+} else {
+  sessionStore = new InMemorySessionStore();
+}
+let sessionManager = new SessionManager({ store: sessionStore });
 
 const salesEngine = new GenericSalesEngine({
   aiClient: ai,
@@ -240,57 +255,73 @@ app.get("/api/engine/adapters", (req, res) => {
 
 // Switch active product adapter dynamically (session-scoped playground switch)
 app.post("/api/engine/adapters/switch", (req, res) => {
-  const { adapterId } = req.body;
-  if (!adapterId || typeof adapterId !== "string") {
-    return res.status(400).json({ error: "adapterId is required." });
-  }
+  try {
+    const { adapterId } = req.body;
+    if (!adapterId || typeof adapterId !== "string") {
+      return res.status(400).json({ error: "adapterId is required." });
+    }
 
-  if (!adapterRegistry.has(adapterId)) {
-    return res.status(400).json({
-      error: `Unknown product identifier: '${adapterId}'. Cannot switch to unknown product.`,
-      code: "UNKNOWN_PRODUCT"
+    if (!adapterRegistry.has(adapterId)) {
+      return res.status(400).json({
+        error: `Unknown product identifier: '${adapterId}'. Cannot switch to unknown product.`,
+        code: "UNKNOWN_PRODUCT"
+      });
+    }
+
+    const targetAdapter = adapterRegistry.resolve(adapterId);
+
+    // Create an isolated fresh session for this product switch so state is never leaked
+    const newSession = sessionManager.createSession(targetAdapter.id);
+
+    res.json({
+      success: true,
+      sessionId: newSession.id,
+      sessionToken: newSession.authToken,
+      roomName: newSession.roomName,
+      activeAdapter: {
+        id: targetAdapter.id,
+        name: targetAdapter.name,
+        description: targetAdapter.description,
+        policies: targetAdapter.getBehavioralPolicies(),
+        tools: targetAdapter.getTools()
+      }
+    });
+  } catch (err: any) {
+    console.error("[API Error] Session persistence error on adapter switch:", err);
+    return res.status(500).json({
+      error: `Session persistence failed: ${err.message}`,
+      code: "SESSION_PERSISTENCE_ERROR"
     });
   }
-
-  const targetAdapter = adapterRegistry.resolve(adapterId);
-
-  // Create an isolated fresh session for this product switch so state is never leaked
-  const newSession = sessionManager.createSession(targetAdapter.id);
-
-  res.json({
-    success: true,
-    sessionId: newSession.id,
-    sessionToken: newSession.authToken,
-    roomName: newSession.roomName,
-    activeAdapter: {
-      id: targetAdapter.id,
-      name: targetAdapter.name,
-      description: targetAdapter.description,
-      policies: targetAdapter.getBehavioralPolicies(),
-      tools: targetAdapter.getTools()
-    }
-  });
 });
 
 // Explicit session endpoints
 // Create a new session bound to a product
 app.post("/api/sessions", (req, res) => {
-  const { productId } = req.body;
-  if (!productId || !adapterRegistry.has(productId)) {
-    return res.status(400).json({
-      error: `Valid registered productId is required. Received: '${productId}'.`,
-      code: "INVALID_PRODUCT"
+  try {
+    const { productId } = req.body;
+    if (!productId || !adapterRegistry.has(productId)) {
+      return res.status(400).json({
+        error: `Valid registered productId is required. Received: '${productId}'.`,
+        code: "INVALID_PRODUCT"
+      });
+    }
+    const adapter = adapterRegistry.resolve(productId);
+    const session = sessionManager.createSession(adapter.id);
+    res.json({
+      sessionId: session.id,
+      sessionToken: session.authToken,
+      productId: session.productId,
+      roomName: session.roomName,
+      createdAt: session.createdAt
+    });
+  } catch (err: any) {
+    console.error("[API Error] Session persistence error on session creation:", err);
+    return res.status(500).json({
+      error: `Session persistence failed: ${err.message}`,
+      code: "SESSION_PERSISTENCE_ERROR"
     });
   }
-  const adapter = adapterRegistry.resolve(productId);
-  const session = sessionManager.createSession(adapter.id);
-  res.json({
-    sessionId: session.id,
-    sessionToken: session.authToken,
-    productId: session.productId,
-    roomName: session.roomName,
-    createdAt: session.createdAt
-  });
 });
 
 // Session listing: does NOT dump all sessions across users
@@ -1167,6 +1198,97 @@ if (!isProd) {
 }
 
 const PORT = 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[Stage 1 Server] Ready at http://localhost:${PORT}`);
-});
+
+// Only listen locally if not executing as a Cloudflare Worker module
+if (typeof process !== "undefined" && !process.env.CF_WORKER) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[Stage 1 Server] Ready at http://localhost:${PORT}`);
+  });
+}
+
+import { Readable } from "stream";
+
+let cloudflareKvStoreInstance: CloudflareKVSessionStore | undefined;
+let cloudflareDoStoreInstance: CloudflareDOSessionStore | undefined;
+
+async function handleRequestWithExpress(request: Request, env: any, ctx: any): Promise<Response> {
+  if (env && env.SESSION_DO) {
+    if (!cloudflareDoStoreInstance) {
+      cloudflareDoStoreInstance = new CloudflareDOSessionStore(env.SESSION_DO);
+      sessionManager = new SessionManager({ store: cloudflareDoStoreInstance });
+    }
+  } else if (env && env.LBV_SESSIONS_KV) {
+    if (!cloudflareKvStoreInstance) {
+      cloudflareKvStoreInstance = new CloudflareKVSessionStore(env.LBV_SESSIONS_KV);
+      await cloudflareKvStoreInstance.initAsync();
+      sessionManager = new SessionManager({ store: cloudflareKvStoreInstance });
+    }
+  }
+
+  return new Promise(async (resolve) => {
+    const url = new URL(request.url);
+    const headers: Record<string, string> = {};
+    for (const [key, value] of request.headers.entries()) {
+      headers[key] = value;
+    }
+
+    const bodyBuffer = request.body ? await request.arrayBuffer() : undefined;
+    const reqStream = new Readable();
+    if (bodyBuffer) {
+      reqStream.push(Buffer.from(bodyBuffer));
+    }
+    reqStream.push(null);
+
+    const req = Object.assign(reqStream, {
+      method: request.method,
+      url: url.pathname + url.search,
+      headers,
+      connection: { encrypted: url.protocol === "https:" }
+    });
+
+    let resStatusCode = 200;
+    let resHeaders: Record<string, string> = {};
+    const chunks: Buffer[] = [];
+
+    const res = {
+      setHeader(name: string, value: string | string[]) {
+        resHeaders[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
+      },
+      getHeader(name: string) {
+        return resHeaders[name.toLowerCase()];
+      },
+      removeHeader(name: string) {
+        delete resHeaders[name.toLowerCase()];
+      },
+      writeHead(statusCode: number, headersObj?: any) {
+        resStatusCode = statusCode;
+        if (headersObj) {
+          for (const [k, v] of Object.entries(headersObj)) {
+            resHeaders[k.toLowerCase()] = String(v);
+          }
+        }
+      },
+      write(chunk: any) {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      },
+      end(chunk?: any) {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const body = Buffer.concat(chunks);
+        resolve(new Response(body, {
+          status: resStatusCode,
+          headers: resHeaders
+        }));
+      }
+    };
+
+    app(req as any, res as any);
+  });
+}
+
+export { SessionDurableObject };
+
+export default {
+  async fetch(request: Request, env: any, ctx: any): Promise<Response> {
+    return handleRequestWithExpress(request, env, ctx);
+  }
+};
