@@ -12,6 +12,7 @@ import { runApprovalGateUnitTests } from "./lbv-sales-copilot/validation/approva
 import { runAdapterIsolationTests } from "./lbv-sales-copilot/validation/adapter-isolation-tests.js";
 import { runSessionAccessControlTests } from "./lbv-sales-copilot/validation/session-access-control-tests.js";
 import { runRealtimeValidationTests } from "./lbv-sales-copilot/validation/livekit-realtime-tests.js";
+import { runSessionPersistenceTests } from "./lbv-sales-copilot/validation/session-persistence-tests.js";
 
 dotenv.config();
 
@@ -106,15 +107,20 @@ if (command === "adversarial") {
   runRealtimeValidationTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "persistence" || command === "session-persistence") {
+  runSessionPersistenceTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
 } else if (command === "hardening" || command === "unit" || command === "engine") {
   Promise.all([
     runHardeningUnitTests(),
     runApprovalGateUnitTests(),
     runAdapterIsolationTests(),
     runSessionAccessControlTests(),
-    runRealtimeValidationTests()
-  ]).then(([s1, s2, s3, s4, s5]) => {
-    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed;
+    runRealtimeValidationTests(),
+    runSessionPersistenceTests()
+  ]).then(([s1, s2, s3, s4, s5, s6]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed;
     process.exit(totalFailed === 0 ? 0 : 1);
   });
 } else {
