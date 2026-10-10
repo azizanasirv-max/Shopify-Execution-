@@ -363,11 +363,29 @@ export class SessionManager {
   public getSession(sessionId: string): SalesSession | undefined {
     if (!sessionId) return undefined;
     const session = this.store.get(sessionId);
+    if (session instanceof Promise) {
+      throw new Error("[SessionManager] getSession called on async store. Use getSessionAsync instead.");
+    }
     if (!session) return undefined;
 
     // Verify TTL
     if (Date.now() - session.lastActivityAt > this.ttlMs) {
       this.store.delete(sessionId);
+      return undefined;
+    }
+
+    return session;
+  }
+
+  public async getSessionAsync(sessionId: string): Promise<SalesSession | undefined> {
+    if (!sessionId) return undefined;
+    const raw = this.store.get(sessionId);
+    const session = raw instanceof Promise ? await raw : raw;
+    if (!session) return undefined;
+
+    if (Date.now() - session.lastActivityAt > this.ttlMs) {
+      const del = this.store.delete(sessionId);
+      if (del instanceof Promise) await del;
       return undefined;
     }
 
@@ -380,6 +398,7 @@ export class SessionManager {
   public findSessionByToken(token: string): SalesSession | undefined {
     if (!token) return undefined;
     const vals = this.store.values();
+    if (vals instanceof Promise) return undefined;
     const sessions = Array.isArray(vals) ? vals : [];
     for (const session of sessions) {
       if (session.authToken === token) {
@@ -417,6 +436,28 @@ export class SessionManager {
     return session;
   }
 
+  public async validateSessionAuthorizationAsync(
+    sessionId: string,
+    providedAuthToken?: string
+  ): Promise<SalesSession> {
+    if (!sessionId) {
+      throw new SessionNotFoundError("undefined");
+    }
+    const session = await this.getSessionAsync(sessionId);
+    if (!session) {
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    if (!providedAuthToken || providedAuthToken.trim() !== session.authToken) {
+      throw new UnauthorizedSessionAccessError(sessionId);
+    }
+
+    session.lastActivityAt = Date.now();
+    const res = this.store.set(session.id, session);
+    if (res instanceof Promise) await res;
+    return session;
+  }
+
   /**
    * Validates that a session exists and belongs to the requested product.
    */
@@ -444,6 +485,64 @@ export class SessionManager {
 
     session.lastActivityAt = Date.now();
     this.store.set(session.id, session);
+    return session;
+  }
+
+  public async validateSessionProductAsync(
+    sessionId: string,
+    requestedProductId: string,
+    registry?: AdapterRegistry
+  ): Promise<SalesSession> {
+    const session = await this.getSessionAsync(sessionId);
+    if (!session) {
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    const targetCanonicalId = registry
+      ? registry.getCanonicalId(requestedProductId) || requestedProductId
+      : requestedProductId;
+
+    const sessionCanonicalId = registry
+      ? registry.getCanonicalId(session.productId) || session.productId
+      : session.productId;
+
+    if (sessionCanonicalId !== targetCanonicalId) {
+      throw new MismatchedSessionProductError(sessionId, session.productId, requestedProductId);
+    }
+
+    session.lastActivityAt = Date.now();
+    const res = this.store.set(session.id, session);
+    if (res instanceof Promise) await res;
+    return session;
+  }
+
+  public async createSessionAsync(
+    canonicalProductId: string,
+    metadata: Record<string, any> = {},
+    explicitId?: string,
+    explicitAuthToken?: string
+  ): Promise<SalesSession> {
+    if (!canonicalProductId || typeof canonicalProductId !== "string") {
+      throw new Error("Cannot create session without a valid canonicalProductId.");
+    }
+
+    const id = explicitId || `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const authToken = explicitAuthToken || `stok_${crypto.randomBytes(24).toString("hex")}`;
+    const roomName = `room_${canonicalProductId}_${id}`;
+
+    const session: SalesSession = {
+      id,
+      authToken,
+      productId: canonicalProductId,
+      roomName,
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
+      conversationHistory: [],
+      metadata: { ...metadata }
+    };
+
+    const res = this.store.set(id, session);
+    if (res instanceof Promise) await res;
     return session;
   }
 
@@ -623,18 +722,17 @@ export class SessionDurableObject {
 }
 
 /**
- * Cloudflare Durable Object Session Store for distributed production deployments.
- * Eliminates race conditions, stale cache overwrites, and process-local mutex limitations
- * by delegating authoritative session storage and execution coordination to Cloudflare Durable Objects.
- */
+  * Cloudflare Durable Object Session Store for distributed production deployments.
+  * Eliminates race conditions, stale cache overwrites, and process-local mutex limitations
+  * by delegating authoritative session storage and execution coordination to Cloudflare Durable Objects.
+  */
 export class CloudflareDOSessionStore implements SessionStore {
   private durableObjectNamespace: any;
-  private memoryCache = new Map<string, SalesSession>();
 
   constructor(durableObjectNamespace?: any) {
     this.durableObjectNamespace = durableObjectNamespace || (typeof globalThis !== "undefined" && (globalThis as any).SESSION_DO);
-    if (!this.durableObjectNamespace && process.env.NODE_ENV === "production" && process.env.LBV_SESSION_STORE === "cloudflare-do") {
-      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required in production Cloudflare Workers mode.");
+    if (!this.durableObjectNamespace && (process.env.NODE_ENV === "production" || process.env.LBV_SESSION_STORE === "cloudflare-do")) {
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required in production Cloudflare Workers mode. Refusing fallback to local memory.");
     }
   }
 
@@ -646,85 +744,64 @@ export class CloudflareDOSessionStore implements SessionStore {
     return this.durableObjectNamespace.get(id);
   }
 
-  get(sessionId: string): SalesSession | undefined {
-    return this.memoryCache.get(sessionId);
-  }
-
-  public async getAsync(sessionId: string): Promise<SalesSession | undefined> {
+  public async get(sessionId: string): Promise<SalesSession | undefined> {
     if (!this.durableObjectNamespace) {
-      return this.memoryCache.get(sessionId);
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required for authoritative reads.");
     }
-    try {
-      const stub = this.getStub(sessionId);
-      const res = await stub.fetch(`https://do/session?action=get`);
-      if (res.ok) {
-        const session = await res.json() as SalesSession | null;
-        if (session) {
-          this.memoryCache.set(sessionId, session);
-          return session;
-        } else {
-          this.memoryCache.delete(sessionId);
-          return undefined;
-        }
-      }
-    } catch (err) {
-      console.error(`[CloudflareDOSessionStore] Failed to fetch session ${sessionId} from DO:`, err);
+    const stub = this.getStub(sessionId);
+    const res = await stub.fetch(`https://do/session?action=get`);
+    if (!res.ok) {
+      throw new Error(`[CloudflareDOSessionStore] Authoritative read failed for session ${sessionId}: ${res.statusText}`);
     }
-    return this.memoryCache.get(sessionId);
+    const session = await res.json() as SalesSession | null;
+    return session || undefined;
   }
 
-  set(sessionId: string, session: SalesSession): void {
-    this.memoryCache.set(sessionId, session);
-    if (this.durableObjectNamespace) {
-      const stub = this.getStub(sessionId);
-      stub.fetch(`https://do/session`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "set", session })
-      }).catch((err: any) => {
-        console.error(`[CloudflareDOSessionStore] Failed to persist session ${sessionId} to DO:`, err);
-      });
+  public async set(sessionId: string, session: SalesSession): Promise<void> {
+    if (!this.durableObjectNamespace) {
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required for authoritative writes.");
+    }
+    const stub = this.getStub(sessionId);
+    const res = await stub.fetch(`https://do/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "set", session })
+    });
+    if (!res.ok) {
+      throw new Error(`[CloudflareDOSessionStore] Authoritative persist failed for session ${sessionId}: ${res.statusText}`);
     }
   }
 
-  delete(sessionId: string): boolean {
-    const deleted = this.memoryCache.delete(sessionId);
-    if (this.durableObjectNamespace) {
-      const stub = this.getStub(sessionId);
-      stub.fetch(`https://do/session`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "delete" })
-      }).catch((err: any) => {
-        console.error(`[CloudflareDOSessionStore] Failed to delete session ${sessionId} from DO:`, err);
-      });
+  public async delete(sessionId: string): Promise<boolean> {
+    if (!this.durableObjectNamespace) {
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required for authoritative deletions.");
     }
-    return deleted;
+    const stub = this.getStub(sessionId);
+    const res = await stub.fetch(`https://do/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete" })
+    });
+    if (!res.ok) {
+      throw new Error(`[CloudflareDOSessionStore] Authoritative delete failed for session ${sessionId}: ${res.statusText}`);
+    }
+    const data = await res.json() as any;
+    return Boolean(data && data.success);
   }
 
   values(): SalesSession[] {
-    return Array.from(this.memoryCache.values());
+    return [];
   }
 
-  clear(): void {
-    this.memoryCache.clear();
-  }
+  clear(): void {}
 
   size(): number {
-    return this.memoryCache.size;
+    return 0;
   }
 
   public async addTurnAsync(sessionId: string, turn: ConversationTurn, providedAuthToken?: string): Promise<SalesSession> {
     if (!this.durableObjectNamespace) {
-      const session = this.get(sessionId);
-      if (!session) throw new SessionNotFoundError(sessionId);
-      if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
-        throw new UnauthorizedSessionAccessError(sessionId);
-      }
-      session.conversationHistory.push(turn);
-      session.lastActivityAt = Date.now();
-      this.set(sessionId, session);
-      return session;
+      throw new Error("[CloudflareDOSessionStore] Durable Object namespace binding 'SESSION_DO' is required.");
     }
 
     const stub = this.getStub(sessionId);
@@ -747,14 +824,7 @@ export class CloudflareDOSessionStore implements SessionStore {
 
     const data = await res.json() as any;
     if (data && data.session) {
-      this.memoryCache.set(sessionId, data.session);
       return data.session;
-    }
-    const session = this.get(sessionId);
-    if (session) {
-      session.conversationHistory.push(turn);
-      session.lastActivityAt = Date.now();
-      return session;
     }
     throw new SessionNotFoundError(sessionId);
   }

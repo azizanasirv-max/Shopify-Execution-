@@ -144,7 +144,7 @@ app.post("/api/copilot", async (req, res) => {
 
     // 1. Resolve product identifier and session
     let targetProductId = productId;
-    let session = sessionId ? sessionManager.getSession(sessionId) : undefined;
+    let session = sessionId ? await sessionManager.getSessionAsync(sessionId) : undefined;
 
     if (sessionId && !session) {
       return res.status(404).json({
@@ -165,7 +165,7 @@ app.post("/api/copilot", async (req, res) => {
       if (targetProductId) {
         // Verify session belongs to requested product (prevent cross-product switching)
         try {
-          sessionManager.validateSessionProduct(session.id, targetProductId, adapterRegistry);
+          await sessionManager.validateSessionProductAsync(session.id, targetProductId, adapterRegistry);
         } catch (mismatchErr: any) {
           return res.status(400).json({
             error: mismatchErr.message,
@@ -198,7 +198,7 @@ app.post("/api/copilot", async (req, res) => {
 
     // 3. Resolve or create sales session
     if (!session) {
-      session = sessionManager.createSession(targetAdapter.id);
+      session = await sessionManager.createSessionAsync(targetAdapter.id);
     }
 
     // 4. Execute recommendation request-scoped with isolated session
@@ -228,12 +228,12 @@ app.post("/api/copilot", async (req, res) => {
 });
 
 // Inspect available and active product adapters in the Generic Engine
-app.get("/api/engine/adapters", (req, res) => {
+app.get("/api/engine/adapters", async (req, res) => {
   const { sessionId, productId } = req.query;
   let activeAdapter: SalesApiAdapter = shopifyAdapter;
 
   if (sessionId && typeof sessionId === "string") {
-    const session = sessionManager.getSession(sessionId);
+    const session = await sessionManager.getSessionAsync(sessionId);
     if (session && adapterRegistry.has(session.productId)) {
       activeAdapter = adapterRegistry.resolve(session.productId);
     }
@@ -254,7 +254,7 @@ app.get("/api/engine/adapters", (req, res) => {
 });
 
 // Switch active product adapter dynamically (session-scoped playground switch)
-app.post("/api/engine/adapters/switch", (req, res) => {
+app.post("/api/engine/adapters/switch", async (req, res) => {
   try {
     const { adapterId } = req.body;
     if (!adapterId || typeof adapterId !== "string") {
@@ -271,7 +271,7 @@ app.post("/api/engine/adapters/switch", (req, res) => {
     const targetAdapter = adapterRegistry.resolve(adapterId);
 
     // Create an isolated fresh session for this product switch so state is never leaked
-    const newSession = sessionManager.createSession(targetAdapter.id);
+    const newSession = await sessionManager.createSessionAsync(targetAdapter.id);
 
     res.json({
       success: true,
@@ -297,7 +297,7 @@ app.post("/api/engine/adapters/switch", (req, res) => {
 
 // Explicit session endpoints
 // Create a new session bound to a product
-app.post("/api/sessions", (req, res) => {
+app.post("/api/sessions", async (req, res) => {
   try {
     const { productId } = req.body;
     if (!productId || !adapterRegistry.has(productId)) {
@@ -307,7 +307,7 @@ app.post("/api/sessions", (req, res) => {
       });
     }
     const adapter = adapterRegistry.resolve(productId);
-    const session = sessionManager.createSession(adapter.id);
+    const session = await sessionManager.createSessionAsync(adapter.id);
     res.json({
       sessionId: session.id,
       sessionToken: session.authToken,
@@ -325,7 +325,7 @@ app.post("/api/sessions", (req, res) => {
 });
 
 // Session listing: does NOT dump all sessions across users
-app.get("/api/sessions", (req, res) => {
+app.get("/api/sessions", async (req, res) => {
   const token =
     (req.headers["x-session-token"] as string) ||
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
@@ -363,13 +363,13 @@ app.get("/api/sessions", (req, res) => {
 });
 
 // Get session details (requires session authorization token)
-app.get("/api/sessions/:id", (req, res) => {
+app.get("/api/sessions/:id", async (req, res) => {
   const token =
     (req.headers["x-session-token"] as string) ||
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     (req.query.sessionToken as string);
 
-  const session = sessionManager.getSession(req.params.id);
+  const session = await sessionManager.getSessionAsync(req.params.id);
   if (!session) {
     return res.status(404).json({ error: "Session not found or expired.", code: "SESSION_NOT_FOUND" });
   }
@@ -393,26 +393,28 @@ app.get("/api/sessions/:id", (req, res) => {
 });
 
 // Clear session history (requires session authorization token)
-app.post("/api/sessions/:id/clear", (req, res) => {
+app.post("/api/sessions/:id/clear", async (req, res) => {
   const token =
     (req.headers["x-session-token"] as string) ||
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     (req.body?.sessionToken as string);
 
-  const session = sessionManager.getSession(req.params.id);
-  if (!session) {
-    return res.status(404).json({ error: "Session not found or expired.", code: "SESSION_NOT_FOUND" });
+  try {
+    const session = await sessionManager.validateSessionAuthorizationAsync(req.params.id, token);
+    session.conversationHistory = [];
+    session.lastActivityAt = Date.now();
+    const resStore = sessionManager.getStore().set(session.id, session);
+    if (resStore instanceof Promise) await resStore;
+    res.json({ success: true, message: `Session ${session.id} history cleared.` });
+  } catch (err: any) {
+    if (err instanceof SessionNotFoundError) {
+      return res.status(404).json({ error: err.message, code: "SESSION_NOT_FOUND" });
+    }
+    if (err instanceof UnauthorizedSessionAccessError) {
+      return res.status(403).json({ error: err.message, code: "UNAUTHORIZED_SESSION_ACCESS" });
+    }
+    return res.status(500).json({ error: err.message, code: "INTERNAL_ERROR" });
   }
-
-  if (!token || token !== session.authToken) {
-    return res.status(403).json({
-      error: "Unauthorized access: Valid session authorization token is required to clear this session.",
-      code: "UNAUTHORIZED_SESSION_ACCESS"
-    });
-  }
-
-  sessionManager.clearSession(session.id, token);
-  res.json({ success: true, message: `Session ${session.id} history cleared.` });
 });
 
 // Run a complete batch of adversarial testing against the Sales Brain
