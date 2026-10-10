@@ -24,17 +24,12 @@ import {
   UnauthorizedSessionAccessError,
   InMemorySessionStore,
   CloudflareD1SessionStore,
-  CloudflareDOSessionStore,
-  SessionDurableObject,
   SessionStore
 } from "./lbv-sales-copilot/engine/session-manager.js";
 import { ModelProvider } from "./lbv-sales-copilot/engine/types.js";
 
-export { SessionDurableObject };
-
 export interface Env {
   DB?: any; // Cloudflare D1
-  SESSION_DO?: any; // Cloudflare Durable Object
   GEMINI_API_KEY?: string;
   ADMIN_API_KEY?: string;
   NODE_ENV?: string;
@@ -143,17 +138,17 @@ export function createWorkerServices(env: Env) {
   adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
   adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
 
-  // 2. Authoritative Session Store Selection (D1 -> DO -> KV -> local)
+  // 2. Authoritative Session Store Selection (D1 authoritative, zero fallback in production)
   let sessionStore: SessionStore;
-  const isProd = env.NODE_ENV === "production" || process.env.NODE_ENV === "production";
+  const isProd =
+    env.NODE_ENV === "production" ||
+    (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
 
   if (env.DB) {
     sessionStore = new CloudflareD1SessionStore(env.DB);
-  } else if (env.SESSION_DO) {
-    sessionStore = new CloudflareDOSessionStore(env.SESSION_DO);
   } else if (isProd || env.LBV_SESSION_STORE === "cloudflare-d1") {
     throw new Error(
-      "[Production Error] Cloudflare D1 persistent database binding 'DB' is required in production Cloudflare Workers mode. Refusing insecure fallback to memory."
+      "[Production Error] Cloudflare D1 persistent database binding 'DB' is required in production Cloudflare Workers mode. Refusing insecure fallback to memory, DO, or KV."
     );
   } else {
     sessionStore = new InMemorySessionStore();

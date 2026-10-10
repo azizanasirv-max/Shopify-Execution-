@@ -15,12 +15,3 @@ database_name = "lbv-sales-sessions"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-[durable_objects]
-bindings = [
-  { name = "SESSION_DO", class_name = "SessionDurableObject" }
-]
-
-[[migrations]]
-tag = "v1"
-new_classes = ["SessionDurableObject"]
-
