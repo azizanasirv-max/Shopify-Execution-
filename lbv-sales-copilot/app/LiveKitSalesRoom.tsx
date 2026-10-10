@@ -345,8 +345,8 @@ export default function LiveKitSalesRoom({
             const isFinal = publication.isFinal === true || publication.final === true;
             const text = publication.text || publication.transcript || "";
 
-            // Defect B4: Use stable segment identifier, fallback to hash of text and publication identity
-            const segmentId = publication.id || publication.segmentId || `${publication.participantIdentity || participant?.identity || 'p'}_${text}`;
+            // Defect B4: Use stable segment identifier (publication.id or publication.segmentId). No timestamp fallback!
+            const segmentId = publication.id || publication.segmentId || `${publication.participantIdentity || participant?.identity || 'prospect'}_${text}`;
 
             // Defect B2: Trustworthy participant identity resolution. Do not default unknown speakers to prospect!
             const rawIdentity = participant?.identity || publication.participantIdentity;

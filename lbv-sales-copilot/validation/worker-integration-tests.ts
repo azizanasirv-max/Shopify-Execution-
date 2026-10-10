@@ -258,7 +258,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   // TEST 9: Transcript Ingress Validation Checks (Defects A1-A4)
   // -------------------------------------------------------------
   console.log("\n[9/9] Testing transcript ingress validation checks...");
-  // Non-boolean isFinal rejected
+  // Non-boolean or non-true isFinal rejected
   const nonBoolFinalReq = new Request("https://worker.local/api/livekit/transcript", {
     method: "POST",
     headers: {
@@ -276,6 +276,23 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(nonBoolFinalRes.status === 400, "Non-boolean isFinal rejected with 400");
   const nonBoolData = await nonBoolFinalRes.json() as any;
   assert(nonBoolData.code === "INVALID_FINAL_STATUS", "Error code is INVALID_FINAL_STATUS");
+
+  // false isFinal rejected
+  const falseFinalReq = new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Token": sessionData.sessionToken
+    },
+    body: JSON.stringify({
+      sessionId: sessionData.sessionId,
+      text: "Hello",
+      isFinal: false,
+      speaker: "prospect"
+    })
+  });
+  const falseFinalRes = await worker.fetch(falseFinalReq, testEnv);
+  assert(falseFinalRes.status === 400, "false isFinal rejected with 400");
 
   // Invalid speaker rejected (must not default unknown speaker to prospect)
   const invalidSpeakerReq = new Request("https://worker.local/api/livekit/transcript", {

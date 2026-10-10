@@ -771,9 +771,9 @@ export default {
           return errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
         }
 
-        // Defect A1 & A2: Strict boolean isFinal check
-        if (typeof isFinal !== "boolean") {
-          return errorResponse("isFinal must be an explicit boolean value.", "INVALID_FINAL_STATUS", 400, corsHeaders);
+        // Defect A1 & A2: Strict boolean isFinal check (reject missing, null, string, or false values)
+        if (typeof isFinal !== "boolean" || isFinal !== true) {
+          return errorResponse("isFinal must be an explicit boolean true value for recommendation generation.", "INVALID_FINAL_STATUS", 400, corsHeaders);
         }
 
         // Defect A3: Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)

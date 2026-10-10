@@ -1124,8 +1124,8 @@ app.post("/api/livekit/transcript", async (req, res) => {
       return res.status(403).json({ error: "Unauthorized access: Valid session authorization token is required.", code: "UNAUTHORIZED_SESSION_ACCESS" });
     }
 
-    if (typeof isFinal !== "boolean") {
-      return res.status(400).json({ error: "isFinal must be an explicit boolean value.", code: "INVALID_FINAL_STATUS" });
+    if (typeof isFinal !== "boolean" || isFinal !== true) {
+      return res.status(400).json({ error: "isFinal must be an explicit boolean true value for recommendation generation.", code: "INVALID_FINAL_STATUS" });
     }
 
     if (speaker !== "prospect" && speaker !== "salesperson") {
