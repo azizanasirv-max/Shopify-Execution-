@@ -495,6 +495,26 @@ export async function runSessionAccessControlTests() {
   assert(testRec.engineMetadata.sessionId === simSession.id, "engineMetadata tracks sessionId");
   assert(simSession.conversationHistory.length === 2, "Conversation turn recorded in isolated session history");
 
+  // -------------------------------------------------------------
+  // TEST 13: Pluggable Session Store & Persistence Architecture
+  // -------------------------------------------------------------
+  console.log("\n[13/13] Testing pluggable session store and persistence architecture...");
+  const customStore = {
+    storeMap: new Map<string, any>(),
+    get(id: string) { return this.storeMap.get(id); },
+    set(id: string, s: any) { this.storeMap.set(id, s); },
+    delete(id: string) { return this.storeMap.delete(id); },
+    values() { return Array.from(this.storeMap.values()); },
+    clear() { this.storeMap.clear(); },
+    size() { return this.storeMap.size; }
+  };
+  const customManager = new SessionManager({ store: customStore, ttlMs: 5000 });
+  const customSess = customManager.createSession("shopify-conversion-pilot");
+  assert(customStore.size() === 1, "Custom SessionStore successfully receives created session");
+  assert(customManager.getSession(customSess.id)?.id === customSess.id, "Custom SessionStore retrieves session correctly");
+  customManager.deleteSession(customSess.id, customSess.authToken);
+  assert(customStore.size() === 0, "Custom SessionStore successfully deletes session");
+
   console.log("\n--------------------------------------------------");
   console.log(`Session Access Control Tests Summary: Passed: ${passed} | Failed: ${failed} | Total: ${passed + failed}`);
   console.log("==================================================");

@@ -53,17 +53,56 @@ export class SessionExpiredError extends Error {
   }
 }
 
+export interface SessionStore {
+  get(sessionId: string): SalesSession | undefined;
+  set(sessionId: string, session: SalesSession): void;
+  delete(sessionId: string): boolean;
+  values(): SalesSession[];
+  clear(): void;
+  size(): number;
+}
+
+export class InMemorySessionStore implements SessionStore {
+  private store = new Map<string, SalesSession>();
+
+  get(sessionId: string): SalesSession | undefined {
+    return this.store.get(sessionId);
+  }
+
+  set(sessionId: string, session: SalesSession): void {
+    this.store.set(sessionId, session);
+  }
+
+  delete(sessionId: string): boolean {
+    return this.store.delete(sessionId);
+  }
+
+  values(): SalesSession[] {
+    return Array.from(this.store.values());
+  }
+
+  clear(): void {
+    this.store.clear();
+  }
+
+  size(): number {
+    return this.store.size;
+  }
+}
+
 export interface SessionManagerOptions {
   ttlMs?: number;
+  store?: SessionStore;
 }
 
 export class SessionManager {
-  private sessions = new Map<string, SalesSession>();
+  private store: SessionStore;
   private readonly ttlMs: number;
 
   constructor(options?: SessionManagerOptions) {
     // Default TTL: 1 hour of inactivity
     this.ttlMs = options?.ttlMs ?? 60 * 60 * 1000;
+    this.store = options?.store ?? new InMemorySessionStore();
   }
 
   /**
@@ -95,7 +134,7 @@ export class SessionManager {
       metadata: { ...metadata }
     };
 
-    this.sessions.set(id, session);
+    this.store.set(id, session);
     return session;
   }
 
@@ -105,12 +144,12 @@ export class SessionManager {
    */
   public getSession(sessionId: string): SalesSession | undefined {
     if (!sessionId) return undefined;
-    const session = this.sessions.get(sessionId);
+    const session = this.store.get(sessionId);
     if (!session) return undefined;
 
     // Verify TTL
     if (Date.now() - session.lastActivityAt > this.ttlMs) {
-      this.sessions.delete(sessionId);
+      this.store.delete(sessionId);
       return undefined;
     }
 
@@ -122,10 +161,10 @@ export class SessionManager {
    */
   public findSessionByToken(token: string): SalesSession | undefined {
     if (!token) return undefined;
-    for (const session of this.sessions.values()) {
+    for (const session of this.store.values()) {
       if (session.authToken === token) {
         if (Date.now() - session.lastActivityAt > this.ttlMs) {
-          this.sessions.delete(session.id);
+          this.store.delete(session.id);
           return undefined;
         }
         return session;
@@ -230,13 +269,13 @@ export class SessionManager {
     if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
-    return this.sessions.delete(sessionId);
+    return this.store.delete(sessionId);
   }
 
   /**
    * Active session count (for telemetry/metrics).
    */
   public getActiveSessionCount(): number {
-    return this.sessions.size;
+    return this.store.size();
   }
 }
