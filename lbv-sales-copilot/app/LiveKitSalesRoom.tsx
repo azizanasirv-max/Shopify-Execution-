@@ -38,11 +38,64 @@ interface ParticipantAudioState {
   audioTrack?: any;
 }
 
-export default function LiveKitSalesRoom() {
-  const [roomName, setRoomName] = useState("lbv-sales-demo-01");
+export interface LiveKitSalesRoomProps {
+  sessionId?: string | null;
+  sessionToken?: string | null;
+  productId?: string;
+}
+
+export default function LiveKitSalesRoom({
+  sessionId: propSessionId,
+  sessionToken: propSessionToken,
+  productId: propProductId = "shopify-conversion-pilot"
+}: LiveKitSalesRoomProps = {}) {
+  const [roomName, setRoomName] = useState("auto-derived-from-session");
   const [identity, setIdentity] = useState<"prospect" | "salesperson">("prospect");
   const [displayName, setDisplayName] = useState("");
   
+  // Session tracking
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(propSessionId || null);
+  const [activeSessionToken, setActiveSessionToken] = useState<string | null>(propSessionToken || null);
+  const [activeProductId, setActiveProductId] = useState<string>(propProductId);
+  const [isSimulatedMode, setIsSimulatedMode] = useState<boolean>(false);
+  const [inviteCopied, setInviteCopied] = useState<boolean>(false);
+  const [showManualSession, setShowManualSession] = useState<boolean>(false);
+  const [manualSessionIdInput, setManualSessionIdInput] = useState<string>("");
+  const [manualSessionTokenInput, setManualSessionTokenInput] = useState<string>("");
+
+  // Sync prop changes
+  useEffect(() => {
+    if (propSessionId) setActiveSessionId(propSessionId);
+    if (propSessionToken) setActiveSessionToken(propSessionToken);
+    if (propProductId) setActiveProductId(propProductId);
+  }, [propSessionId, propSessionToken, propProductId]);
+
+  // Read URL params on mount to support instant 2-browser test links
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const qSessionId = params.get("sessionId");
+      const qSessionToken = params.get("sessionToken");
+      const qProductId = params.get("productId");
+      const qRole = params.get("role");
+      if (qSessionId) {
+        setActiveSessionId(qSessionId);
+        setManualSessionIdInput(qSessionId);
+      }
+      if (qSessionToken) {
+        setActiveSessionToken(qSessionToken);
+        setManualSessionTokenInput(qSessionToken);
+      }
+      if (qProductId) setActiveProductId(qProductId);
+      if (qRole === "salesperson" || qRole === "prospect") {
+        setIdentity(qRole);
+      } else if (qSessionId) {
+        // When joining via an existing invite link, default to salesperson
+        setIdentity("salesperson");
+      }
+    }
+  }, []);
+
   // Connection states
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.Disconnected);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -131,22 +184,44 @@ export default function LiveKitSalesRoom() {
   };
 
   const handleJoinRoom = async () => {
-    if (!roomName.trim()) {
-      setErrorMessage("Please enter a room name.");
-      return;
-    }
-
     setErrorMessage(null);
     setIsConnecting(true);
 
     try {
-      // 1. Fetch short-lived token from our secure server endpoint
+      let currentSessionId = activeSessionId;
+      let currentSessionToken = activeSessionToken;
+
+      // Ensure an authorized session exists before requesting a LiveKit token
+      if (!currentSessionId || !currentSessionToken) {
+        const sessRes = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ productId: activeProductId })
+        });
+        if (!sessRes.ok) {
+          const sessErr = await sessRes.json();
+          throw new Error(sessErr.error || "Failed to create sales session.");
+        }
+        const sessData = await sessRes.json();
+        currentSessionId = sessData.sessionId;
+        currentSessionToken = sessData.sessionToken;
+        setActiveSessionId(sessData.sessionId);
+        setActiveSessionToken(sessData.sessionToken);
+        if (sessData.roomName) setRoomName(sessData.roomName);
+      }
+
+      // 1. Fetch token from our hardened server endpoint
       const effectiveName = displayName.trim() || (identity === "prospect" ? "Prospect User" : "Sales Representative");
       const res = await fetch("/api/livekit/token", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
+        },
         body: JSON.stringify({
-          roomName: roomName.trim(),
+          sessionId: currentSessionId,
+          sessionToken: currentSessionToken,
+          productId: activeProductId,
           identity,
           name: effectiveName
         }),
@@ -157,9 +232,34 @@ export default function LiveKitSalesRoom() {
         throw new Error(errData.message || errData.error || `Server returned ${res.status}`);
       }
 
-      const { token, serverUrl } = await res.json();
+      const { token, serverUrl, roomName: serverRoom, mode } = await res.json();
+      if (serverRoom) setRoomName(serverRoom);
 
-      // 2. Initialize LiveKit Room client
+      // Handle simulated mode safely
+      if (mode === "simulated") {
+        setIsSimulatedMode(true);
+        setConnectionState(ConnectionState.Connected);
+        setIsConnecting(false);
+        setParticipants([
+          {
+            identity,
+            name: effectiveName,
+            isLocal: true,
+            isSpeaking: false,
+            isAudioEnabled: isMicEnabled
+          },
+          {
+            identity: identity === "prospect" ? "salesperson" : "prospect",
+            name: identity === "prospect" ? "Sales Representative (Simulated)" : "Store Owner (Simulated)",
+            isLocal: false,
+            isSpeaking: false,
+            isAudioEnabled: true
+          }
+        ]);
+        return;
+      }
+
+      // 2. Initialize LiveKit Room client for real cloud connection
       const room = new Room({
         adaptiveStream: true,
         dynacast: true,
@@ -187,7 +287,6 @@ export default function LiveKitSalesRoom() {
           updateParticipantsList(room);
         })
         .on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
-          // Remove attached audio element if exists
           const el = audioElementsRef.current.get(participant.identity);
           if (el) {
             el.remove();
@@ -230,26 +329,66 @@ export default function LiveKitSalesRoom() {
       // 3. Connect to LiveKit Room
       await room.connect(serverUrl, token);
 
-      // 4. Publish local microphone track
+      // 4. Start audio playback context to satisfy browser autoplay policies
+      try {
+        await room.startAudio();
+      } catch (audioErr) {
+        console.warn("Audio autoplay policy restriction on startAudio:", audioErr);
+      }
+
+      // 5. Attach any existing subscribed remote audio tracks (in case other participant joined first)
+      room.remoteParticipants.forEach((p) => {
+        p.trackPublications.forEach((pub) => {
+          if (pub.track && pub.track.kind === Track.Kind.Audio && !audioElementsRef.current.has(p.identity)) {
+            const el = pub.track.attach();
+            el.autoplay = true;
+            audioElementsRef.current.set(p.identity, el);
+          }
+        });
+      });
+
+      // 6. Publish local microphone track
       try {
         await room.localParticipant.setMicrophoneEnabled(isMicEnabled);
         setAudioPermissionGranted(true);
       } catch (micErr: any) {
         console.warn("Microphone permission was denied or failed:", micErr);
         setAudioPermissionGranted(false);
+        setErrorMessage(
+          "Microphone permission was denied or device is unavailable. You are connected to the room as a listener, but your microphone audio will not be broadcast."
+        );
       }
 
       updateParticipantsList(room);
 
     } catch (err: any) {
       console.error("LiveKit connection error:", err);
-      setErrorMessage(err.message || "Failed to connect to LiveKit room.");
+      let userFriendlyMessage = err.message || "Failed to connect to LiveKit room.";
+      if (userFriendlyMessage.includes("UNAUTHORIZED") || userFriendlyMessage.includes("Unauthorized")) {
+        userFriendlyMessage = "Unauthorized session: The provided session token is invalid or does not match this session.";
+      } else if (userFriendlyMessage.includes("SESSION_NOT_FOUND") || userFriendlyMessage.includes("not found")) {
+        userFriendlyMessage = "Session expired or not found. Please establish a new sales session.";
+      } else if (userFriendlyMessage.includes("MISMATCHED_SESSION_PRODUCT")) {
+        userFriendlyMessage = "Product mismatch: This session belongs to another product and cannot join this room.";
+      } else if (userFriendlyMessage.includes("network") || userFriendlyMessage.includes("WebSocket") || userFriendlyMessage.includes("failed to connect")) {
+        userFriendlyMessage = "Network connection failed. Unable to connect to LiveKit Cloud. Please check your connection.";
+      }
+      setErrorMessage(userFriendlyMessage);
       setIsConnecting(false);
       setConnectionState(ConnectionState.Disconnected);
     }
   };
 
   const handleToggleMic = async () => {
+    if (isSimulatedMode) {
+      const nextState = !isMicEnabled;
+      setIsMicEnabled(nextState);
+      setParticipants((prev) =>
+        prev.map((p) => (p.isLocal ? { ...p, isAudioEnabled: nextState } : p))
+      );
+      return;
+    }
+
     if (!roomRef.current || roomRef.current.state !== ConnectionState.Connected) {
       setIsMicEnabled(!isMicEnabled);
       return;
@@ -271,12 +410,78 @@ export default function LiveKitSalesRoom() {
       roomRef.current.disconnect();
       roomRef.current = null;
     }
-    // Clean up all audio elements
     audioElementsRef.current.forEach((el) => el.remove());
     audioElementsRef.current.clear();
     setConnectionState(ConnectionState.Disconnected);
     setParticipants([]);
     setIsConnecting(false);
+    setIsSimulatedMode(false);
+  };
+
+  const handleCopyInviteLink = async () => {
+    try {
+      let curId = activeSessionId;
+      let curToken = activeSessionToken;
+      if (!curId || !curToken) {
+        const sessRes = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ productId: activeProductId })
+        });
+        if (sessRes.ok) {
+          const sessData = await sessRes.json();
+          curId = sessData.sessionId;
+          curToken = sessData.sessionToken;
+          setActiveSessionId(curId);
+          setActiveSessionToken(curToken);
+          if (sessData.roomName) setRoomName(sessData.roomName);
+        }
+      }
+      if (curId && curToken) {
+        const inviteUrl = `${window.location.origin}${window.location.pathname}?tab=livekit&sessionId=${encodeURIComponent(
+          curId
+        )}&sessionToken=${encodeURIComponent(curToken)}&productId=${encodeURIComponent(
+          activeProductId
+        )}&role=salesperson`;
+        await navigator.clipboard.writeText(inviteUrl);
+        setInviteCopied(true);
+        setTimeout(() => setInviteCopied(false), 3500);
+      }
+    } catch (e: any) {
+      console.error("Failed to copy invite link:", e);
+    }
+  };
+
+  const handleCreateNewSession = async () => {
+    if (isConnected || isConnecting) return;
+    try {
+      const sessRes = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productId: activeProductId })
+      });
+      if (sessRes.ok) {
+        const sessData = await sessRes.json();
+        setActiveSessionId(sessData.sessionId);
+        setActiveSessionToken(sessData.sessionToken);
+        setManualSessionIdInput(sessData.sessionId);
+        setManualSessionTokenInput(sessData.sessionToken);
+        if (sessData.roomName) setRoomName(sessData.roomName);
+        setErrorMessage(null);
+      }
+    } catch (e: any) {
+      console.error("Failed to create new session:", e);
+    }
+  };
+
+  const handleApplyManualCredentials = () => {
+    if (manualSessionIdInput.trim() && manualSessionTokenInput.trim()) {
+      setActiveSessionId(manualSessionIdInput.trim());
+      setActiveSessionToken(manualSessionTokenInput.trim());
+      setRoomName(`room_${activeProductId}_${manualSessionIdInput.trim()}`);
+      setShowManualSession(false);
+      setErrorMessage(null);
+    }
   };
 
   const isConnected = connectionState === ConnectionState.Connected;
@@ -306,7 +511,9 @@ export default function LiveKitSalesRoom() {
           <div
             className={`px-3 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-2 ${
               isConnected
-                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+                ? isSimulatedMode
+                  ? "bg-indigo-500/10 border-indigo-500/30 text-indigo-300"
+                  : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
                 : isConnecting
                 ? "bg-amber-500/10 border-amber-500/30 text-amber-400"
                 : "bg-slate-800 border-slate-700 text-slate-400"
@@ -315,17 +522,20 @@ export default function LiveKitSalesRoom() {
             <span
               className={`w-2 h-2 rounded-full ${
                 isConnected
-                  ? "bg-emerald-400 animate-ping"
+                  ? isSimulatedMode
+                    ? "bg-indigo-400 animate-pulse"
+                    : "bg-emerald-400 animate-ping"
                   : isConnecting
                   ? "bg-amber-400 animate-pulse"
                   : "bg-slate-500"
               }`}
             />
-            Status:{" "}
-            {connectionState === ConnectionState.Connected
-              ? "Connected"
-              : connectionState === ConnectionState.Connecting
-              ? "Connecting..."
+            {isConnected
+              ? isSimulatedMode
+                ? "Simulated Sandbox (No Cloud Connection)"
+                : "LiveKit Cloud Active (WebRTC Audio)"
+              : isConnecting
+              ? "Connecting to LiveKit..."
               : connectionState === ConnectionState.Reconnecting
               ? "Reconnecting..."
               : "Disconnected"}
@@ -390,19 +600,110 @@ export default function LiveKitSalesRoom() {
               Room &amp; Participant Setup
             </h3>
 
-            {/* Room Name Input */}
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1.5">
-                LiveKit Room Name
-              </label>
-              <input
-                type="text"
-                disabled={isConnected || isConnecting}
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-                placeholder="sales-room-demo"
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-50 font-mono"
-              />
+            {/* Authorized Session & Room Display */}
+            <div className="space-y-2">
+              <div className="flex justify-between items-center mb-1">
+                <label className="text-xs font-medium text-slate-400">
+                  Authorized Session &amp; Room
+                </label>
+                {activeSessionId && (
+                  <span className="text-[10px] text-emerald-400 font-mono">
+                    {activeProductId}
+                  </span>
+                )}
+              </div>
+              <div className="bg-slate-900 border border-slate-700/80 rounded-lg p-2.5 space-y-1.5 font-mono text-[11px]">
+                <div className="text-slate-400 flex justify-between items-center">
+                  <span>Session:</span>
+                  <span className="text-slate-200 truncate max-w-[200px]">
+                    {activeSessionId || "(Auto-generated on join)"}
+                  </span>
+                </div>
+                <div className="text-slate-400 flex justify-between items-center">
+                  <span>Room:</span>
+                  <span className="text-indigo-300 truncate max-w-[200px]">{roomName}</span>
+                </div>
+              </div>
+
+              {/* 2-Browser Test Invite Link & Session Controls */}
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleCopyInviteLink}
+                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    inviteCopied
+                      ? "bg-emerald-600/20 text-emerald-300 border-emerald-500/40"
+                      : "bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-700 hover:text-white"
+                  }`}
+                  title="Copy direct invite link with session token for second browser"
+                >
+                  <Sparkles className="w-3 h-3 text-indigo-400" />
+                  {inviteCopied ? "Invite Link Copied!" : "Copy 2-Browser Invite Link"}
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isConnected || isConnecting}
+                  onClick={handleCreateNewSession}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-700 hover:border-slate-600 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-[11px] font-semibold flex items-center gap-1 transition-colors disabled:opacity-50 cursor-pointer"
+                  title="Mint a fresh session"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  New Session
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isConnected || isConnecting}
+                  onClick={() => setShowManualSession(!showManualSession)}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-800 text-slate-400 hover:text-slate-300 text-[11px] font-semibold transition-colors disabled:opacity-50 cursor-pointer"
+                >
+                  {showManualSession ? "Hide Manual" : "Manual Join"}
+                </button>
+              </div>
+
+              {/* Manual Session Credentials Inputs */}
+              {showManualSession && (
+                <div className="mt-2 p-3 bg-slate-900/90 border border-slate-700 rounded-lg space-y-2 text-xs">
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">Session ID:</label>
+                    <input
+                      type="text"
+                      disabled={isConnected || isConnecting}
+                      value={manualSessionIdInput}
+                      onChange={(e) => setManualSessionIdInput(e.target.value)}
+                      placeholder="sess_..."
+                      className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">Session Authorization Token:</label>
+                    <input
+                      type="password"
+                      disabled={isConnected || isConnecting}
+                      value={manualSessionTokenInput}
+                      onChange={(e) => setManualSessionTokenInput(e.target.value)}
+                      placeholder="stok_..."
+                      className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 font-mono"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isConnected || isConnecting || !manualSessionIdInput.trim() || !manualSessionTokenInput.trim()}
+                    onClick={handleApplyManualCredentials}
+                    className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    Apply Session Credentials
+                  </button>
+                </div>
+              )}
+
+              {isSimulatedMode && (
+                <div className="mt-2 bg-indigo-500/10 border border-indigo-500/30 rounded-lg p-2 text-indigo-300 text-xs flex items-center gap-2">
+                  <Sparkles className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                  <span>Simulated realtime session active (Hardened sandbox mode).</span>
+                </div>
+              )}
             </div>
 
             {/* Role / Identity Selector */}

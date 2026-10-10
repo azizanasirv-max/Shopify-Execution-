@@ -12,6 +12,9 @@ import { GenericSalesEngine } from "./lbv-sales-copilot/engine/generic-sales-eng
 import { ShopifySalesAdapter } from "./lbv-sales-copilot/sales-api/shopify-adapter.js";
 import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwriter-adapter.js";
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
+import { SalesApiAdapter } from "./lbv-sales-copilot/engine/types.js";
+import { AdapterRegistry, UnknownProductError } from "./lbv-sales-copilot/engine/adapter-registry.js";
+import { SessionManager, SessionNotFoundError, MismatchedSessionProductError } from "./lbv-sales-copilot/engine/session-manager.js";
 
 dotenv.config();
 
@@ -29,17 +32,26 @@ const ai = new GoogleGenAI({
   },
 });
 
-// Initialize Product-Independent Generic Sales Engine & Adapters
+// Initialize Product-Independent Generic Sales Engine & Approved Adapters
 const shopifyAdapter = new ShopifySalesAdapter();
 const ghostwriterAdapter = new GhostwriterSalesAdapter();
+
+// Server-side Adapter Registry
+const adapterRegistry = new AdapterRegistry();
+adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
+adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
+
+// Isolated Session Manager
+const sessionManager = new SessionManager();
 
 const salesEngine = new GenericSalesEngine({
   aiClient: ai,
   modelName: "gemini-3.1-flash-lite",
-  defaultAdapter: shopifyAdapter
+  defaultAdapter: shopifyAdapter,
+  adapterRegistry
 });
 
-const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine);
+const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, adapterRegistry);
 
 // Helper to load static JSON files safely
 const loadJson = (relativeFilePath: string) => {
@@ -102,31 +114,95 @@ const getOfferTool = {
   }
 };
 
-// API Endpoint to evaluate prospect queries with the Generic Sales Engine and active adapter
+// API Endpoint to evaluate prospect queries with the Generic Sales Engine and explicit product adapter
 app.post("/api/copilot", async (req, res) => {
   try {
-    const { prompt, productId } = req.body;
-    if (!prompt) {
-      return res.status(400).json({ error: "Prompt is required" });
+    const { prompt, productId, sessionId, sessionToken } = req.body;
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+      return res.status(400).json({ error: "Prompt is required and must be a non-empty string." });
     }
 
-    // Support optional per-request product adapter override
-    let targetAdapter = salesEngine.getActiveAdapter();
-    if (productId === "ghostwriter" || productId === ghostwriterAdapter.id) {
-      targetAdapter = ghostwriterAdapter;
-    } else if (productId === "shopify" || productId === shopifyAdapter.id) {
-      targetAdapter = shopifyAdapter;
+    const tokenHeader =
+      (req.headers["x-session-token"] as string) ||
+      req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+      sessionToken;
+
+    // 1. Resolve product identifier and session
+    let targetProductId = productId;
+    let session = sessionId ? sessionManager.getSession(sessionId) : undefined;
+
+    if (sessionId && !session) {
+      return res.status(404).json({
+        error: `Session '${sessionId}' not found or expired.`,
+        code: "SESSION_NOT_FOUND"
+      });
     }
 
-    const recommendation = await salesEngine.generateRecommendation(prompt, targetAdapter);
+    // If session exists, require and enforce authorization token
+    if (session) {
+      if (!tokenHeader || tokenHeader !== session.authToken) {
+        return res.status(403).json({
+          error: `Unauthorized access: Valid session authorization token is required for session '${sessionId}'.`,
+          code: "UNAUTHORIZED_SESSION_ACCESS"
+        });
+      }
+
+      if (targetProductId) {
+        // Verify session belongs to requested product (prevent cross-product switching)
+        try {
+          sessionManager.validateSessionProduct(session.id, targetProductId, adapterRegistry);
+        } catch (mismatchErr: any) {
+          return res.status(400).json({
+            error: mismatchErr.message,
+            code: "MISMATCHED_SESSION_PRODUCT"
+          });
+        }
+      } else {
+        targetProductId = session.productId;
+      }
+    }
+
+    // If still no product ID, reject request (no silent default!)
+    if (!targetProductId) {
+      return res.status(400).json({
+        error:
+          "Product identifier ('productId') or valid 'sessionId' is required to resolve product adapter. Silent fallback is prohibited.",
+        code: "MISSING_PRODUCT_ID"
+      });
+    }
+
+    // 2. Resolve registered adapter explicitly (fails closed on unknown)
+    if (!adapterRegistry.has(targetProductId)) {
+      return res.status(400).json({
+        error: `Unknown product identifier: '${targetProductId}'. Must be an approved registered adapter.`,
+        code: "UNKNOWN_PRODUCT"
+      });
+    }
+
+    const targetAdapter = adapterRegistry.resolve(targetProductId);
+
+    // 3. Resolve or create sales session
+    if (!session) {
+      session = sessionManager.createSession(targetAdapter.id);
+    }
+
+    // 4. Execute recommendation request-scoped with isolated session
+    const recommendation = await salesEngine.generateRecommendation(prompt, {
+      adapter: targetAdapter,
+      session
+    });
 
     res.json({
       answer: recommendation.statement,
+      status: recommendation.status,
+      sessionId: session.id,
+      sessionToken: session.authToken,
+      roomName: session.roomName,
+      productId: targetAdapter.id,
       toolsUsed: recommendation.toolsUsed,
       validationReport: recommendation.validationReport,
       engineMetadata: recommendation.engineMetadata
     });
-
   } catch (error: any) {
     console.error("Generic Sales Engine Error:", error);
     res.status(500).json({
@@ -138,49 +214,174 @@ app.post("/api/copilot", async (req, res) => {
 
 // Inspect available and active product adapters in the Generic Engine
 app.get("/api/engine/adapters", (req, res) => {
-  const active = salesEngine.getActiveAdapter();
+  const { sessionId, productId } = req.query;
+  let activeAdapter: SalesApiAdapter = shopifyAdapter;
+
+  if (sessionId && typeof sessionId === "string") {
+    const session = sessionManager.getSession(sessionId);
+    if (session && adapterRegistry.has(session.productId)) {
+      activeAdapter = adapterRegistry.resolve(session.productId);
+    }
+  } else if (productId && typeof productId === "string" && adapterRegistry.has(productId)) {
+    activeAdapter = adapterRegistry.resolve(productId);
+  }
+
   res.json({
     activeAdapter: {
-      id: active.id,
-      name: active.name,
-      description: active.description,
-      policies: active.getBehavioralPolicies(),
-      tools: active.getTools()
+      id: activeAdapter.id,
+      name: activeAdapter.name,
+      description: activeAdapter.description,
+      policies: activeAdapter.getBehavioralPolicies(),
+      tools: activeAdapter.getTools()
     },
-    availableAdapters: [
+    availableAdapters: adapterRegistry.getSummaries()
+  });
+});
+
+// Switch active product adapter dynamically (session-scoped playground switch)
+app.post("/api/engine/adapters/switch", (req, res) => {
+  const { adapterId } = req.body;
+  if (!adapterId || typeof adapterId !== "string") {
+    return res.status(400).json({ error: "adapterId is required." });
+  }
+
+  if (!adapterRegistry.has(adapterId)) {
+    return res.status(400).json({
+      error: `Unknown product identifier: '${adapterId}'. Cannot switch to unknown product.`,
+      code: "UNKNOWN_PRODUCT"
+    });
+  }
+
+  const targetAdapter = adapterRegistry.resolve(adapterId);
+
+  // Create an isolated fresh session for this product switch so state is never leaked
+  const newSession = sessionManager.createSession(targetAdapter.id);
+
+  res.json({
+    success: true,
+    sessionId: newSession.id,
+    sessionToken: newSession.authToken,
+    roomName: newSession.roomName,
+    activeAdapter: {
+      id: targetAdapter.id,
+      name: targetAdapter.name,
+      description: targetAdapter.description,
+      policies: targetAdapter.getBehavioralPolicies(),
+      tools: targetAdapter.getTools()
+    }
+  });
+});
+
+// Explicit session endpoints
+// Create a new session bound to a product
+app.post("/api/sessions", (req, res) => {
+  const { productId } = req.body;
+  if (!productId || !adapterRegistry.has(productId)) {
+    return res.status(400).json({
+      error: `Valid registered productId is required. Received: '${productId}'.`,
+      code: "INVALID_PRODUCT"
+    });
+  }
+  const adapter = adapterRegistry.resolve(productId);
+  const session = sessionManager.createSession(adapter.id);
+  res.json({
+    sessionId: session.id,
+    sessionToken: session.authToken,
+    productId: session.productId,
+    roomName: session.roomName,
+    createdAt: session.createdAt
+  });
+});
+
+// Session listing: does NOT dump all sessions across users
+app.get("/api/sessions", (req, res) => {
+  const token =
+    (req.headers["x-session-token"] as string) ||
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    (req.query.sessionToken as string);
+
+  if (!token) {
+    return res.status(401).json({
+      error:
+        "Authentication required. Global session enumeration across multiple users is prohibited.",
+      code: "GLOBAL_LISTING_FORBIDDEN"
+    });
+  }
+
+  const authorizedSession = sessionManager.findSessionByToken(token);
+  if (!authorizedSession) {
+    return res.status(401).json({
+      error: "Invalid session authorization token. No matching session found.",
+      code: "UNAUTHORIZED_SESSION_ACCESS"
+    });
+  }
+
+  // Returns ONLY the authorized session for this token. Never dumps other users' sessions.
+  res.json({
+    sessions: [
       {
-        id: shopifyAdapter.id,
-        name: shopifyAdapter.name,
-        description: shopifyAdapter.description,
-        toolsCount: shopifyAdapter.getTools().length
-      },
-      {
-        id: ghostwriterAdapter.id,
-        name: ghostwriterAdapter.name,
-        description: ghostwriterAdapter.description,
-        toolsCount: ghostwriterAdapter.getTools().length
+        id: authorizedSession.id,
+        productId: authorizedSession.productId,
+        roomName: authorizedSession.roomName,
+        createdAt: authorizedSession.createdAt,
+        lastActivityAt: authorizedSession.lastActivityAt,
+        historyCount: authorizedSession.conversationHistory.length
       }
     ]
   });
 });
 
-// Switch active product adapter dynamically
-app.post("/api/engine/adapters/switch", (req, res) => {
-  const { adapterId } = req.body;
-  if (adapterId === "ghostwriter" || adapterId === ghostwriterAdapter.id) {
-    salesEngine.setAdapter(ghostwriterAdapter);
-  } else {
-    salesEngine.setAdapter(shopifyAdapter);
+// Get session details (requires session authorization token)
+app.get("/api/sessions/:id", (req, res) => {
+  const token =
+    (req.headers["x-session-token"] as string) ||
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    (req.query.sessionToken as string);
+
+  const session = sessionManager.getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: "Session not found or expired.", code: "SESSION_NOT_FOUND" });
   }
-  const active = salesEngine.getActiveAdapter();
+
+  if (!token || token !== session.authToken) {
+    return res.status(403).json({
+      error: "Unauthorized access: Valid session authorization token is required to inspect this session.",
+      code: "UNAUTHORIZED_SESSION_ACCESS"
+    });
+  }
+
   res.json({
-    success: true,
-    activeAdapter: {
-      id: active.id,
-      name: active.name,
-      description: active.description
-    }
+    id: session.id,
+    productId: session.productId,
+    roomName: session.roomName,
+    createdAt: session.createdAt,
+    lastActivityAt: session.lastActivityAt,
+    historyCount: session.conversationHistory.length,
+    conversationHistory: session.conversationHistory
   });
+});
+
+// Clear session history (requires session authorization token)
+app.post("/api/sessions/:id/clear", (req, res) => {
+  const token =
+    (req.headers["x-session-token"] as string) ||
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    (req.body?.sessionToken as string);
+
+  const session = sessionManager.getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: "Session not found or expired.", code: "SESSION_NOT_FOUND" });
+  }
+
+  if (!token || token !== session.authToken) {
+    return res.status(403).json({
+      error: "Unauthorized access: Valid session authorization token is required to clear this session.",
+      code: "UNAUTHORIZED_SESSION_ACCESS"
+    });
+  }
+
+  sessionManager.clearSession(session.id, token);
+  res.json({ success: true, message: `Session ${session.id} history cleared.` });
 });
 
 // Run a complete batch of adversarial testing against the Sales Brain
@@ -834,34 +1035,119 @@ app.get("/api/livekit/status", (req, res) => {
   res.json(realtimeAdapter.getStatus());
 });
 
-// Stage 3.1 LiveKit Short-Lived Access Token Generation Endpoint
+// Stage 3.1 LiveKit Access Token Generation Endpoint (Hardened Session & Identity Access Controls)
 app.post("/api/livekit/token", async (req, res) => {
   try {
-    const { roomName, identity, name } = req.body;
-    if (!roomName || !identity) {
-      return res.status(400).json({ error: "roomName and identity are required parameters." });
-    }
+    const { sessionId, sessionToken, productId, roomName, identity, name, permissions, grants } =
+      req.body;
+    const tokenHeader =
+      (req.headers["x-session-token"] as string) ||
+      req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+      sessionToken;
 
-    if (!realtimeAdapter.isConfigured()) {
-      return res.status(503).json({
-        error: "LiveKit server credentials are not configured.",
-        configured: false,
-        message: "Please configure LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET in your environment.",
+    // 1. Session check: token request without session is rejected
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({
+        error: "sessionId is required to request a LiveKit token.",
+        code: "SESSION_REQUIRED"
       });
     }
 
-    // Validate identity: reserve lbv-ai for future silent observer
-    if (identity === "lbv-ai") {
+    // 2. Validate session existence and authorization
+    const session = sessionManager.getSession(sessionId);
+    if (!session) {
+      return res.status(404).json({
+        error: "Sales session not found or expired.",
+        code: "SESSION_NOT_FOUND"
+      });
+    }
+
+    if (!tokenHeader || tokenHeader !== session.authToken) {
       return res.status(403).json({
-        error: "Identity 'lbv-ai' is reserved for future silent sales assistant participant."
+        error: "Unauthorized access: Valid session authorization token is required.",
+        code: "UNAUTHORIZED_SESSION_ACCESS"
       });
     }
 
-    const tokenData = await realtimeAdapter.createParticipantToken(roomName, identity, name);
+    // 3. Product binding validation
+    if (productId && typeof productId === "string") {
+      const canonicalReq = adapterRegistry.getCanonicalId(productId) || productId;
+      const canonicalSess = adapterRegistry.getCanonicalId(session.productId) || session.productId;
+      if (canonicalReq !== canonicalSess) {
+        return res.status(400).json({
+          error: `Session '${session.id}' is bound to product '${session.productId}' and cannot receive a LiveKit token for product '${productId}'. Cross-product LiveKit access is rejected.`,
+          code: "MISMATCHED_SESSION_PRODUCT"
+        });
+      }
+    }
+
+    // 4. Room name check: client cannot specify an arbitrary room name
+    const trustedRoom = session.roomName || `room_${session.productId}_${session.id}`;
+    if (roomName && roomName.trim() !== trustedRoom) {
+      return res.status(403).json({
+        error: `Arbitrary room name '${roomName}' is rejected. Room is strictly bound to authorized session ('${trustedRoom}').`,
+        code: "ARBITRARY_ROOM_REJECTED"
+      });
+    }
+
+    // 5. Identity & Anti-impersonation check
+    if (!identity || typeof identity !== "string") {
+      return res.status(400).json({
+        error: "Participant identity is required ('prospect' or 'salesperson').",
+        code: "INVALID_IDENTITY"
+      });
+    }
+
+    const lowerId = identity.toLowerCase().trim();
+    if (
+      lowerId === "lbv-ai" ||
+      lowerId.includes("lbv-ai") ||
+      ["system", "admin", "assistant", "agent"].includes(lowerId)
+    ) {
+      return res.status(403).json({
+        error: `Identity '${identity}' is reserved for future silent sales assistant participant ('lbv-ai'). Impersonation is rejected.`,
+        code: "RESERVED_IDENTITY"
+      });
+    }
+
+    if (
+      lowerId !== "prospect" &&
+      lowerId !== "salesperson" &&
+      !lowerId.startsWith("prospect_") &&
+      !lowerId.startsWith("salesperson_")
+    ) {
+      return res.status(400).json({
+        error: `Invalid participant identity '${identity}'. Allowed roles are 'prospect' or 'salesperson'.`,
+        code: "INVALID_IDENTITY"
+      });
+    }
+
+    // 6. Permission elevation check: client cannot elevate permissions
+    if (permissions || grants) {
+      return res.status(403).json({
+        error:
+          "Client cannot elevate its own LiveKit room permissions. Role permissions are strictly server-governed.",
+        code: "PERMISSION_ELEVATION_DENIED"
+      });
+    }
+
+    // 7. Token generation via realtimeAdapter (handles both real and simulated mode)
+    const tokenData = await realtimeAdapter.createParticipantToken({
+      session,
+      identity,
+      displayName: name,
+      clientRoomName: roomName,
+      requestedPermissions: permissions,
+      requestedProductId: productId
+    });
+
     return res.json(tokenData);
   } catch (error: any) {
     console.error("LiveKit token generation failure:", error);
-    return res.status(500).json({ error: "Failed to generate LiveKit token", details: error.message });
+    return res.status(500).json({
+      error: "Failed to generate LiveKit token.",
+      code: error.code || "INTERNAL_ERROR"
+    });
   }
 });
 

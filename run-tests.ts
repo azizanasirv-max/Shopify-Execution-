@@ -8,6 +8,10 @@ import { compileStage2Result, getExpectedToolsForPrompt, Stage2TestResult, Stage
 import { GenericSalesEngine } from "./lbv-sales-copilot/engine/generic-sales-engine.js";
 import { ShopifySalesAdapter } from "./lbv-sales-copilot/sales-api/shopify-adapter.js";
 import { runHardeningUnitTests } from "./lbv-sales-copilot/validation/hardening-unit-tests.js";
+import { runApprovalGateUnitTests } from "./lbv-sales-copilot/validation/approval-gate-tests.js";
+import { runAdapterIsolationTests } from "./lbv-sales-copilot/validation/adapter-isolation-tests.js";
+import { runSessionAccessControlTests } from "./lbv-sales-copilot/validation/session-access-control-tests.js";
+import { runRealtimeValidationTests } from "./lbv-sales-copilot/validation/livekit-realtime-tests.js";
 
 dotenv.config();
 
@@ -86,12 +90,35 @@ if (command === "adversarial") {
   runStage2Suite();
 } else if (command === "classification") {
   runClassificationUnitTests();
-} else if (command === "hardening" || command === "unit" || command === "engine") {
-  runHardeningUnitTests().then(summary => {
+} else if (command === "approval-gate") {
+  runApprovalGateUnitTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "isolation" || command === "adapter-isolation") {
+  runAdapterIsolationTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
+} else if (command === "access-control" || command === "session" || command === "session-access") {
+  runSessionAccessControlTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
+} else if (command === "realtime" || command === "livekit" || command === "e2e-realtime") {
+  runRealtimeValidationTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
+} else if (command === "hardening" || command === "unit" || command === "engine") {
+  Promise.all([
+    runHardeningUnitTests(),
+    runApprovalGateUnitTests(),
+    runAdapterIsolationTests(),
+    runSessionAccessControlTests(),
+    runRealtimeValidationTests()
+  ]).then(([s1, s2, s3, s4, s5]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed;
+    process.exit(totalFailed === 0 ? 0 : 1);
+  });
 } else {
-  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification" or "hardening".`);
+  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", or "hardening".`);
   process.exit(1);
 }
 

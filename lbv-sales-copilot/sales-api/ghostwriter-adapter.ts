@@ -20,6 +20,7 @@ import {
   BehavioralPolicy,
   ValidationReport
 } from "../engine/types.js";
+import { validateCommercialCommitments } from "../engine/commercial-validator.js";
 
 export class GhostwriterSalesAdapter implements SalesApiAdapter {
   public readonly id = "ghostwriter-thought-leadership";
@@ -141,7 +142,7 @@ CRITICAL COMPLIANCE RULES:
     }
   }
 
-  public validateResponse(response: string, _prompt: string): ValidationReport {
+  public validateResponse(response: string, prompt: string): ValidationReport {
     const unsupportedClaims: string[] = [];
     const lower = response.toLowerCase();
 
@@ -152,9 +153,13 @@ CRITICAL COMPLIANCE RULES:
       }
     }
 
-    // Check firm pricing ($1200 pilot, $2500 retainer)
-    if (lower.includes("discount") && (lower.includes("can offer") || lower.includes("reduced"))) {
-      unsupportedClaims.push("Offered unauthorized discount on ghostwriting services.");
+    // Check firm pricing ($1,200 pilot, $2,500 retainer) and disallow unauthorized rates/discounts
+    const commercialReport = validateCommercialCommitments(response, prompt, {
+      authorizedPrices: [1200, 2500],
+      disallowDiscounts: true
+    });
+    if (!commercialReport.valid) {
+      unsupportedClaims.push(...commercialReport.violations);
     }
 
     return {
@@ -168,8 +173,8 @@ CRITICAL COMPLIANCE RULES:
         },
         {
           name: "Firm Pricing",
-          status: unsupportedClaims.some(c => c.includes("discount")) ? "FAILED" : "PASSED",
-          description: "Must maintain firm $1,200 pilot and $2,500/mo pricing."
+          status: unsupportedClaims.some(c => c.includes("pricing commitment") || c.includes("discount commitment")) ? "FAILED" : "PASSED",
+          description: "Must maintain firm $1,200 pilot and $2,500/mo pricing with zero unauthorized rates."
         }
       ]
     };

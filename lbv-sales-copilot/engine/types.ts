@@ -27,6 +27,27 @@ export interface ToolCallResult {
   latencyMs?: number;
 }
 
+export interface ConversationTurn {
+  role: "user" | "model";
+  text?: string;
+  toolCalls?: ToolCallResult[];
+  timestamp: number;
+}
+
+/**
+ * Isolated sales conversation session bound to an approved product adapter
+ */
+export interface SalesSession {
+  readonly id: string;
+  readonly authToken: string;
+  readonly productId: string;
+  readonly roomName: string;
+  readonly createdAt: number;
+  lastActivityAt: number;
+  conversationHistory: ConversationTurn[];
+  metadata: Record<string, any>;
+}
+
 export interface PolicyRuleStatus {
   name: string;
   status: "PASSED" | "FAILED";
@@ -47,10 +68,24 @@ export interface BehavioralPolicy {
 }
 
 /**
+ * Explicit validation approval outcome for recommendations
+ */
+export type RecommendationApprovalStatus = "APPROVED" | "RECOVERY_REQUIRED" | "BLOCKED";
+
+/**
+ * Concise safe fallback statement when recommendation is BLOCKED
+ */
+export const SAFE_FALLBACK_RECOMMENDATION = 
+  "I need to verify those details with our team before confirming any specifics.";
+
+/**
  * Standard recommendation output produced by the Generic Sales Engine
  */
 export interface SalesRecommendation {
+  /** The final recommendation text for the salesperson. If BLOCKED, safe fallback is provided. */
   statement: string;
+  /** Enforced validation approval status */
+  status: RecommendationApprovalStatus;
   toolsUsed: ToolCallResult[];
   validationReport: ValidationReport;
   timestamp: number;
@@ -59,7 +94,22 @@ export interface SalesRecommendation {
     productId: string;
     latencyMs: number;
     turnsCount: number;
+    recoveryAttempts?: number;
+    isFallback?: boolean;
+    rawUnapprovedStatement?: string;
+    sessionId?: string;
   };
+}
+
+/**
+ * Abstraction for model content generation (enables deterministic testing)
+ */
+export interface ModelProvider {
+  generateContent(params: {
+    model: string;
+    contents: any[];
+    config?: any;
+  }): Promise<{ text?: string; functionCalls?: any[]; candidates?: any[] }>;
 }
 
 /**

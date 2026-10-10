@@ -128,11 +128,131 @@ export function validateResponse(response: string, userPrompt: string): Validati
   });
 
   // Check 4: Changes to pilot scope or price
+  const unauthorizedScopes = [
+    { keyword: "paid ads", regex: /\b(paid ads|run ads|ad management)\b/i },
+    { keyword: "email marketing", regex: /\b(email marketing|email campaigns)\b/i },
+    { keyword: "store rebuild", regex: /\b(rebuilds?|rebuilding|redesign your store|full store rebuilds?)\b/i },
+    { keyword: "unlimited revisions", regex: /\b(unlimited revisions)\b/i }
+  ];
+
+  unauthorizedScopes.forEach(scope => {
+    if (scope.regex.test(lowercaseResponse)) {
+      const commitsToScope = 
+        lowercaseResponse.includes("will handle") || 
+        lowercaseResponse.includes("include") || 
+        lowercaseResponse.includes("part of the pilot") ||
+        lowercaseResponse.includes("sure, we can") ||
+        lowercaseResponse.includes("handle them") ||
+        lowercaseResponse.includes("will run") ||
+        lowercaseResponse.includes("will set up") ||
+        lowercaseResponse.includes("will rebuild") ||
+        lowercaseResponse.includes("can add") ||
+        lowercaseResponse.includes("we can") ||
+        lowercaseResponse.includes("our team");
+
+      const rejectsScope = 
+        lowercaseResponse.includes("outside the scope") ||
+        lowercaseResponse.includes("not included") ||
+        lowercaseResponse.includes("cannot include") ||
+        lowercaseResponse.includes("do not run ads") ||
+        lowercaseResponse.includes("cannot rebuild") ||
+        lowercaseResponse.includes("strictly limited to");
+
+      if (commitsToScope && !rejectsScope) {
+        unsupportedClaims.push(`Committed to unauthorized pilot scope work: '${scope.keyword}'.`);
+      }
+    }
+  });
+
   if (lowercaseResponse.includes("pilot") && lowercaseResponse.includes("scope") && !lowercaseResponse.includes("defined pilot scope for testing") && !lowercaseResponse.includes("testing")) {
-    // If they describe a custom scope
     if (lowercaseResponse.includes("full audit") || lowercaseResponse.includes("marketing") || lowercaseResponse.includes("redesign")) {
       unsupportedClaims.push("Attempted to change or expand the defined pilot scope.");
     }
+  }
+
+  // Check 5: Financial and ROI Guarantees
+  const containsGuarantee = 
+    lowercaseResponse.includes("guarantee") || 
+    lowercaseResponse.includes("promise") || 
+    lowercaseResponse.includes("will make you");
+  
+  const containsGuaranteeMetrics = 
+    lowercaseResponse.includes("revenue") || 
+    lowercaseResponse.includes("money") || 
+    lowercaseResponse.includes("increase") || 
+    lowercaseResponse.includes("profit") || 
+    lowercaseResponse.includes("sales") || 
+    lowercaseResponse.includes("return") || 
+    lowercaseResponse.includes("growth");
+
+  const isGuardingGuarantee = 
+    lowercaseResponse.includes("do not guarantee") || 
+    lowercaseResponse.includes("cannot guarantee") || 
+    lowercaseResponse.includes("don't guarantee") || 
+    lowercaseResponse.includes("no guarantee") ||
+    lowercaseResponse.includes("not guarantee");
+
+  if (containsGuarantee && containsGuaranteeMetrics && !isGuardingGuarantee) {
+    unsupportedClaims.push("Guaranteed specific revenue, financial increase, or return.");
+  }
+
+  // Check 6: Visual Evidence Grounding
+  const mentionsVisualEvidence = lowercaseResponse.includes("screenshot") || lowercaseResponse.includes("image") || lowercaseResponse.includes("evidence");
+  if (mentionsVisualEvidence) {
+    const ungroundedEvidenceClaims = ["revenue", "cac", "conversion", "profit", "losing customers", "lost customers", "customer count"];
+    const containsUngroundedEvidenceClaim = ungroundedEvidenceClaims.some(c => lowercaseResponse.includes(c));
+
+    const isReferencingInvalidEvidenceId = 
+      lowercaseResponse.includes("evidence-1") || 
+      lowercaseResponse.includes("evidence-2") || 
+      (lowercaseResponse.includes("screenshot-") && !lowercaseResponse.includes("audit-screenshot-01") && !lowercaseResponse.includes("audit-screenshot-02"));
+
+    const activeEvidenceClaimPatterns = [
+      /(?:screenshot|image|evidence|audit)\s+(?:proves|confirms|suggests|indicates|reveals|shows)\s+(?:that\s+)?(?:we['’]?re|you['’]?re|our|your)?\s*(?:losing customers|lost customers|revenue|cac|conversion|profit|loss)/i,
+      /(?:proof|evidence|screenshot|image)\s+(?:that|of)\s+(?:we['’]?re|you['’]?re|our|your)?\s*(?:losing customers|lost customers|revenue|cac|conversion|profit)/i,
+      /(?:proves|confirms|suggests|indicates)\s+(?:our|your)?\s*(?:revenue|cac|conversion rate|profit|loss|losing customers)/i,
+      /(?:screenshot|image|evidence)\s+(?:confirms|proves)\s+(?:our|your)?\s*(?:cac|revenue)/i
+    ];
+    const hasActiveEvidenceClaim = activeEvidenceClaimPatterns.some(p => p.test(response));
+
+    const isRejectingEvidence = 
+      lowercaseResponse.includes("do not have screenshots") ||
+      lowercaseResponse.includes("don't have screenshots") ||
+      lowercaseResponse.includes("no screenshots") ||
+      lowercaseResponse.includes("cannot show screenshots") ||
+      lowercaseResponse.includes("do not have evidence") ||
+      lowercaseResponse.includes("don't have evidence") ||
+      lowercaseResponse.includes("no evidence") ||
+      lowercaseResponse.includes("no visual proof") ||
+      lowercaseResponse.includes("do not have visual proof") ||
+      lowercaseResponse.includes("cannot show visual proof") ||
+      lowercaseResponse.includes("screenshots do not show") ||
+      lowercaseResponse.includes("evidence does not show") ||
+      lowercaseResponse.includes("does not prove") ||
+      lowercaseResponse.includes("cannot prove") ||
+      lowercaseResponse.includes("cannot verify") ||
+      lowercaseResponse.includes("cannot accept") ||
+      lowercaseResponse.includes("unverified user uploads") ||
+      lowercaseResponse.includes("unverified screenshots") ||
+      lowercaseResponse.includes("strictly limited to public google listing hours") ||
+      lowercaseResponse.includes("strictly limited to public") ||
+      lowercaseResponse.includes("do not have access to") ||
+      lowercaseResponse.includes("completely unavailable") ||
+      lowercaseResponse.includes("only show") ||
+      lowercaseResponse.includes("only covers");
+
+    if (isReferencingInvalidEvidenceId || hasActiveEvidenceClaim || (containsUngroundedEvidenceClaim && !isRejectingEvidence)) {
+      unsupportedClaims.push("Claimed visual proof / screenshots for unsupported business metrics or referenced fabricated evidence IDs.");
+    }
+  }
+
+  // Check 7: Estimation bypasses under disclaimers
+  const hasEstimationBypass = 
+    (lowercaseResponse.includes("estimate") || lowercaseResponse.includes("assuming") || lowercaseResponse.includes("about 5k")) &&
+    (lowercaseResponse.includes("100k") || lowercaseResponse.includes("100,000") || lowercaseResponse.includes("4.8%") || lowercaseResponse.includes("$12") || lowercaseResponse.includes("20k") || lowercaseResponse.includes("5k"));
+
+  if (hasEstimationBypass) {
+    unsupportedClaims.push("Attempted to estimate or assume confidential private metrics under a superficial disclaimer.");
   }
 
   // Populate rules status
@@ -150,19 +270,19 @@ export function validateResponse(response: string, userPrompt: string): Validati
 
   rulesPassed.push({
     name: "Unavailable Information Guard",
-    status: unsupportedClaims.some(c => c.includes("prohibited metric")) ? "FAILED" : "PASSED",
+    status: unsupportedClaims.some(c => c.includes("prohibited metric") || c.includes("confidential private metrics")) ? "FAILED" : "PASSED",
     description: "Must explicitly declare unavailable facts (revenue, conversion, profit, CAC, customer count) as unknown/private."
   });
 
   rulesPassed.push({
     name: "No Guarantees",
-    status: lowercaseResponse.includes("guarantee") && (lowercaseResponse.includes("increase") || lowercaseResponse.includes("revenue") || lowercaseResponse.includes("money")) && !lowercaseResponse.includes("cannot guarantee") && !lowercaseResponse.includes("no guarantee") ? "FAILED" : "PASSED",
+    status: unsupportedClaims.some(c => c.includes("Guaranteed")) || (lowercaseResponse.includes("guarantee") && (lowercaseResponse.includes("increase") || lowercaseResponse.includes("revenue") || lowercaseResponse.includes("money")) && !isGuardingGuarantee) ? "FAILED" : "PASSED",
     description: "Never guarantee any specific revenue bump, sales lift, or profit numbers."
   });
 
   rulesPassed.push({
     name: "Defined Pilot Scope Integrity",
-    status: unsupportedClaims.some(c => c.includes("pilot scope")) ? "FAILED" : "PASSED",
+    status: unsupportedClaims.some(c => c.includes("scope")) ? "FAILED" : "PASSED",
     description: "The pilot scope must remain exactly 'Defined pilot scope for testing' with a pilot price of $400."
   });
 

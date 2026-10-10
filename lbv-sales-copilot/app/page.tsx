@@ -88,8 +88,18 @@ interface ValidationReport {
 
 interface ValidationResult {
   answer: string;
+  status?: "APPROVED" | "RECOVERY_REQUIRED" | "BLOCKED";
   toolsUsed: { tool: string; result: any }[];
   validationReport: ValidationReport;
+  engineMetadata?: {
+    model: string;
+    productId: string;
+    latencyMs: number;
+    turnsCount: number;
+    recoveryAttempts?: number;
+    isFallback?: boolean;
+    rawUnapprovedStatement?: string;
+  };
 }
 
 // Stage 2 test report types
@@ -170,7 +180,15 @@ interface Stage2Report {
 }
 
 export default function Page() {
-  const [activeTab, setActiveTab] = useState<"playground" | "adversarial" | "stage2" | "livekit" | "architecture">("playground");
+  const [activeTab, setActiveTab] = useState<"playground" | "adversarial" | "stage2" | "livekit" | "architecture">(() => {
+    if (typeof window !== "undefined") {
+      const tab = new URLSearchParams(window.location.search).get("tab");
+      if (tab === "livekit" || tab === "adversarial" || tab === "stage2" || tab === "architecture") {
+        return tab;
+      }
+    }
+    return "playground";
+  });
   const [prospectData, setProspectData] = useState<FullProspectData | null>(null);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedScenarioId, setSelectedScenarioId] = useState<number>(1);
@@ -182,7 +200,24 @@ export default function Page() {
 
   // Architecture & Product Adapter state
   const [engineAdapters, setEngineAdapters] = useState<any | null>(null);
-  const [selectedProductAdapter, setSelectedProductAdapter] = useState<string>("shopify-conversion-pilot");
+  const [selectedProductAdapter, setSelectedProductAdapter] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return new URLSearchParams(window.location.search).get("productId") || "shopify-conversion-pilot";
+    }
+    return "shopify-conversion-pilot";
+  });
+  const [sessionId, setSessionId] = useState<string | null>(() => {
+    if (typeof window !== "undefined") {
+      return new URLSearchParams(window.location.search).get("sessionId") || null;
+    }
+    return null;
+  });
+  const [sessionToken, setSessionToken] = useState<string | null>(() => {
+    if (typeof window !== "undefined") {
+      return new URLSearchParams(window.location.search).get("sessionToken") || null;
+    }
+    return null;
+  });
   const [switchingAdapter, setSwitchingAdapter] = useState<boolean>(false);
 
   // Stage 1.5 Adversarial state
@@ -210,15 +245,13 @@ export default function Page() {
   const [stage2Filter, setStage2Filter] = useState<"all" | "passed" | "failed">("all");
   const [stage2SubTab, setStage2SubTab] = useState<"summary" | "originals" | "normal" | "repetitions">("summary");
 
-  const fetchAdapters = async () => {
+  const fetchAdapters = async (targetProduct?: string) => {
     try {
-      const res = await fetch("/api/engine/adapters");
+      const prod = targetProduct || selectedProductAdapter;
+      const res = await fetch(`/api/engine/adapters?productId=${encodeURIComponent(prod)}`);
       if (res.ok) {
         const data = await res.json();
         setEngineAdapters(data);
-        if (data.activeAdapter) {
-          setSelectedProductAdapter(data.activeAdapter.id);
-        }
       }
     } catch (e) {
       console.error("Failed to load engine adapters:", e);
@@ -253,7 +286,7 @@ export default function Page() {
           setStage2Baseline(bData);
         }
 
-        await fetchAdapters();
+        await fetchAdapters("shopify-conversion-pilot");
       } catch (err: any) {
         setError(err.message || "Unknown error loading data");
       }
@@ -270,8 +303,15 @@ export default function Page() {
         body: JSON.stringify({ adapterId })
       });
       if (res.ok) {
+        const switchData = await res.json();
+        if (switchData.sessionId) {
+          setSessionId(switchData.sessionId);
+        }
+        if (switchData.sessionToken) {
+          setSessionToken(switchData.sessionToken);
+        }
         setSelectedProductAdapter(adapterId);
-        await fetchAdapters();
+        await fetchAdapters(adapterId);
         if (adapterId === "ghostwriter-thought-leadership" || adapterId === "ghostwriter") {
           setCustomPrompt("What is included in your ghostwriting pilot, and what does it cost?");
         } else {
@@ -304,18 +344,29 @@ export default function Page() {
     try {
       const res = await fetch("/api/copilot", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(sessionToken ? { "x-session-token": sessionToken } : {})
+        },
         body: JSON.stringify({ 
           prompt: customPrompt, 
           scenarioId: selectedScenarioId,
-          productId: selectedProductAdapter 
+          productId: selectedProductAdapter,
+          sessionId: sessionId || undefined,
+          sessionToken: sessionToken || undefined
         })
       });
       if (!res.ok) {
         const errJson = await res.json();
         throw new Error(errJson.details || errJson.error || "Generation error");
       }
-      const data: ValidationResult = await res.json();
+      const data: ValidationResult & { sessionId?: string; sessionToken?: string } = await res.json();
+      if (data.sessionId) {
+        setSessionId(data.sessionId);
+      }
+      if (data.sessionToken) {
+        setSessionToken(data.sessionToken);
+      }
       setResult(data);
     } catch (err: any) {
       setError(err.message || "Failed to contact Generic Sales Engine server");
@@ -699,11 +750,48 @@ export default function Page() {
 
             {result && (
               <div className="space-y-6 animate-fadeIn">
-                <div className="bg-gradient-to-b from-indigo-950/20 to-slate-900 border border-indigo-500/25 rounded-2xl p-6 shadow-2xl relative overflow-hidden">
+                <div className={`border rounded-2xl p-6 shadow-2xl relative overflow-hidden transition-all ${
+                  result.status === "BLOCKED"
+                    ? "bg-gradient-to-b from-rose-950/30 to-slate-900 border-rose-500/40"
+                    : "bg-gradient-to-b from-indigo-950/20 to-slate-900 border-indigo-500/25"
+                }`}>
+                  {/* Status Banner when Blocked */}
+                  {result.status === "BLOCKED" && (
+                    <div className="mb-4 p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-start gap-2.5 text-xs text-rose-300">
+                      <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold block">Approval Gate Enforced — Recommendation Blocked</span>
+                        <span>Model output failed compliance validation. The unverified text was suppressed and replaced with a safe fallback response.</span>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
-                    <div>
-                      <span className="text-[10px] uppercase tracking-widest text-indigo-400 font-extrabold block">Recommended Script Output</span>
-                      <h3 className="text-lg font-bold text-slate-100">"SAY THIS NEXT"</h3>
+                    <div className="flex items-center gap-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] uppercase tracking-widest text-indigo-400 font-extrabold block">
+                            {result.status === "BLOCKED" ? "Safe Fallback Script" : "Recommended Script Output"}
+                          </span>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold font-mono border flex items-center gap-1 ${
+                            result.status === "BLOCKED"
+                              ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
+                              : "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                          }`}>
+                            {result.status === "BLOCKED" ? (
+                              <><ShieldAlert className="w-3 h-3" /> BLOCKED</>
+                            ) : (
+                              <><ShieldCheck className="w-3 h-3" /> APPROVED</>
+                            )}
+                          </span>
+                          {result.engineMetadata?.recoveryAttempts && result.engineMetadata.recoveryAttempts > 0 ? (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-mono text-amber-300 bg-amber-500/15 border border-amber-500/30">
+                              Recovery: {result.engineMetadata.recoveryAttempts} attempt
+                            </span>
+                          ) : null}
+                        </div>
+                        <h3 className="text-lg font-bold text-slate-100">"SAY THIS NEXT"</h3>
+                      </div>
                     </div>
                     <button
                       onClick={() => copyToClipboard(result.answer)}
@@ -713,15 +801,28 @@ export default function Page() {
                       {copied ? "Copied Script!" : "Copy Script"}
                     </button>
                   </div>
-                  <div className="bg-slate-950 border border-indigo-950/80 p-5 rounded-xl font-sans text-slate-100 leading-relaxed text-base min-h-[90px] shadow-inner selection:bg-indigo-500">
+                  <div className={`border p-5 rounded-xl font-sans leading-relaxed text-base min-h-[90px] shadow-inner ${
+                    result.status === "BLOCKED"
+                      ? "bg-slate-950/80 border-rose-950 text-rose-100 selection:bg-rose-500/40"
+                      : "bg-slate-950 border-indigo-950/80 text-slate-100 selection:bg-indigo-500"
+                  }`}>
                     {result.answer}
                   </div>
                 </div>
 
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
-                  <h3 className="font-bold text-slate-200 text-sm border-b border-slate-800 pb-3 flex items-center gap-2">
-                    <ShieldAlert className="w-4 h-4 text-indigo-400" />
-                    Automated Grounding Checks
+                  <h3 className="font-bold text-slate-200 text-sm border-b border-slate-800 pb-3 flex items-center justify-between">
+                    <span className="flex items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-indigo-400" />
+                      Automated Grounding Checks
+                    </span>
+                    <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                      result.status === "BLOCKED"
+                        ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                        : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                    }`}>
+                      GATE: {result.status}
+                    </span>
                   </h3>
                   <div className="space-y-2">
                     {result.validationReport.rulesPassed.map((rule, idx) => (
@@ -732,6 +833,16 @@ export default function Page() {
                         }`}>{rule.status}</span>
                       </div>
                     ))}
+                    {result.validationReport.unsupportedClaims.length > 0 && (
+                      <div className="mt-3 p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl space-y-1">
+                        <span className="text-[11px] font-bold text-rose-400 uppercase tracking-wider block">Detected Policy Violations:</span>
+                        {result.validationReport.unsupportedClaims.map((claim, idx) => (
+                          <p key={idx} className="text-xs text-rose-300">
+                            • {claim}
+                          </p>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1209,7 +1320,11 @@ export default function Page() {
         </div>
       ) : activeTab === "livekit" ? (
         <div className="max-w-7xl mx-auto animate-fadeIn">
-          <LiveKitSalesRoom />
+          <LiveKitSalesRoom
+            sessionId={sessionId}
+            sessionToken={sessionToken}
+            productId={selectedProductAdapter}
+          />
         </div>
       ) : (
         /* Architecture & Engine Decoupling Panel */

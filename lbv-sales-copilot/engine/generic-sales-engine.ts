@@ -19,35 +19,56 @@ import {
   SalesRecommendation,
   ToolCallResult,
   ToolDefinition,
-  RealtimeTranscriptEvent
+  RealtimeTranscriptEvent,
+  RecommendationApprovalStatus,
+  SAFE_FALLBACK_RECOMMENDATION,
+  ModelProvider,
+  ConversationTurn,
+  SalesSession
 } from "./types.js";
 import { validateToolCall } from "./schema-validator.js";
+import { AdapterRegistry } from "./adapter-registry.js";
+
+export type { ConversationTurn } from "./types.js";
 
 export interface SalesEngineConfig {
-  aiClient: GoogleGenAI;
+  aiClient?: GoogleGenAI;
+  modelProvider?: ModelProvider;
   modelName?: string;
-  defaultAdapter: SalesApiAdapter;
+  defaultAdapter?: SalesApiAdapter;
+  adapterRegistry?: AdapterRegistry;
   logger?: (level: "info" | "warn" | "error", message: string, meta?: any) => void;
 }
 
-export interface ConversationTurn {
-  role: "user" | "model";
-  text?: string;
-  toolCalls?: ToolCallResult[];
-  timestamp: number;
+export interface GenerateRecommendationOptions {
+  adapter?: SalesApiAdapter;
+  productId?: string;
+  session?: SalesSession;
+  history?: ConversationTurn[];
 }
 
 export class GenericSalesEngine {
-  private ai: GoogleGenAI;
+  private modelProvider: ModelProvider;
   private modelName: string;
-  private adapter: SalesApiAdapter;
+  private defaultAdapter?: SalesApiAdapter;
+  private adapterRegistry?: AdapterRegistry;
   private conversationHistory: ConversationTurn[] = [];
   private logger: (level: "info" | "warn" | "error", message: string, meta?: any) => void;
 
   constructor(config: SalesEngineConfig) {
-    this.ai = config.aiClient;
+    if (config.modelProvider) {
+      this.modelProvider = config.modelProvider;
+    } else if (config.aiClient) {
+      const ai = config.aiClient;
+      this.modelProvider = {
+        generateContent: (params) => ai.models.generateContent(params)
+      };
+    } else {
+      throw new Error("SalesEngineConfig must provide either aiClient or modelProvider.");
+    }
     this.modelName = config.modelName || "gemini-3.1-flash-lite";
-    this.adapter = config.defaultAdapter;
+    this.defaultAdapter = config.defaultAdapter;
+    this.adapterRegistry = config.adapterRegistry;
     this.logger = config.logger || ((level, msg, meta) => {
       if (level === "error") {
         console.error(`[SalesEngine:${level.toUpperCase()}] ${msg}`, meta || "");
@@ -58,30 +79,33 @@ export class GenericSalesEngine {
   }
 
   /**
-   * Set or switch the active product adapter (e.g. from Shopify to Ghostwriter)
+   * Set or switch default fallback adapter (legacy / single-user support)
    */
   public setAdapter(adapter: SalesApiAdapter): void {
-    this.logger("info", `Switching active Sales API adapter to: ${adapter.name} (${adapter.id})`);
-    this.adapter = adapter;
+    this.logger("info", `Setting default Sales API adapter to: ${adapter.name} (${adapter.id})`);
+    this.defaultAdapter = adapter;
     this.clearConversation();
   }
 
   /**
-   * Returns current active adapter details
+   * Returns current active fallback adapter details
    */
   public getActiveAdapter(): SalesApiAdapter {
-    return this.adapter;
+    if (!this.defaultAdapter) {
+      throw new Error("No default adapter configured on GenericSalesEngine. Use request-scoped adapter resolution.");
+    }
+    return this.defaultAdapter;
   }
 
   /**
-   * Clears in-memory conversation state
+   * Clears in-memory default conversation state
    */
   public clearConversation(): void {
     this.conversationHistory = [];
   }
 
   /**
-   * Returns conversation turns history
+   * Returns conversation turns history for default single-user state
    */
   public getHistory(): ConversationTurn[] {
     return [...this.conversationHistory];
@@ -106,17 +130,48 @@ export class GenericSalesEngine {
    * Generates a grounded, policy-checked recommendation for the salesperson.
    *
    * @param prospectPrompt The statement, question, or objection from the prospect
-   * @param overrideAdapter Optional per-request adapter override
+   * @param adapterOrOptions Explicit SalesApiAdapter OR GenerateRecommendationOptions for request/session scoping
    */
   public async generateRecommendation(
     prospectPrompt: string,
-    overrideAdapter?: SalesApiAdapter
+    adapterOrOptions?: SalesApiAdapter | GenerateRecommendationOptions
   ): Promise<SalesRecommendation> {
     const startTime = Date.now();
-    const activeAdapter = overrideAdapter || this.adapter;
+    let activeAdapter: SalesApiAdapter | undefined;
+    let session: SalesSession | undefined;
+    let isolatedHistory: ConversationTurn[] | undefined;
+
+    if (adapterOrOptions) {
+      if ("getTools" in adapterOrOptions && typeof (adapterOrOptions as any).getTools === "function") {
+        activeAdapter = adapterOrOptions as SalesApiAdapter;
+      } else {
+        const opts = adapterOrOptions as GenerateRecommendationOptions;
+        session = opts.session;
+        isolatedHistory = opts.history;
+        if (opts.adapter) {
+          activeAdapter = opts.adapter;
+        } else if (opts.productId && this.adapterRegistry) {
+          activeAdapter = this.adapterRegistry.resolve(opts.productId);
+        } else if (opts.session && this.adapterRegistry) {
+          activeAdapter = this.adapterRegistry.resolve(opts.session.productId);
+        }
+      }
+    }
+
+    if (!activeAdapter) {
+      activeAdapter = this.defaultAdapter;
+    }
+
+    if (!activeAdapter) {
+      throw new Error("GenericSalesEngine: No SalesApiAdapter resolved for recommendation generation. Specify adapter or configure defaultAdapter.");
+    }
+
     const toolsLogged: ToolCallResult[] = [];
 
-    this.logger("info", `Processing recommendation for adapter: ${activeAdapter.id}`, { prompt: prospectPrompt });
+    this.logger("info", `Processing recommendation for adapter: ${activeAdapter.id}${session ? ` [Session: ${session.id}]` : ""}`, {
+      prompt: prospectPrompt,
+      sessionId: session?.id
+    });
 
     // Build model tool declarations from the active adapter
     const toolDefinitions = activeAdapter.getTools();
@@ -131,7 +186,7 @@ export class GenericSalesEngine {
 
     try {
       // 1st Model Turn: Determine need for business tools
-      let response = await this.ai.models.generateContent({
+      let response = await this.modelProvider.generateContent({
         model: this.modelName,
         contents: currentContents,
         config: {
@@ -196,7 +251,7 @@ export class GenericSalesEngine {
         });
 
         // 2nd Model Turn: Synthesize grounded response using tool results
-        response = await this.ai.models.generateContent({
+        response = await this.modelProvider.generateContent({
           model: this.modelName,
           contents: currentContents,
           config: {
@@ -207,27 +262,94 @@ export class GenericSalesEngine {
       }
 
       const rawStatement = response.text || "";
+      let validationReport = activeAdapter.validateResponse(rawStatement, prospectPrompt);
+      let status: RecommendationApprovalStatus = "APPROVED";
+      let finalStatement = rawStatement;
+      let recoveryAttempts = 0;
+      let rawUnapprovedStatement: string | undefined = undefined;
+
+      // Validation Gate - Check if initial response passed
+      if (!validationReport.isGrounded || validationReport.unsupportedClaims.length > 0) {
+        status = "RECOVERY_REQUIRED";
+        rawUnapprovedStatement = rawStatement;
+        this.logger("warn", `Validation failed on initial generation: [${validationReport.unsupportedClaims.join("; ")}]. Initiating bounded recovery.`);
+
+        // Bounded Recovery: Retry at most once with validation findings as feedback
+        recoveryAttempts++;
+        turnsCount++;
+
+        const correctivePrompt = `The previous proposed recommendation failed compliance validation due to the following policy violations:\n${validationReport.unsupportedClaims.map(c => `- ${c}`).join("\n")}\n\nPlease regenerate a strictly compliant recommendation for the salesperson. Stick strictly to verified tool data, do not offer unauthorized prices or discounts, do not make financial guarantees, and adhere strictly to the behavioral policies. Produce only the next statement for the salesperson.`;
+
+        const recoveryContents = [
+          ...currentContents,
+          { role: "model", parts: [{ text: rawStatement }] },
+          { role: "user", parts: [{ text: correctivePrompt }] }
+        ];
+
+        try {
+          const recoveryResponse = await this.modelProvider.generateContent({
+            model: this.modelName,
+            contents: recoveryContents,
+            config: {
+              systemInstruction: activeAdapter.getSystemInstructions()
+            }
+          });
+
+          const recoveredStatement = recoveryResponse.text || "";
+          const recoveryValidation = activeAdapter.validateResponse(recoveredStatement, prospectPrompt);
+
+          if (recoveryValidation.isGrounded && recoveryValidation.unsupportedClaims.length === 0) {
+            status = "APPROVED";
+            finalStatement = recoveredStatement;
+            validationReport = recoveryValidation;
+            this.logger("info", "Bounded recovery succeeded and passed validation.");
+          } else {
+            status = "BLOCKED";
+            validationReport = recoveryValidation;
+            rawUnapprovedStatement = recoveredStatement;
+            finalStatement = SAFE_FALLBACK_RECOMMENDATION;
+            this.logger("warn", `Bounded recovery failed validation: [${recoveryValidation.unsupportedClaims.join("; ")}]. Enforcing BLOCKED approval gate.`);
+          }
+        } catch (recoveryErr: any) {
+          this.logger("error", "Error during bounded recovery attempt:", recoveryErr);
+          status = "BLOCKED";
+          finalStatement = SAFE_FALLBACK_RECOMMENDATION;
+        }
+      }
+
+      // Ensure that BLOCKED results NEVER expose the unapproved/rejected text as the statement
+      if (status === "BLOCKED") {
+        finalStatement = SAFE_FALLBACK_RECOMMENDATION;
+      }
+
       const totalLatency = Date.now() - startTime;
 
-      // Validate the recommendation using the active product adapter's compliance validator
-      const validationReport = activeAdapter.validateResponse(rawStatement, prospectPrompt);
-
-      // Record in conversation state
-      this.conversationHistory.push({
+      // Record in conversation state (isolated per session/request)
+      const userTurn: ConversationTurn = {
         role: "user",
         text: prospectPrompt,
         timestamp: startTime
-      });
+      };
 
-      this.conversationHistory.push({
+      const modelTurn: ConversationTurn = {
         role: "model",
-        text: rawStatement,
+        text: finalStatement,
         toolCalls: toolsLogged,
         timestamp: Date.now()
-      });
+      };
+
+      if (session) {
+        session.conversationHistory.push(userTurn, modelTurn);
+        session.lastActivityAt = Date.now();
+      } else if (isolatedHistory) {
+        isolatedHistory.push(userTurn, modelTurn);
+      } else {
+        this.conversationHistory.push(userTurn, modelTurn);
+      }
 
       const recommendation: SalesRecommendation = {
-        statement: rawStatement,
+        statement: finalStatement,
+        status,
         toolsUsed: toolsLogged,
         validationReport,
         timestamp: Date.now(),
@@ -235,20 +357,53 @@ export class GenericSalesEngine {
           model: this.modelName,
           productId: activeAdapter.id,
           latencyMs: totalLatency,
-          turnsCount
+          turnsCount,
+          recoveryAttempts,
+          isFallback: status === "BLOCKED",
+          rawUnapprovedStatement,
+          sessionId: session?.id
         }
       };
 
-      this.logger("info", `Recommendation generated successfully (${totalLatency}ms)`, {
+      this.logger("info", `Recommendation completed with status [${status}] (${totalLatency}ms)`, {
+        status,
         toolsUsedCount: toolsLogged.length,
-        isGrounded: validationReport.isGrounded
+        isGrounded: validationReport.isGrounded,
+        recoveryAttempts
       });
 
       return recommendation;
 
     } catch (error: any) {
       this.logger("error", `Engine failed to generate recommendation: ${error.message || error}`, error);
-      throw error;
+      
+      const totalLatency = Date.now() - startTime;
+      const failedRecommendation: SalesRecommendation = {
+        statement: SAFE_FALLBACK_RECOMMENDATION,
+        status: "BLOCKED",
+        toolsUsed: toolsLogged,
+        validationReport: {
+          isGrounded: false,
+          unsupportedClaims: [`Model provider error: ${error.message || "Failed to generate recommendation"}`],
+          rulesPassed: [{
+            name: "Execution Guard",
+            status: "FAILED",
+            description: "Model generation failed or encountered an error."
+          }]
+        },
+        timestamp: Date.now(),
+        engineMetadata: {
+          model: this.modelName,
+          productId: activeAdapter ? activeAdapter.id : "unknown",
+          latencyMs: totalLatency,
+          turnsCount,
+          recoveryAttempts: 0,
+          isFallback: true,
+          sessionId: session?.id
+        }
+      };
+
+      return failedRecommendation;
     }
   }
 
