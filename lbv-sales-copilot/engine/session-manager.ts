@@ -60,12 +60,12 @@ export class SessionExpiredError extends Error {
  * SessionStore interface abstracting session persistence storage.
  */
 export interface SessionStore {
-  get(sessionId: string): SalesSession | undefined;
-  set(sessionId: string, session: SalesSession): void;
-  delete(sessionId: string): boolean;
-  values(): SalesSession[];
-  clear(): void;
-  size(): number;
+  get(sessionId: string): SalesSession | undefined | Promise<SalesSession | undefined>;
+  set(sessionId: string, session: SalesSession): void | Promise<void>;
+  delete(sessionId: string): boolean | Promise<boolean>;
+  values(): SalesSession[] | Promise<SalesSession[]>;
+  clear(): void | Promise<void>;
+  size(): number | Promise<number>;
 }
 
 /**
@@ -395,6 +395,9 @@ export class SessionManager {
   /**
    * Lookup session by authorization token (used for token-bound operations).
    */
+  /**
+   * Lookup session by authorization token (used for token-bound operations).
+   */
   public findSessionByToken(token: string): SalesSession | undefined {
     if (!token) return undefined;
     const vals = this.store.values();
@@ -404,6 +407,30 @@ export class SessionManager {
       if (session.authToken === token) {
         if (Date.now() - session.lastActivityAt > this.ttlMs) {
           this.store.delete(session.id);
+          return undefined;
+        }
+        return session;
+      }
+    }
+    return undefined;
+  }
+
+  public async findSessionByTokenAsync(token: string, sessionId?: string): Promise<SalesSession | undefined> {
+    if (!token) return undefined;
+    if (sessionId) {
+      const session = await this.getSessionAsync(sessionId);
+      if (session && session.authToken === token) {
+        return session;
+      }
+      return undefined;
+    }
+    const vals = this.store.values();
+    const sessions = vals instanceof Promise ? await vals : (Array.isArray(vals) ? vals : []);
+    for (const session of sessions) {
+      if (session.authToken === token) {
+        if (Date.now() - session.lastActivityAt > this.ttlMs) {
+          const del = this.store.delete(session.id);
+          if (del instanceof Promise) await del;
           return undefined;
         }
         return session;
@@ -655,6 +682,15 @@ export class SessionDurableObject {
       const reqAction = body.action || action;
 
       if (reqAction === "delete") {
+        if (this.session && this.session.authToken) {
+          const token = body.providedAuthToken || body.authToken;
+          if (token !== this.session.authToken) {
+            return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+              status: 403,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+        }
         this.session = null;
         await this.state.storage.deleteAll();
         return new Response(JSON.stringify({ success: true }), {
@@ -663,6 +699,15 @@ export class SessionDurableObject {
       }
 
       if (reqAction === "set" || body.session) {
+        if (this.session && this.session.authToken) {
+          const token = body.providedAuthToken || body.session?.authToken || body.authToken;
+          if (token !== this.session.authToken) {
+            return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+              status: 403,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+        }
         this.session = body.session;
         if (this.session) {
           await this.state.storage.put("session", this.session);

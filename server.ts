@@ -330,6 +330,7 @@ app.get("/api/sessions", async (req, res) => {
     (req.headers["x-session-token"] as string) ||
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     (req.query.sessionToken as string);
+  const sessionId = (req.query.sessionId as string) || (req.headers["x-session-id"] as string);
 
   if (!token) {
     return res.status(401).json({
@@ -339,7 +340,7 @@ app.get("/api/sessions", async (req, res) => {
     });
   }
 
-  const authorizedSession = sessionManager.findSessionByToken(token);
+  const authorizedSession = await sessionManager.findSessionByTokenAsync(token, sessionId);
   if (!authorizedSession) {
     return res.status(401).json({
       error: "Invalid session authorization token. No matching session found.",
@@ -1087,7 +1088,7 @@ app.post("/api/livekit/token", async (req, res) => {
     }
 
     // 2. Validate session existence and authorization
-    const session = sessionManager.getSession(sessionId);
+    const session = await sessionManager.getSessionAsync(sessionId);
     if (!session) {
       return res.status(404).json({
         error: "Sales session not found or expired.",
