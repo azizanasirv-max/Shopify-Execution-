@@ -82,10 +82,10 @@ export async function runRealtimeValidationTests(): Promise<{ passed: number; fa
   registry.register(shopifyAdapter);
   registry.register(ghostwriterAdapter);
 
-  const sessionManager = new SessionManager(60 * 60 * 1000); // 1h TTL
+  const sessionManager = new SessionManager({ ttlMs: 60 * 60 * 1000 }); // 1h TTL
   const mockAi = new MockModelProvider();
   const salesEngine = new GenericSalesEngine({
-    aiClient: mockAi,
+    modelProvider: mockAi,
     modelName: "test-model"
   });
 
@@ -237,7 +237,7 @@ export async function runRealtimeValidationTests(): Promise<{ passed: number; fa
   // Simulate turn recorded during audio session
   sessionManager.addTurn(shopifySession.id, {
     role: "user",
-    statement: "Can you tell me about the conversion rate lift?",
+    text: "Can you tell me about the conversion rate lift?",
     timestamp: Date.now()
   }, shopifySession.authToken);
 
@@ -251,7 +251,7 @@ export async function runRealtimeValidationTests(): Promise<{ passed: number; fa
   assert(rejoinedToken.roomName === shopifySession.roomName, "Rejoining participant rejoins the identical room");
   const reconnectedSession = sessionManager.getSession(shopifySession.id);
   assert(reconnectedSession?.conversationHistory.length === 1, "Session conversation history remains intact across leave/rejoin");
-  assert(reconnectedSession?.conversationHistory[0].statement.includes("conversion rate lift"), "Turn content preserved in session history");
+  assert(Boolean(reconnectedSession?.conversationHistory[0].text?.includes("conversion rate lift")), "Turn content preserved in session history");
 
   console.log("--------------------------------------------------");
   console.log(`Realtime Validation Tests Summary: Passed: ${passed} | Failed: ${failed} | Total: ${passed + failed}`);

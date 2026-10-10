@@ -54,6 +54,16 @@ export class GenericSalesEngine {
   private adapterRegistry?: AdapterRegistry;
   private conversationHistory: ConversationTurn[] = [];
   private logger: (level: "info" | "warn" | "error", message: string, meta?: any) => void;
+  private recentTranscripts = new Map<string, number>();
+  private readonly maxHistoryTurns: number = 100;
+
+  private pushBoundedHistory(historyArray: ConversationTurn[] | undefined, userTurn: ConversationTurn, modelTurn: ConversationTurn): void {
+    if (!historyArray) return;
+    historyArray.push(userTurn, modelTurn);
+    if (historyArray.length > this.maxHistoryTurns) {
+      historyArray.splice(0, historyArray.length - this.maxHistoryTurns);
+    }
+  }
 
   constructor(config: SalesEngineConfig) {
     if (config.modelProvider) {
@@ -167,6 +177,10 @@ export class GenericSalesEngine {
     }
 
     const toolsLogged: ToolCallResult[] = [];
+    const modelStart = Date.now();
+    let modelExecutionMs = 0;
+    let approvalGateStart = 0;
+    let approvalGateMs = 0;
 
     this.logger("info", `Processing recommendation for adapter: ${activeAdapter.id}${session ? ` [Session: ${session.id}]` : ""}`, {
       prompt: prospectPrompt,
@@ -261,6 +275,9 @@ export class GenericSalesEngine {
         });
       }
 
+      modelExecutionMs = Date.now() - modelStart;
+      approvalGateStart = Date.now();
+
       const rawStatement = response.text || "";
       let validationReport = activeAdapter.validateResponse(rawStatement, prospectPrompt);
       let status: RecommendationApprovalStatus = "APPROVED";
@@ -322,6 +339,7 @@ export class GenericSalesEngine {
         finalStatement = SAFE_FALLBACK_RECOMMENDATION;
       }
 
+      approvalGateMs = Date.now() - approvalGateStart;
       const totalLatency = Date.now() - startTime;
 
       // Record in conversation state (isolated per session/request)
@@ -339,12 +357,12 @@ export class GenericSalesEngine {
       };
 
       if (session) {
-        session.conversationHistory.push(userTurn, modelTurn);
+        this.pushBoundedHistory(session.conversationHistory, userTurn, modelTurn);
         session.lastActivityAt = Date.now();
       } else if (isolatedHistory) {
-        isolatedHistory.push(userTurn, modelTurn);
+        this.pushBoundedHistory(isolatedHistory, userTurn, modelTurn);
       } else {
-        this.conversationHistory.push(userTurn, modelTurn);
+        this.pushBoundedHistory(this.conversationHistory, userTurn, modelTurn);
       }
 
       const recommendation: SalesRecommendation = {
@@ -357,12 +375,14 @@ export class GenericSalesEngine {
           model: this.modelName,
           productId: activeAdapter.id,
           latencyMs: totalLatency,
+          modelExecutionMs,
+          approvalGateMs,
           turnsCount,
           recoveryAttempts,
           isFallback: status === "BLOCKED",
           rawUnapprovedStatement,
           sessionId: session?.id
-        }
+        } as any
       };
 
       this.logger("info", `Recommendation completed with status [${status}] (${totalLatency}ms)`, {
@@ -416,8 +436,24 @@ export class GenericSalesEngine {
     onRecommendationReady: (rec: SalesRecommendation) => void
   ): Promise<void> {
     if (event.speaker === "prospect" && event.isFinal && event.text.trim().length > 0) {
-      this.logger("info", `Realtime prospect statement received: "${event.text}"`);
-      const rec = await this.generateRecommendation(event.text);
+      const trimmedText = event.text.trim();
+      const now = Date.now();
+
+      // Clean up old entries (> 5 seconds old)
+      for (const [txt, time] of this.recentTranscripts.entries()) {
+        if (now - time > 5000) {
+          this.recentTranscripts.delete(txt);
+        }
+      }
+
+      if (this.recentTranscripts.has(trimmedText)) {
+        this.logger("info", `Suppressing duplicate final transcript event: "${trimmedText}"`);
+        return;
+      }
+
+      this.recentTranscripts.set(trimmedText, now);
+      this.logger("info", `Realtime prospect statement received: "${trimmedText}"`);
+      const rec = await this.generateRecommendation(trimmedText);
       onRecommendationReady(rec);
     }
   }
