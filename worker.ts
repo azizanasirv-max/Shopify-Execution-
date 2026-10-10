@@ -181,7 +181,8 @@ export function createWorkerServices(env: Env) {
   const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, adapterRegistry, {
     serverUrl: env.LIVEKIT_URL,
     apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET
+    apiSecret: env.LIVEKIT_API_SECRET,
+    isProd
   });
 
   return {

@@ -87,10 +87,12 @@ export class LiveKitRealtimeAdapter {
   private apiKey: string | null;
   private apiSecret: string | null;
 
+  private isProdMode: boolean;
+
   constructor(
     engine: GenericSalesEngine,
     registry?: AdapterRegistry,
-    livekitConfig?: { serverUrl?: string; apiKey?: string; apiSecret?: string }
+    livekitConfig?: { serverUrl?: string; apiKey?: string; apiSecret?: string; isProd?: boolean }
   ) {
     this.engine = engine;
     this.registry = registry;
@@ -106,6 +108,10 @@ export class LiveKitRealtimeAdapter {
       livekitConfig?.apiSecret ||
       (typeof process !== "undefined" ? process.env?.LIVEKIT_API_SECRET : undefined) ||
       null;
+    this.isProdMode =
+      typeof livekitConfig?.isProd === "boolean"
+        ? livekitConfig.isProd
+        : (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
   }
 
   /**
@@ -152,6 +158,11 @@ export class LiveKitRealtimeAdapter {
       }
 
       if (!this.isConfigured()) {
+        if (this.isProdMode) {
+          throw new Error(
+            "[Production Error] LiveKit Cloud environment configuration (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET) is missing or invalid in production mode. Refusing simulated room token issuance."
+          );
+        }
         const simPayload = { room: roomName, identity, simulated: true };
         return {
           token: `sim_token_${Buffer.from(JSON.stringify(simPayload)).toString("base64url")}`,
@@ -265,9 +276,6 @@ export class LiveKitRealtimeAdapter {
     }
 
     // 6. Token generation (Real vs Simulated)
-    const isProd =
-      (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
-
     const shouldUseReal = this.isConfigured() && !forceSimulated;
     if (shouldUseReal) {
       const at = new AccessToken(this.apiKey!, this.apiSecret!, {
@@ -296,9 +304,9 @@ export class LiveKitRealtimeAdapter {
         expiresIn: 3600
       };
     } else {
-      if (isProd) {
+      if (this.isProdMode) {
         throw new Error(
-          "[Production Error] LiveKit Cloud environment configuration (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET) is missing in production mode. Refusing simulated room token issuance."
+          "[Production Error] LiveKit Cloud environment configuration (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET) is missing or invalid in production mode. Refusing simulated room token issuance."
         );
       }
 

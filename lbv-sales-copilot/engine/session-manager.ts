@@ -263,7 +263,7 @@ export class CloudflareD1SessionStore implements SessionStore {
       throw new SessionNotFoundError(sessionId);
     }
 
-    if (providedAuthToken !== undefined && providedAuthToken !== sessionRow.auth_token) {
+    if (!providedAuthToken || providedAuthToken !== sessionRow.auth_token) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
 
@@ -313,7 +313,7 @@ export class CloudflareD1SessionStore implements SessionStore {
       throw new SessionNotFoundError(sessionId);
     }
 
-    if (providedAuthToken !== undefined && providedAuthToken !== sessionRow.auth_token) {
+    if (!providedAuthToken || providedAuthToken !== sessionRow.auth_token) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
 

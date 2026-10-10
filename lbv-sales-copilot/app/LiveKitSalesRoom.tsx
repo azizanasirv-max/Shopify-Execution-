@@ -122,6 +122,7 @@ export default function LiveKitSalesRoom({
   } | null>(null);
   const [isProcessingTranscript, setIsProcessingTranscript] = useState<boolean>(false);
   const processedSegmentIdsRef = useRef<Set<string>>(new Set());
+  const monotonicReqSeqRef = useRef<number>(0);
 
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -341,14 +342,14 @@ export default function LiveKitSalesRoom({
         room.on((RoomEvent as any).TranscriptionReceived, async (transcriptions: any[], participant?: RemoteParticipant | LocalParticipant) => {
           if (!transcriptions || transcriptions.length === 0) return;
           for (const publication of transcriptions) {
-            // Defect B1: Only explicitly final segments (isFinal === true)
+            // Defect 3: Only explicitly final segments (isFinal === true)
             const isFinal = publication.isFinal === true || publication.final === true;
             const text = publication.text || publication.transcript || "";
 
-            // Defect B4: Use stable segment identifier (publication.id or publication.segmentId). No timestamp fallback!
-            const segmentId = publication.id || publication.segmentId || `${publication.participantIdentity || participant?.identity || 'prospect'}_${text}`;
+            // Defect 3: Prefer stable segment ID supplied by provider. If none, generate unique ID per event instance (no text-based collision!)
+            const segmentId = publication.id || publication.segmentId || `seg_${publication.participantIdentity || participant?.identity || 'p'}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-            // Defect B2: Trustworthy participant identity resolution. Do not default unknown speakers to prospect!
+            // Defect 3: Trustworthy participant identity resolution
             const rawIdentity = participant?.identity || publication.participantIdentity;
             let speakerRole: "prospect" | "salesperson" | "other" = "other";
             if (rawIdentity) {
@@ -360,14 +361,14 @@ export default function LiveKitSalesRoom({
               }
             }
 
-            // Defect B1, B2, B3: Process strictly final prospect transcripts only, deduplicated by segment ID
+            // Defect 3: Process strictly final prospect transcripts only
             if (isFinal && text.trim().length > 0 && speakerRole === "prospect") {
               if (processedSegmentIdsRef.current.has(segmentId)) continue;
               processedSegmentIdsRef.current.add(segmentId);
 
-              // Defect B7: Request sequence counter for stale response rejection
-              const currentReqSequence = Date.now();
-              (room as any)._latestReqSeq = currentReqSequence;
+              // Defect 3: Monotonic request sequence counter for stale-response rejection
+              monotonicReqSeqRef.current += 1;
+              const currentReqSeq = monotonicReqSeqRef.current;
 
               setIsProcessingTranscript(true);
               setErrorMessage(null);
@@ -390,12 +391,13 @@ export default function LiveKitSalesRoom({
 
                 if (!transcriptRes.ok) {
                   const errData = await transcriptRes.json().catch(() => ({}));
-                  // Defect B6: Visible error state on HTTP/network failures
+                  // Defect 3: Unmark failed request so retries can occur safely
+                  processedSegmentIdsRef.current.delete(segmentId);
                   setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
                 } else {
                   const data = await transcriptRes.json();
-                  // Defect B7: Reject stale response if a newer request was dispatched while waiting
-                  if ((room as any)._latestReqSeq === currentReqSequence && data.recommendation) {
+                  // Defect 3: Monotonic check for out-of-order response rejection
+                  if (currentReqSeq === monotonicReqSeqRef.current && data.recommendation) {
                     setCurrentRecommendation({
                       statement: data.recommendation.statement,
                       status: data.recommendation.status,
@@ -406,9 +408,11 @@ export default function LiveKitSalesRoom({
                 }
               } catch (txErr: any) {
                 console.error("Failed to process LiveKit transcript:", txErr);
+                // Defect 3: Unmark failed network request so retries can occur
+                processedSegmentIdsRef.current.delete(segmentId);
                 setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
               } finally {
-                if ((room as any)._latestReqSeq === currentReqSequence) {
+                if (currentReqSeq === monotonicReqSeqRef.current) {
                   setIsProcessingTranscript(false);
                 }
               }
