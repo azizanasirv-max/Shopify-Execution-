@@ -12,6 +12,8 @@
     "test:isolation": "tsx run-tests.ts isolation",
     "test:hardening": "tsx run-tests.ts hardening",
     "test:approval-gate": "tsx run-tests.ts approval-gate",
+    "test:d1": "tsx run-tests.ts d1",
+    "test:worker": "tsx run-tests.ts worker",
     "test:adversarial": "tsx run-tests.ts adversarial",
     "test:stage2": "tsx run-tests.ts stage2"
   },

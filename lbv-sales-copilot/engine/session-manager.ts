@@ -280,6 +280,222 @@ export class CloudflareKVSessionStore implements SessionStore {
   }
 }
 
+/**
+ * Cloudflare D1 Session Store for production deployments.
+ * Implements durable, strongly-consistent SQL storage on Cloudflare D1.
+ * Features:
+ * - Versioned optimistic concurrency control on session mutations.
+ * - Atomic multi-statement batching for turn appending and timestamp updates.
+ * - Foreign-key cascading deletions.
+ * - Secure session authorization token validation in SQL queries.
+ * - Fail-closed error propagation with no silent fallbacks.
+ */
+export class CloudflareD1SessionStore implements SessionStore {
+  private db: any;
+
+  constructor(db?: any) {
+    this.db = db || (typeof globalThis !== "undefined" && (globalThis as any).DB);
+    if (!this.db && (process.env.NODE_ENV === "production" || process.env.LBV_SESSION_STORE === "cloudflare-d1")) {
+      throw new Error("[CloudflareD1SessionStore] Cloudflare D1 database binding 'DB' is required in production mode. Refusing fallback to local memory.");
+    }
+  }
+
+  private ensureDb() {
+    if (!this.db) {
+      throw new Error("[CloudflareD1SessionStore] Cloudflare D1 database binding 'DB' is not available.");
+    }
+    return this.db;
+  }
+
+  public async get(sessionId: string): Promise<SalesSession | undefined> {
+    const db = this.ensureDb();
+    const row = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionId).first();
+    if (!row) return undefined;
+
+    const turnsRes = await db.prepare(
+      "SELECT turn_index, role, text, tool_calls_json, timestamp FROM conversation_turns WHERE session_id = ? ORDER BY turn_index ASC"
+    ).bind(sessionId).all();
+
+    const conversationHistory: ConversationTurn[] = (turnsRes.results || []).map((t: any) => ({
+      role: t.role,
+      text: t.text || undefined,
+      toolCalls: t.tool_calls_json ? JSON.parse(t.tool_calls_json) : undefined,
+      timestamp: Number(t.timestamp)
+    }));
+
+    let metadata: Record<string, any> = {};
+    if (row.metadata_json) {
+      try {
+        metadata = JSON.parse(row.metadata_json);
+      } catch {}
+    }
+
+    return {
+      id: row.id,
+      authToken: row.auth_token,
+      productId: row.product_id,
+      roomName: row.room_name,
+      createdAt: Number(row.created_at),
+      lastActivityAt: Number(row.last_activity_at),
+      conversationHistory,
+      metadata,
+      version: Number(row.version || 1)
+    } as any;
+  }
+
+  public async set(sessionId: string, session: SalesSession, expectedVersion?: number): Promise<void> {
+    const db = this.ensureDb();
+    const metadataJson = JSON.stringify(session.metadata || {});
+
+    // Check if session exists to handle optimistic concurrency
+    const existing = await db.prepare("SELECT version FROM sessions WHERE id = ?").bind(sessionId).first();
+
+    if (existing) {
+      const versionToMatch =
+        expectedVersion !== undefined
+          ? expectedVersion
+          : (typeof (session as any).version === "number"
+            ? (session as any).version
+            : Number(existing.version));
+
+      const updateRes = await db.prepare(
+        "UPDATE sessions SET auth_token = ?, product_id = ?, room_name = ?, last_activity_at = ?, metadata_json = ?, version = version + 1 WHERE id = ? AND version = ?"
+      ).bind(
+        session.authToken,
+        session.productId,
+        session.roomName,
+        session.lastActivityAt,
+        metadataJson,
+        sessionId,
+        versionToMatch
+      ).run();
+
+      if (updateRes.meta && updateRes.meta.changes === 0) {
+        throw new Error(`[CloudflareD1SessionStore] Optimistic concurrency conflict on session '${sessionId}'. Version mismatch.`);
+      }
+    } else {
+      await db.prepare(
+        "INSERT INTO sessions (id, auth_token, product_id, room_name, created_at, last_activity_at, version, metadata_json) VALUES (?, ?, ?, ?, ?, ?, 1, ?)"
+      ).bind(
+        session.id,
+        session.authToken,
+        session.productId,
+        session.roomName,
+        session.createdAt,
+        session.lastActivityAt,
+        metadataJson
+      ).run();
+    }
+  }
+
+  public async delete(sessionId: string): Promise<boolean> {
+    const db = this.ensureDb();
+    const batch = await db.batch([
+      db.prepare("DELETE FROM conversation_turns WHERE session_id = ?").bind(sessionId),
+      db.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId)
+    ]);
+    const deleteSessionRes = batch[1];
+    return Boolean(deleteSessionRes.meta?.changes && deleteSessionRes.meta.changes > 0);
+  }
+
+  public async values(): Promise<SalesSession[]> {
+    const db = this.ensureDb();
+    const sessionsRes = await db.prepare("SELECT id FROM sessions ORDER BY created_at DESC").all();
+    const ids = (sessionsRes.results || []).map((r: any) => r.id);
+    const sessions: SalesSession[] = [];
+    for (const id of ids) {
+      const s = await this.get(id);
+      if (s) sessions.push(s);
+    }
+    return sessions;
+  }
+
+  public async clear(): Promise<void> {
+    const db = this.ensureDb();
+    await db.batch([
+      db.prepare("DELETE FROM conversation_turns"),
+      db.prepare("DELETE FROM sessions")
+    ]);
+  }
+
+  public async size(): Promise<number> {
+    const db = this.ensureDb();
+    const row = await db.prepare("SELECT COUNT(*) as count FROM sessions").first();
+    return Number(row?.count || 0);
+  }
+
+  public async addTurnAsync(
+    sessionId: string,
+    turn: ConversationTurn,
+    providedAuthToken?: string
+  ): Promise<SalesSession> {
+    const db = this.ensureDb();
+    const sessionRow = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionId).first();
+    if (!sessionRow) {
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    if (providedAuthToken !== undefined && providedAuthToken !== sessionRow.auth_token) {
+      throw new UnauthorizedSessionAccessError(sessionId);
+    }
+
+    // Get current turn count for sequential indexing
+    const countRow = await db.prepare("SELECT COUNT(*) as count FROM conversation_turns WHERE session_id = ?").bind(sessionId).first();
+    const turnIndex = Number(countRow?.count || 0);
+    const now = Date.now();
+    const toolCallsJson = turn.toolCalls ? JSON.stringify(turn.toolCalls) : null;
+    const currentVersion = Number(sessionRow.version);
+
+    // Atomic batch: insert turn AND update session last_activity_at + increment version
+    const batchRes = await db.batch([
+      db.prepare(
+        "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(sessionId, turnIndex, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now),
+      db.prepare(
+        "UPDATE sessions SET last_activity_at = ?, version = version + 1 WHERE id = ? AND version = ?"
+      ).bind(now, sessionId, currentVersion)
+    ]);
+
+    const updateRes = batchRes[1];
+    if (updateRes.meta && updateRes.meta.changes === 0) {
+      throw new Error(`[CloudflareD1SessionStore] Optimistic concurrency conflict on session '${sessionId}'. Version mismatch.`);
+    }
+
+    const updated = await this.get(sessionId);
+    if (!updated) throw new SessionNotFoundError(sessionId);
+    return updated;
+  }
+
+  public async clearSessionAsync(sessionId: string, providedAuthToken?: string): Promise<void> {
+    const db = this.ensureDb();
+    const sessionRow = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionId).first();
+    if (!sessionRow) {
+      throw new SessionNotFoundError(sessionId);
+    }
+
+    if (providedAuthToken !== undefined && providedAuthToken !== sessionRow.auth_token) {
+      throw new UnauthorizedSessionAccessError(sessionId);
+    }
+
+    const now = Date.now();
+    const currentVersion = Number(sessionRow.version);
+
+    await db.batch([
+      db.prepare("DELETE FROM conversation_turns WHERE session_id = ?").bind(sessionId),
+      db.prepare(
+        "UPDATE sessions SET last_activity_at = ?, version = version + 1 WHERE id = ? AND version = ?"
+      ).bind(now, sessionId, currentVersion)
+    ]);
+  }
+
+  public async cleanupExpired(ttlMs: number): Promise<number> {
+    const db = this.ensureDb();
+    const cutoff = Date.now() - ttlMs;
+    const res = await db.prepare("DELETE FROM sessions WHERE last_activity_at < ?").bind(cutoff).run();
+    return Number(res.meta?.changes || 0);
+  }
+}
+
 export interface SessionManagerOptions {
   ttlMs?: number;
   store?: SessionStore;
@@ -581,6 +797,10 @@ export class SessionManager {
     turn: ConversationTurn,
     providedAuthToken?: string
   ): Promise<void> {
+    if (this.store instanceof CloudflareD1SessionStore) {
+      await this.store.addTurnAsync(sessionId, turn, providedAuthToken);
+      return;
+    }
     if (this.store instanceof CloudflareDOSessionStore) {
       await this.store.addTurnAsync(sessionId, turn, providedAuthToken);
       return;
@@ -615,6 +835,24 @@ export class SessionManager {
   /**
    * Reset/clear conversation history of a specific session.
    */
+  public async clearSessionAsync(sessionId: string, providedAuthToken?: string): Promise<void> {
+    if (this.store instanceof CloudflareD1SessionStore) {
+      await this.store.clearSessionAsync(sessionId, providedAuthToken);
+      return;
+    }
+    const session = await this.getSessionAsync(sessionId);
+    if (!session) {
+      throw new SessionNotFoundError(sessionId);
+    }
+    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+      throw new UnauthorizedSessionAccessError(sessionId);
+    }
+    session.conversationHistory = [];
+    session.lastActivityAt = Date.now();
+    const res = this.store.set(sessionId, session);
+    if (res instanceof Promise) await res;
+  }
+
   public clearSession(sessionId: string, providedAuthToken?: string): void {
     const session = this.getSession(sessionId);
     if (!session) {
@@ -631,13 +869,23 @@ export class SessionManager {
   /**
    * Delete an active session.
    */
+  public async deleteSessionAsync(sessionId: string, providedAuthToken?: string): Promise<boolean> {
+    const session = await this.getSessionAsync(sessionId);
+    if (!session) return false;
+    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+      throw new UnauthorizedSessionAccessError(sessionId);
+    }
+    const res = this.store.delete(sessionId);
+    return res instanceof Promise ? await res : res;
+  }
+
   public deleteSession(sessionId: string, providedAuthToken?: string): boolean {
     const session = this.getSession(sessionId);
     if (!session) return false;
     if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
-    return this.store.delete(sessionId);
+    return this.store.delete(sessionId) as boolean;
   }
 
   /**

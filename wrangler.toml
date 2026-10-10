@@ -1,5 +1,5 @@
 name = "lbv-sales-copilot"
-main = "server.ts"
+main = "worker.ts"
 compatibility_date = "2024-03-20"
 
 [site]
@@ -7,6 +7,12 @@ bucket = "dist"
 
 [vars]
 NODE_ENV = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lbv-sales-sessions"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "LBV_SESSIONS_KV"

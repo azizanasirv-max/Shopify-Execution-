@@ -13,6 +13,8 @@ import { runAdapterIsolationTests } from "./lbv-sales-copilot/validation/adapter
 import { runSessionAccessControlTests } from "./lbv-sales-copilot/validation/session-access-control-tests.js";
 import { runRealtimeValidationTests } from "./lbv-sales-copilot/validation/livekit-realtime-tests.js";
 import { runSessionPersistenceTests } from "./lbv-sales-copilot/validation/session-persistence-tests.js";
+import { runD1PersistenceTests } from "./lbv-sales-copilot/validation/d1-persistence-tests.js";
+import { runWorkerIntegrationTests } from "./lbv-sales-copilot/validation/worker-integration-tests.js";
 
 dotenv.config();
 
@@ -111,6 +113,14 @@ if (command === "adversarial") {
   runSessionPersistenceTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "d1" || command === "d1-persistence") {
+  runD1PersistenceTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
+} else if (command === "worker" || command === "worker-integration") {
+  runWorkerIntegrationTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
 } else if (command === "hardening" || command === "unit" || command === "engine") {
   Promise.all([
     runHardeningUnitTests(),
@@ -118,13 +128,15 @@ if (command === "adversarial") {
     runAdapterIsolationTests(),
     runSessionAccessControlTests(),
     runRealtimeValidationTests(),
-    runSessionPersistenceTests()
-  ]).then(([s1, s2, s3, s4, s5, s6]) => {
-    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed;
+    runSessionPersistenceTests(),
+    runD1PersistenceTests(),
+    runWorkerIntegrationTests()
+  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed;
     process.exit(totalFailed === 0 ? 0 : 1);
   });
 } else {
-  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", or "hardening".`);
+  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", "persistence", "d1", "worker", or "hardening".`);
   process.exit(1);
 }
 
