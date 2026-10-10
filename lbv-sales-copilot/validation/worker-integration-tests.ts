@@ -107,7 +107,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(unauthData.code === "GLOBAL_LISTING_FORBIDDEN", "Rejects global session enumeration across users");
 
   // Authenticated listing returns strictly user's session
-  const authListReq = new Request("https://worker.local/api/sessions", {
+  const authListReq = new Request(`https://worker.local/api/sessions?sessionId=${sessionData.sessionId}`, {
     method: "GET",
     headers: {
       "X-Session-Token": sessionData.sessionToken
@@ -117,7 +117,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(authListRes.status === 200, "GET /api/sessions with token returns 200");
   const authListData = await authListRes.json() as any;
   assert(authListData.sessions?.length === 1, "Returns strictly single matching session");
-  assert(authListData.sessions[0].id === sessionData.sessionId, "Session ID matches authorized user");
+  assert(authListData.sessions && authListData.sessions[0]?.id === sessionData.sessionId, "Session ID matches authorized user");
 
   // -------------------------------------------------------------
   // TEST 5: Session Inspection, History Clear, and Deletion

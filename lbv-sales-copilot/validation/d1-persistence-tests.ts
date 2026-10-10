@@ -79,6 +79,14 @@ export class MockD1PreparedStatement {
       return { results: s ? [s as any] : [], success: true, meta: {} };
     }
 
+    if (trimmed.startsWith("SELECT * FROM sessions WHERE auth_token = ?")) {
+      const token = this.params[0];
+      const sessionId = this.params[1];
+      const allSessions = Array.from(this.db.sessions.values());
+      const s = allSessions.find(sess => sess.auth_token === token && (!sessionId || sess.id === sessionId));
+      return { results: s ? [s as any] : [], success: true, meta: {} };
+    }
+
     if (trimmed.startsWith("SELECT version FROM sessions WHERE id = ?")) {
       const id = this.params[0];
       const s = this.db.sessions.get(id);

@@ -87,12 +87,25 @@ export class LiveKitRealtimeAdapter {
   private apiKey: string | null;
   private apiSecret: string | null;
 
-  constructor(engine: GenericSalesEngine, registry?: AdapterRegistry) {
+  constructor(
+    engine: GenericSalesEngine,
+    registry?: AdapterRegistry,
+    livekitConfig?: { serverUrl?: string; apiKey?: string; apiSecret?: string }
+  ) {
     this.engine = engine;
     this.registry = registry;
-    this.serverUrl = process.env.LIVEKIT_URL || null;
-    this.apiKey = process.env.LIVEKIT_API_KEY || null;
-    this.apiSecret = process.env.LIVEKIT_API_SECRET || null;
+    this.serverUrl =
+      livekitConfig?.serverUrl ||
+      (typeof process !== "undefined" ? process.env?.LIVEKIT_URL : undefined) ||
+      null;
+    this.apiKey =
+      livekitConfig?.apiKey ||
+      (typeof process !== "undefined" ? process.env?.LIVEKIT_API_KEY : undefined) ||
+      null;
+    this.apiSecret =
+      livekitConfig?.apiSecret ||
+      (typeof process !== "undefined" ? process.env?.LIVEKIT_API_SECRET : undefined) ||
+      null;
   }
 
   /**

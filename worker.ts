@@ -32,6 +32,9 @@ export interface Env {
   DB?: any; // Cloudflare D1
   GEMINI_API_KEY?: string;
   ADMIN_API_KEY?: string;
+  LIVEKIT_URL?: string;
+  LIVEKIT_API_KEY?: string;
+  LIVEKIT_API_SECRET?: string;
   NODE_ENV?: string;
   LBV_SESSION_STORE?: string;
   ALLOWED_ORIGINS?: string;
@@ -175,7 +178,11 @@ export function createWorkerServices(env: Env) {
   });
 
   // 5. Realtime Adapter
-  const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, adapterRegistry);
+  const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, adapterRegistry, {
+    serverUrl: env.LIVEKIT_URL,
+    apiKey: env.LIVEKIT_API_KEY,
+    apiSecret: env.LIVEKIT_API_SECRET
+  });
 
   return {
     adapterRegistry,
@@ -225,9 +232,23 @@ function errorResponse(
 
 // Helper to handle CORS
 function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
-  const origin = request.headers.get("Origin") || "*";
-  const allowed = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(o => o.trim()) : ["*"];
-  const allowOrigin = allowed.includes("*") || allowed.includes(origin) ? origin : "null";
+  const isProd =
+    env.NODE_ENV === "production" ||
+    (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
+  const origin = request.headers.get("Origin") || "";
+
+  // Explicit allowed origin policy in production
+  const defaultAllowed = isProd ? [] : ["*"];
+  const allowed = env.ALLOWED_ORIGINS
+    ? env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
+    : defaultAllowed;
+
+  let allowOrigin = "null";
+  if (allowed.includes("*")) {
+    allowOrigin = origin || "*";
+  } else if (origin && allowed.includes(origin)) {
+    allowOrigin = origin;
+  }
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
@@ -344,8 +365,29 @@ export default {
 
         const recommendation = await salesEngine.generateRecommendation(prompt, {
           adapter: targetAdapter,
-          session
+          session,
+          history: session.conversationHistory
         });
+
+        // Ensure new conversation turns created in-memory during recommendation generation are explicitly persisted back to D1 / store
+        if (session.conversationHistory.length > 0) {
+          const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
+          const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
+          if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
+            try {
+              await sessionManager.addTurnAsync(session.id, lastUserTurn, session.authToken);
+              await sessionManager.addTurnAsync(session.id, lastModelTurn, session.authToken);
+            } catch (persistErr: any) {
+              console.error("[Worker] D1 Turn persistence error:", persistErr);
+              return errorResponse("Failed to persist session conversation turn.", "PERSISTENCE_ERROR", 500, corsHeaders);
+            }
+          }
+        }
+
+        // Sanitize recommendation before returning in public response:
+        // Raw unapproved text (rawUnapprovedStatement) must never be leaked in engineMetadata or public JSON
+        const sanitizedEngineMetadata = recommendation.engineMetadata ? { ...recommendation.engineMetadata } : {};
+        delete (sanitizedEngineMetadata as any).rawUnapprovedStatement;
 
         return jsonResponse(
           {
@@ -357,7 +399,7 @@ export default {
             productId: targetAdapter.id,
             toolsUsed: recommendation.toolsUsed,
             validationReport: recommendation.validationReport,
-            engineMetadata: recommendation.engineMetadata
+            engineMetadata: sanitizedEngineMetadata
           },
           200,
           corsHeaders
@@ -566,6 +608,10 @@ export default {
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
           body?.sessionToken;
 
+        if (!token) {
+          return errorResponse("Unauthorized access: Valid session authorization token is required to clear a session.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
+        }
+
         try {
           await sessionManager.clearSessionAsync(sessionId, token);
           return jsonResponse({ success: true, message: `Session ${sessionId} history cleared.` }, 200, corsHeaders);
@@ -589,8 +635,12 @@ export default {
           request.headers.get("x-session-token") ||
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
 
+        if (!token) {
+          return errorResponse("Unauthorized access: Valid session authorization token is required to delete a session.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
+        }
+
         try {
-          const deleted = await sessionManager.deleteSessionAsync(sessionId, token || undefined);
+          const deleted = await sessionManager.deleteSessionAsync(sessionId, token);
           if (!deleted) {
             return errorResponse("Session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
           }
@@ -696,6 +746,86 @@ export default {
         });
 
         return jsonResponse(tokenData, 200, corsHeaders);
+      }
+
+      // =========================================================================
+      // ROUTE: POST /api/livekit/transcript
+      // =========================================================================
+      if (pathname === "/api/livekit/transcript" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as any;
+        const { sessionId, sessionToken, text, isFinal, speaker } = body;
+        const tokenHeader =
+          request.headers.get("x-session-token") ||
+          request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+          sessionToken;
+
+        if (!sessionId || typeof sessionId !== "string") {
+          return errorResponse("sessionId is required for transcript ingress.", "SESSION_REQUIRED", 400, corsHeaders);
+        }
+
+        const session = await sessionManager.getSessionAsync(sessionId);
+        if (!session) {
+          return errorResponse("Sales session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
+        }
+
+        if (!tokenHeader || tokenHeader !== session.authToken) {
+          return errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
+        }
+
+        if (!text || typeof text !== "string" || !text.trim()) {
+          return errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders);
+        }
+
+        const targetAdapter = adapterRegistry.resolve(session.productId);
+        const transcriptSpeaker = speaker === "salesperson" ? "salesperson" : "prospect";
+        const finalFlag = isFinal !== false;
+
+        let recommendation: any = null;
+
+        if (transcriptSpeaker === "prospect" && finalFlag) {
+          const rawRec = await salesEngine.generateRecommendation(text.trim(), {
+            adapter: targetAdapter,
+            session,
+            history: session.conversationHistory
+          });
+
+          // Explicitly persist new turns to session store / D1
+          if (session.conversationHistory.length > 0) {
+            const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
+            const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
+            if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
+              try {
+                await sessionManager.addTurnAsync(session.id, lastUserTurn, session.authToken);
+                await sessionManager.addTurnAsync(session.id, lastModelTurn, session.authToken);
+              } catch (persistErr: any) {
+                console.error("[Worker Realtime] Persistence error:", persistErr);
+              }
+            }
+          }
+
+          const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
+          delete (sanitizedMetadata as any).rawUnapprovedStatement;
+
+          recommendation = {
+            statement: rawRec.statement,
+            status: rawRec.status,
+            toolsUsed: rawRec.toolsUsed,
+            validationReport: rawRec.validationReport,
+            engineMetadata: sanitizedMetadata
+          };
+        }
+
+        return jsonResponse(
+          {
+            success: true,
+            sessionId: session.id,
+            productId: session.productId,
+            speaker: transcriptSpeaker,
+            recommendation
+          },
+          200,
+          corsHeaders
+        );
       }
 
       // =========================================================================

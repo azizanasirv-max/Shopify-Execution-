@@ -206,6 +206,11 @@ app.post("/api/copilot", async (req, res) => {
       session
     });
 
+    const sanitizedEngineMetadata = recommendation.engineMetadata ? { ...recommendation.engineMetadata } : {};
+    if (sanitizedEngineMetadata) {
+      delete (sanitizedEngineMetadata as any).rawUnapprovedStatement;
+    }
+
     res.json({
       answer: recommendation.statement,
       status: recommendation.status,
@@ -215,7 +220,7 @@ app.post("/api/copilot", async (req, res) => {
       productId: targetAdapter.id,
       toolsUsed: recommendation.toolsUsed,
       validationReport: recommendation.validationReport,
-      engineMetadata: recommendation.engineMetadata
+      engineMetadata: sanitizedEngineMetadata
     });
   } catch (error: any) {
     console.error("Generic Sales Engine Error:", error);
@@ -399,6 +404,13 @@ app.post("/api/sessions/:id/clear", async (req, res) => {
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     (req.body?.sessionToken as string);
 
+  if (!token) {
+    return res.status(403).json({
+      error: "Unauthorized access: Valid session authorization token is required to clear a session.",
+      code: "UNAUTHORIZED_SESSION_ACCESS"
+    });
+  }
+
   try {
     const session = await sessionManager.validateSessionAuthorizationAsync(req.params.id, token);
     session.conversationHistory = [];
@@ -410,6 +422,33 @@ app.post("/api/sessions/:id/clear", async (req, res) => {
     if (err instanceof SessionNotFoundError) {
       return res.status(404).json({ error: err.message, code: "SESSION_NOT_FOUND" });
     }
+    if (err instanceof UnauthorizedSessionAccessError) {
+      return res.status(403).json({ error: err.message, code: "UNAUTHORIZED_SESSION_ACCESS" });
+    }
+    return res.status(500).json({ error: err.message, code: "INTERNAL_ERROR" });
+  }
+});
+
+// Delete session (requires session authorization token)
+app.delete("/api/sessions/:id", async (req, res) => {
+  const token =
+    (req.headers["x-session-token"] as string) ||
+    req.headers.authorization?.replace(/^Bearer\s+/i, "");
+
+  if (!token) {
+    return res.status(403).json({
+      error: "Unauthorized access: Valid session authorization token is required to delete a session.",
+      code: "UNAUTHORIZED_SESSION_ACCESS"
+    });
+  }
+
+  try {
+    const deleted = await sessionManager.deleteSessionAsync(req.params.id, token);
+    if (!deleted) {
+      return res.status(404).json({ error: "Session not found or expired.", code: "SESSION_NOT_FOUND" });
+    }
+    res.json({ success: true, message: `Session ${req.params.id} deleted.` });
+  } catch (err: any) {
     if (err instanceof UnauthorizedSessionAccessError) {
       return res.status(403).json({ error: err.message, code: "UNAUTHORIZED_SESSION_ACCESS" });
     }
@@ -1060,6 +1099,70 @@ app.post("/api/run-stage2-validation", async (req, res) => {
   } catch (error: any) {
     console.error("Stage 2 Validation Failure:", error);
     res.status(500).json({ error: "Failed to run complete Stage 2 validation.", details: error.message });
+  }
+});
+
+// Realtime Transcript Ingress Endpoint for LiveKit Speech-to-Text pipeline
+app.post("/api/livekit/transcript", async (req, res) => {
+  try {
+    const { sessionId, sessionToken, text, isFinal, speaker } = req.body;
+    const tokenHeader =
+      (req.headers["x-session-token"] as string) ||
+      req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+      sessionToken;
+
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({ error: "sessionId is required for transcript ingress.", code: "SESSION_REQUIRED" });
+    }
+
+    const session = await sessionManager.getSessionAsync(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: "Sales session not found or expired.", code: "SESSION_NOT_FOUND" });
+    }
+
+    if (!tokenHeader || tokenHeader !== session.authToken) {
+      return res.status(403).json({ error: "Unauthorized access: Valid session authorization token is required.", code: "UNAUTHORIZED_SESSION_ACCESS" });
+    }
+
+    if (!text || typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "Non-empty transcript text is required.", code: "INVALID_TRANSCRIPT" });
+    }
+
+    const targetAdapter = adapterRegistry.resolve(session.productId);
+    const transcriptSpeaker = speaker === "salesperson" ? "salesperson" : "prospect";
+    const finalFlag = isFinal !== false;
+
+    let recommendation: any = null;
+
+    if (transcriptSpeaker === "prospect" && finalFlag) {
+      const rawRec = await salesEngine.generateRecommendation(text.trim(), {
+        adapter: targetAdapter,
+        session,
+        history: session.conversationHistory
+      });
+
+      const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
+      delete (sanitizedMetadata as any).rawUnapprovedStatement;
+
+      recommendation = {
+        statement: rawRec.statement,
+        status: rawRec.status,
+        toolsUsed: rawRec.toolsUsed,
+        validationReport: rawRec.validationReport,
+        engineMetadata: sanitizedMetadata
+      };
+    }
+
+    res.json({
+      success: true,
+      sessionId: session.id,
+      productId: session.productId,
+      speaker: transcriptSpeaker,
+      recommendation
+    });
+  } catch (err: any) {
+    console.error("Transcript ingress error:", err);
+    res.status(500).json({ error: "Failed to process transcript event.", details: err.message });
   }
 });
 

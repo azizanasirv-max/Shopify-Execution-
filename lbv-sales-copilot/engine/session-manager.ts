@@ -319,6 +319,18 @@ export class CloudflareD1SessionStore implements SessionStore {
     const res = await db.prepare("DELETE FROM sessions WHERE last_activity_at < ?").bind(cutoff).run();
     return Number(res.meta?.changes || 0);
   }
+
+  public async findByTokenAsync(token: string, sessionId?: string): Promise<SalesSession | undefined> {
+    const db = this.ensureDb();
+    let row: any = null;
+    if (sessionId) {
+      row = await db.prepare("SELECT * FROM sessions WHERE auth_token = ? AND id = ?").bind(token, sessionId).first();
+    } else {
+      row = await db.prepare("SELECT * FROM sessions WHERE auth_token = ?").bind(token).first();
+    }
+    if (!row) return undefined;
+    return this.get(row.id);
+  }
 }
 
 export interface SessionManagerOptions {
@@ -460,6 +472,17 @@ export class SessionManager {
 
   public async findSessionByTokenAsync(token: string, sessionId?: string): Promise<SalesSession | undefined> {
     if (!token) return undefined;
+    if (this.store instanceof CloudflareD1SessionStore) {
+      const session = await this.store.findByTokenAsync(token, sessionId);
+      if (session) {
+        if (Date.now() - session.lastActivityAt > this.ttlMs) {
+          await this.store.delete(session.id);
+          return undefined;
+        }
+        return session;
+      }
+      return undefined;
+    }
     if (sessionId) {
       const session = await this.getSessionAsync(sessionId);
       if (session && session.authToken === token) {
