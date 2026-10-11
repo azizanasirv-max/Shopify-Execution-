@@ -359,6 +359,17 @@ export async function runSessionAccessControlTests() {
   assert(unauthorizedClearRejected, "Clearing session with incorrect token is rejected");
   assert(user1Session.conversationHistory.length === 1, "Conversation history remains preserved upon rejected clear");
 
+  // Testing missing token on synchronous clearSession fails closed
+  let missingTokenClearRejected = false;
+  try {
+    standardSessionManager.clearSession(user1Session.id, undefined);
+  } catch (err: any) {
+    if (err instanceof UnauthorizedSessionAccessError || err.code === "UNAUTHORIZED_SESSION_ACCESS") {
+      missingTokenClearRejected = true;
+    }
+  }
+  assert(missingTokenClearRejected, "Synchronous clearSession with missing token fails closed");
+
   // Clearing with valid token succeeds
   standardSessionManager.clearSession(user1Session.id, user1Session.authToken);
   assert(user1Session.conversationHistory.length === 0, "Authorized clear successfully empties conversation history");

@@ -735,7 +735,7 @@ export class SessionManager {
     if (!session) {
       throw new SessionNotFoundError(sessionId);
     }
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     session.conversationHistory = [];
@@ -851,7 +851,8 @@ export class SessionDurableObject {
             headers: { "Content-Type": "application/json" }
           });
         }
-        if (body.providedAuthToken !== undefined && body.providedAuthToken !== this.session.authToken) {
+        const token = body.providedAuthToken || body.authToken;
+        if (!token || token !== this.session.authToken) {
           return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
             status: 403,
             headers: { "Content-Type": "application/json" }
@@ -872,7 +873,8 @@ export class SessionDurableObject {
             headers: { "Content-Type": "application/json" }
           });
         }
-        if (body.providedAuthToken !== undefined && body.providedAuthToken !== this.session.authToken) {
+        const token = body.providedAuthToken || body.authToken;
+        if (!token || token !== this.session.authToken) {
           return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
             status: 403,
             headers: { "Content-Type": "application/json" }
