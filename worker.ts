@@ -238,7 +238,8 @@ function errorResponse(
 function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
   const isProd =
     env.NODE_ENV === "production" ||
-    (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
+    (!env.NODE_ENV && typeof process !== "undefined" && process.env?.NODE_ENV === "production") ||
+    (!env.NODE_ENV && typeof process === "undefined"); // Fail closed in Worker environment if NODE_ENV is unspecified
   const origin = request.headers.get("Origin") || "";
 
   // Explicit allowed origin policy in production

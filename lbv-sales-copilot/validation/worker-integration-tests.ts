@@ -58,6 +58,33 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(Boolean(optionsRes.headers.get("Access-Control-Allow-Methods")?.includes("POST")), "CORS allows POST method");
   assert(Boolean(optionsRes.headers.get("Access-Control-Allow-Headers")?.includes("X-Session-Token")), "CORS allows X-Session-Token header");
 
+  // TEST 1b: CORS fail-closed in Worker environment with NODE_ENV absent
+  console.log("\n[1b] Testing CORS fail-closed when NODE_ENV is absent...");
+  const noEnvProdEnv: Env = {
+    DB: mockDb,
+    ALLOWED_ORIGINS: "https://approved-store.com,https://dashboard.company.com"
+  };
+
+  const unapprovedCorsReq = new Request("https://worker.local/api/copilot", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://malicious-site.com",
+      "Access-Control-Request-Method": "POST"
+    }
+  });
+  const unapprovedCorsRes = await worker.fetch(unapprovedCorsReq, noEnvProdEnv);
+  assert(unapprovedCorsRes.headers.get("Access-Control-Allow-Origin") === "null", "Unapproved origin returns Access-Control-Allow-Origin: null when NODE_ENV is absent");
+
+  const approvedCorsReq = new Request("https://worker.local/api/copilot", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://approved-store.com",
+      "Access-Control-Request-Method": "POST"
+    }
+  });
+  const approvedCorsRes = await worker.fetch(approvedCorsReq, noEnvProdEnv);
+  assert(approvedCorsRes.headers.get("Access-Control-Allow-Origin") === "https://approved-store.com", "Explicitly approved origin returns origin header when NODE_ENV is absent");
+
   // -------------------------------------------------------------
   // TEST 2: Request Body Size Limit (Reject > 64KB)
   // -------------------------------------------------------------
