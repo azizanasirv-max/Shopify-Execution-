@@ -60,7 +60,8 @@ export class GeminiWorkerModelProvider implements ModelProvider {
     config?: any;
   }): Promise<{ text?: string; functionCalls?: any[]; candidates?: any[] }> {
     const model = params.model || "gemini-3.1-flash-lite";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
+    // Use secure x-goog-api-key HTTP header for authentication instead of URL query parameter
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
     const bodyPayload: Record<string, any> = {
       contents: params.contents
@@ -84,6 +85,7 @@ export class GeminiWorkerModelProvider implements ModelProvider {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "x-goog-api-key": this.apiKey,
           "User-Agent": "lbv-sales-engine-worker/1.0"
         },
         body: JSON.stringify(bodyPayload),
@@ -145,7 +147,8 @@ export function createWorkerServices(env: Env) {
   let sessionStore: SessionStore;
   const isProd =
     env.NODE_ENV === "production" ||
-    (typeof process !== "undefined" && process.env?.NODE_ENV === "production");
+    (!env.NODE_ENV && typeof process !== "undefined" && process.env?.NODE_ENV === "production") ||
+    (!env.NODE_ENV && typeof process === "undefined"); // Fail closed in Worker environment if NODE_ENV is unspecified
 
   if (env.DB) {
     sessionStore = new CloudflareD1SessionStore(env.DB);

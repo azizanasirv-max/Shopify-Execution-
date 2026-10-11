@@ -509,7 +509,7 @@ export async function runSessionAccessControlTests() {
   // -------------------------------------------------------------
   // TEST 13: Pluggable Session Store & Persistence Architecture
   // -------------------------------------------------------------
-  console.log("\n[13/13] Testing pluggable session store and persistence architecture...");
+  console.log("\n[13/14] Testing pluggable session store and persistence architecture...");
   const customStore = {
     storeMap: new Map<string, any>(),
     get(id: string) { return this.storeMap.get(id); },
@@ -525,6 +525,43 @@ export async function runSessionAccessControlTests() {
   assert(customManager.getSession(customSess.id)?.id === customSess.id, "Custom SessionStore retrieves session correctly");
   customManager.deleteSession(customSess.id, customSess.authToken);
   assert(customStore.size() === 0, "Custom SessionStore successfully deletes session");
+
+  // -------------------------------------------------------------
+  // TEST 14: SessionDurableObject Authorization Protection
+  // -------------------------------------------------------------
+  console.log("\n[14/14] Testing SessionDurableObject action authorization protection...");
+  const mockStorage = {
+    data: new Map<string, any>(),
+    async get(k: string) { return this.data.get(k); },
+    async put(k: string, v: any) { this.data.set(k, v); },
+    async deleteAll() { this.data.clear(); }
+  };
+  const mockState = { storage: mockStorage };
+  const doInstance = new (require("../engine/session-manager.js").SessionDurableObject)(mockState, {});
+
+  // Put a session into DO storage
+  await mockStorage.put("session", {
+    id: "do_sess_101",
+    authToken: "stok_do_secret_999",
+    productId: "shopify",
+    conversationHistory: []
+  });
+
+  // Unauthorized GET request without token
+  const unauthGetRes = await doInstance.fetch(new Request("https://do/session?action=get"));
+  assert(unauthGetRes.status === 403, "SessionDurableObject GET without token rejected with 403");
+
+  // Authorized GET request with token
+  const authGetRes = await doInstance.fetch(new Request("https://do/session?action=get&token=stok_do_secret_999"));
+  assert(authGetRes.status === 200, "SessionDurableObject GET with valid token succeeds with 200");
+
+  // Unauthorized delete request without token
+  const unauthDelRes = await doInstance.fetch(new Request("https://do/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "delete", providedAuthToken: "wrong_token" })
+  }));
+  assert(unauthDelRes.status === 403, "SessionDurableObject delete with invalid token rejected with 403");
 
   console.log("\n--------------------------------------------------");
   console.log(`Session Access Control Tests Summary: Passed: ${passed} | Failed: ${failed} | Total: ${passed + failed}`);

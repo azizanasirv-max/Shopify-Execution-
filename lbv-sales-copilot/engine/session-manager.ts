@@ -797,6 +797,15 @@ export class SessionDurableObject {
     }
 
     if (request.method === "GET" || action === "get") {
+      const token = url.searchParams.get("token") || url.searchParams.get("providedAuthToken");
+      if (this.session && this.session.authToken) {
+        if (!token || token !== this.session.authToken) {
+          return new Response(JSON.stringify({ error: "Unauthorized access: Valid token required to inspect session.", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
       return new Response(JSON.stringify(this.session), {
         headers: { "Content-Type": "application/json" }
       });
@@ -805,12 +814,12 @@ export class SessionDurableObject {
     if (request.method === "POST" || action === "set" || action === "update" || action === "delete" || action === "add_turn" || action === "clear") {
       const body = request.body ? await request.json().catch(() => ({})) as any : {};
       const reqAction = body.action || action;
+      const providedToken = body.providedAuthToken || body.authToken || url.searchParams.get("token");
 
       if (reqAction === "delete") {
         if (this.session && this.session.authToken) {
-          const token = body.providedAuthToken || body.authToken;
-          if (token !== this.session.authToken) {
-            return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+          if (!providedToken || providedToken !== this.session.authToken) {
+            return new Response(JSON.stringify({ error: "Unauthorized access: Valid token required to delete session.", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
               status: 403,
               headers: { "Content-Type": "application/json" }
             });
@@ -825,9 +834,8 @@ export class SessionDurableObject {
 
       if (reqAction === "set" || body.session) {
         if (this.session && this.session.authToken) {
-          const token = body.providedAuthToken || body.session?.authToken || body.authToken;
-          if (token !== this.session.authToken) {
-            return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+          if (!providedToken || providedToken !== this.session.authToken) {
+            return new Response(JSON.stringify({ error: "Unauthorized access: Valid token required to update session.", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
               status: 403,
               headers: { "Content-Type": "application/json" }
             });
