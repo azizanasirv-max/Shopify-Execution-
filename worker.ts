@@ -24,39 +24,23 @@ import {
   UnauthorizedSessionAccessError,
   InMemorySessionStore,
   CloudflareD1SessionStore,
+  CloudflareDOSessionStore,
+  SessionDurableObject,
   SessionStore
 } from "./lbv-sales-copilot/engine/session-manager.js";
 import { ModelProvider } from "./lbv-sales-copilot/engine/types.js";
 
+export { SessionDurableObject };
+
 export interface Env {
   DB?: any; // Cloudflare D1
+  SESSION_DO?: any; // Cloudflare Durable Object
   GEMINI_API_KEY?: string;
   ADMIN_API_KEY?: string;
-  LIVEKIT_URL?: string;
-  LIVEKIT_API_KEY?: string;
-  LIVEKIT_API_SECRET?: string;
   NODE_ENV?: string;
   LBV_SESSION_STORE?: string;
   ALLOWED_ORIGINS?: string;
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
-}
-
-/**
- * Determine whether the worker must run in production (fail-closed) mode.
- *
- * Security rationale: Cloudflare Workers configured with the `nodejs_compat`
- * flag expose a `process` polyfill, so `typeof process` CANNOT be used to
- * distinguish a Cloudflare Worker from Node.js. The previous implementation
- * relied on it and therefore failed OPEN (enabling wildcard CORS) whenever
- * `NODE_ENV` was absent in a Worker with `process` defined.
- *
- * Policy: treat the environment as production unless it is *explicitly*
- * configured as a non-production environment (`development` or `test`).
- * This makes secure behavior the default and requires an explicit opt-in
- * for development conveniences such as wildcard CORS.
- */
-export function isProductionEnvironment(env: Env): boolean {
-  return env.NODE_ENV !== "development" && env.NODE_ENV !== "test";
 }
 
 /**
@@ -78,8 +62,7 @@ export class GeminiWorkerModelProvider implements ModelProvider {
     config?: any;
   }): Promise<{ text?: string; functionCalls?: any[]; candidates?: any[] }> {
     const model = params.model || "gemini-3.1-flash-lite";
-    // Use secure x-goog-api-key HTTP header for authentication instead of URL query parameter
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
 
     const bodyPayload: Record<string, any> = {
       contents: params.contents
@@ -103,7 +86,6 @@ export class GeminiWorkerModelProvider implements ModelProvider {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-goog-api-key": this.apiKey,
           "User-Agent": "lbv-sales-engine-worker/1.0"
         },
         body: JSON.stringify(bodyPayload),
@@ -161,15 +143,17 @@ export function createWorkerServices(env: Env) {
   adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
   adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
 
-  // 2. Authoritative Session Store Selection (D1 authoritative, zero fallback in production)
+  // 2. Authoritative Session Store Selection (D1 -> DO -> KV -> local)
   let sessionStore: SessionStore;
-  const isProd = isProductionEnvironment(env);
+  const isProd = env.NODE_ENV === "production" || process.env.NODE_ENV === "production";
 
   if (env.DB) {
     sessionStore = new CloudflareD1SessionStore(env.DB);
+  } else if (env.SESSION_DO) {
+    sessionStore = new CloudflareDOSessionStore(env.SESSION_DO);
   } else if (isProd || env.LBV_SESSION_STORE === "cloudflare-d1") {
     throw new Error(
-      "[Production Error] Cloudflare D1 persistent database binding 'DB' is required in production Cloudflare Workers mode. Refusing insecure fallback to memory, DO, or KV."
+      "[Production Error] Cloudflare D1 persistent database binding 'DB' is required in production Cloudflare Workers mode. Refusing insecure fallback to memory."
     );
   } else {
     sessionStore = new InMemorySessionStore();
@@ -196,12 +180,7 @@ export function createWorkerServices(env: Env) {
   });
 
   // 5. Realtime Adapter
-  const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, adapterRegistry, {
-    serverUrl: env.LIVEKIT_URL,
-    apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET,
-    isProd
-  });
+  const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, adapterRegistry);
 
   return {
     adapterRegistry,
@@ -251,21 +230,9 @@ function errorResponse(
 
 // Helper to handle CORS
 function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
-  const isProd = isProductionEnvironment(env);
-  const origin = request.headers.get("Origin") || "";
-
-  // Explicit allowed origin policy in production
-  const defaultAllowed = isProd ? [] : ["*"];
-  const allowed = env.ALLOWED_ORIGINS
-    ? env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
-    : defaultAllowed;
-
-  let allowOrigin = "null";
-  if (allowed.includes("*")) {
-    allowOrigin = origin || "*";
-  } else if (origin && allowed.includes(origin)) {
-    allowOrigin = origin;
-  }
+  const origin = request.headers.get("Origin") || "*";
+  const allowed = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(o => o.trim()) : ["*"];
+  const allowOrigin = allowed.includes("*") || allowed.includes(origin) ? origin : "null";
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
@@ -382,28 +349,8 @@ export default {
 
         const recommendation = await salesEngine.generateRecommendation(prompt, {
           adapter: targetAdapter,
-          session,
-          history: session.conversationHistory
+          session
         });
-
-        // Ensure new conversation turns created in-memory during recommendation generation are atomically persisted back to D1 / store
-        if (session.conversationHistory.length >= 2) {
-          const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
-          const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
-          if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
-            try {
-              await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
-            } catch (persistErr: any) {
-              console.error("[Worker] D1 Turn atomic persistence error:", persistErr);
-              return errorResponse("Failed to persist session conversation turn.", "PERSISTENCE_ERROR", 500, corsHeaders);
-            }
-          }
-        }
-
-        // Sanitize recommendation before returning in public response:
-        // Raw unapproved text (rawUnapprovedStatement) must never be leaked in engineMetadata or public JSON
-        const sanitizedEngineMetadata = recommendation.engineMetadata ? { ...recommendation.engineMetadata } : {};
-        delete (sanitizedEngineMetadata as any).rawUnapprovedStatement;
 
         return jsonResponse(
           {
@@ -415,7 +362,7 @@ export default {
             productId: targetAdapter.id,
             toolsUsed: recommendation.toolsUsed,
             validationReport: recommendation.validationReport,
-            engineMetadata: sanitizedEngineMetadata
+            engineMetadata: recommendation.engineMetadata
           },
           200,
           corsHeaders
@@ -624,10 +571,6 @@ export default {
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
           body?.sessionToken;
 
-        if (!token) {
-          return errorResponse("Unauthorized access: Valid session authorization token is required to clear a session.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
-        }
-
         try {
           await sessionManager.clearSessionAsync(sessionId, token);
           return jsonResponse({ success: true, message: `Session ${sessionId} history cleared.` }, 200, corsHeaders);
@@ -651,12 +594,8 @@ export default {
           request.headers.get("x-session-token") ||
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
 
-        if (!token) {
-          return errorResponse("Unauthorized access: Valid session authorization token is required to delete a session.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
-        }
-
         try {
-          const deleted = await sessionManager.deleteSessionAsync(sessionId, token);
+          const deleted = await sessionManager.deleteSessionAsync(sessionId, token || undefined);
           if (!deleted) {
             return errorResponse("Session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
           }
@@ -765,100 +704,6 @@ export default {
       }
 
       // =========================================================================
-      // ROUTE: POST /api/livekit/transcript
-      // =========================================================================
-      if (pathname === "/api/livekit/transcript" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
-        const { sessionId, sessionToken, text, isFinal, speaker } = body;
-        const tokenHeader =
-          request.headers.get("x-session-token") ||
-          request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
-          sessionToken;
-
-        if (!sessionId || typeof sessionId !== "string") {
-          return errorResponse("sessionId is required for transcript ingress.", "SESSION_REQUIRED", 400, corsHeaders);
-        }
-
-        const session = await sessionManager.getSessionAsync(sessionId);
-        if (!session) {
-          return errorResponse("Sales session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
-        }
-
-        if (!tokenHeader || tokenHeader !== session.authToken) {
-          return errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
-        }
-
-        // Defect A1 & A2: Strict boolean isFinal check (reject missing, null, string, or false values)
-        if (typeof isFinal !== "boolean" || isFinal !== true) {
-          return errorResponse("isFinal must be an explicit boolean true value for recommendation generation.", "INVALID_FINAL_STATUS", 400, corsHeaders);
-        }
-
-        // Defect A3: Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)
-        if (speaker !== "prospect" && speaker !== "salesperson") {
-          return errorResponse("Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", "INVALID_SPEAKER", 400, corsHeaders);
-        }
-
-        // Defect A4: Validate text length and format (non-empty string <= 4000 characters)
-        if (!text || typeof text !== "string" || !text.trim()) {
-          return errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders);
-        }
-        if (text.length > 4000) {
-          return errorResponse("Transcript text exceeds maximum allowed length of 4000 characters.", "TRANSCRIPT_TOO_LONG", 400, corsHeaders);
-        }
-
-        const targetAdapter = adapterRegistry.resolve(session.productId);
-        const transcriptSpeaker = speaker;
-        const finalFlag = isFinal === true;
-
-        let recommendation: any = null;
-
-        if (transcriptSpeaker === "prospect" && finalFlag) {
-          const rawRec = await salesEngine.generateRecommendation(text.trim(), {
-            adapter: targetAdapter,
-            session,
-            history: session.conversationHistory
-          });
-
-          // Explicitly persist new turns atomically to session store / D1
-          if (session.conversationHistory.length >= 2) {
-            const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
-            const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
-            if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
-              try {
-                await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
-              } catch (persistErr: any) {
-                console.error("[Worker Realtime] Atomic persistence error:", persistErr);
-                return errorResponse("Failed to persist session conversation turn.", "PERSISTENCE_ERROR", 500, corsHeaders);
-              }
-            }
-          }
-
-          const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
-          delete (sanitizedMetadata as any).rawUnapprovedStatement;
-
-          recommendation = {
-            statement: rawRec.statement,
-            status: rawRec.status,
-            toolsUsed: rawRec.toolsUsed,
-            validationReport: rawRec.validationReport,
-            engineMetadata: sanitizedMetadata
-          };
-        }
-
-        return jsonResponse(
-          {
-            success: true,
-            sessionId: session.id,
-            productId: session.productId,
-            speaker: transcriptSpeaker,
-            recommendation
-          },
-          200,
-          corsHeaders
-        );
-      }
-
-      // =========================================================================
       // ROUTE: GET /api/livekit/status
       // =========================================================================
       if (pathname === "/api/livekit/status" && request.method === "GET") {
@@ -874,7 +719,7 @@ export default {
         pathname === "/api/save-baseline" ||
         pathname === "/api/load-baseline"
       ) {
-        if (isProductionEnvironment(env)) {
+        if (env.NODE_ENV === "production") {
           return errorResponse(
             "Internal test and evaluation endpoints are disabled in production.",
             "ENDPOINT_DISABLED_IN_PRODUCTION",

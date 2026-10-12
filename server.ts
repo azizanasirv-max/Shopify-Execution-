@@ -206,11 +206,6 @@ app.post("/api/copilot", async (req, res) => {
       session
     });
 
-    const sanitizedEngineMetadata = recommendation.engineMetadata ? { ...recommendation.engineMetadata } : {};
-    if (sanitizedEngineMetadata) {
-      delete (sanitizedEngineMetadata as any).rawUnapprovedStatement;
-    }
-
     res.json({
       answer: recommendation.statement,
       status: recommendation.status,
@@ -220,7 +215,7 @@ app.post("/api/copilot", async (req, res) => {
       productId: targetAdapter.id,
       toolsUsed: recommendation.toolsUsed,
       validationReport: recommendation.validationReport,
-      engineMetadata: sanitizedEngineMetadata
+      engineMetadata: recommendation.engineMetadata
     });
   } catch (error: any) {
     console.error("Generic Sales Engine Error:", error);
@@ -404,13 +399,6 @@ app.post("/api/sessions/:id/clear", async (req, res) => {
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     (req.body?.sessionToken as string);
 
-  if (!token) {
-    return res.status(403).json({
-      error: "Unauthorized access: Valid session authorization token is required to clear a session.",
-      code: "UNAUTHORIZED_SESSION_ACCESS"
-    });
-  }
-
   try {
     const session = await sessionManager.validateSessionAuthorizationAsync(req.params.id, token);
     session.conversationHistory = [];
@@ -422,33 +410,6 @@ app.post("/api/sessions/:id/clear", async (req, res) => {
     if (err instanceof SessionNotFoundError) {
       return res.status(404).json({ error: err.message, code: "SESSION_NOT_FOUND" });
     }
-    if (err instanceof UnauthorizedSessionAccessError) {
-      return res.status(403).json({ error: err.message, code: "UNAUTHORIZED_SESSION_ACCESS" });
-    }
-    return res.status(500).json({ error: err.message, code: "INTERNAL_ERROR" });
-  }
-});
-
-// Delete session (requires session authorization token)
-app.delete("/api/sessions/:id", async (req, res) => {
-  const token =
-    (req.headers["x-session-token"] as string) ||
-    req.headers.authorization?.replace(/^Bearer\s+/i, "");
-
-  if (!token) {
-    return res.status(403).json({
-      error: "Unauthorized access: Valid session authorization token is required to delete a session.",
-      code: "UNAUTHORIZED_SESSION_ACCESS"
-    });
-  }
-
-  try {
-    const deleted = await sessionManager.deleteSessionAsync(req.params.id, token);
-    if (!deleted) {
-      return res.status(404).json({ error: "Session not found or expired.", code: "SESSION_NOT_FOUND" });
-    }
-    res.json({ success: true, message: `Session ${req.params.id} deleted.` });
-  } catch (err: any) {
     if (err instanceof UnauthorizedSessionAccessError) {
       return res.status(403).json({ error: err.message, code: "UNAUTHORIZED_SESSION_ACCESS" });
     }
@@ -1102,94 +1063,6 @@ app.post("/api/run-stage2-validation", async (req, res) => {
   }
 });
 
-// Realtime Transcript Ingress Endpoint for LiveKit Speech-to-Text pipeline
-app.post("/api/livekit/transcript", async (req, res) => {
-  try {
-    const { sessionId, sessionToken, text, isFinal, speaker } = req.body;
-    const tokenHeader =
-      (req.headers["x-session-token"] as string) ||
-      req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
-      sessionToken;
-
-    if (!sessionId || typeof sessionId !== "string") {
-      return res.status(400).json({ error: "sessionId is required for transcript ingress.", code: "SESSION_REQUIRED" });
-    }
-
-    const session = await sessionManager.getSessionAsync(sessionId);
-    if (!session) {
-      return res.status(404).json({ error: "Sales session not found or expired.", code: "SESSION_NOT_FOUND" });
-    }
-
-    if (!tokenHeader || tokenHeader !== session.authToken) {
-      return res.status(403).json({ error: "Unauthorized access: Valid session authorization token is required.", code: "UNAUTHORIZED_SESSION_ACCESS" });
-    }
-
-    if (typeof isFinal !== "boolean" || isFinal !== true) {
-      return res.status(400).json({ error: "isFinal must be an explicit boolean true value for recommendation generation.", code: "INVALID_FINAL_STATUS" });
-    }
-
-    if (speaker !== "prospect" && speaker !== "salesperson") {
-      return res.status(400).json({ error: "Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", code: "INVALID_SPEAKER" });
-    }
-
-    if (!text || typeof text !== "string" || !text.trim()) {
-      return res.status(400).json({ error: "Non-empty transcript text is required.", code: "INVALID_TRANSCRIPT" });
-    }
-    if (text.length > 4000) {
-      return res.status(400).json({ error: "Transcript text exceeds maximum allowed length of 4000 characters.", code: "TRANSCRIPT_TOO_LONG" });
-    }
-
-    const targetAdapter = adapterRegistry.resolve(session.productId);
-    const transcriptSpeaker = speaker;
-    const finalFlag = isFinal === true;
-
-    let recommendation: any = null;
-
-    if (transcriptSpeaker === "prospect" && finalFlag) {
-      const rawRec = await salesEngine.generateRecommendation(text.trim(), {
-        adapter: targetAdapter,
-        session,
-        history: session.conversationHistory
-      });
-
-      if (session.conversationHistory.length >= 2) {
-        const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
-        const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
-        if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
-          try {
-            await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
-          } catch (persistErr: any) {
-            console.error("[Server Realtime] Atomic persistence error:", persistErr);
-            return res.status(500).json({ error: "Failed to persist session conversation turn.", code: "PERSISTENCE_ERROR" });
-          }
-        }
-      }
-
-      const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
-      delete (sanitizedMetadata as any).rawUnapprovedStatement;
-
-      recommendation = {
-        statement: rawRec.statement,
-        status: rawRec.status,
-        toolsUsed: rawRec.toolsUsed,
-        validationReport: rawRec.validationReport,
-        engineMetadata: sanitizedMetadata
-      };
-    }
-
-    res.json({
-      success: true,
-      sessionId: session.id,
-      productId: session.productId,
-      speaker: transcriptSpeaker,
-      recommendation
-    });
-  } catch (err: any) {
-    console.error("Transcript ingress error:", err);
-    res.status(500).json({ error: "Failed to process transcript event.", details: err.message });
-  }
-});
-
 // Stage 3.1 LiveKit Configuration Status Endpoint (Delegated to RealtimeAdapter)
 app.get("/api/livekit/status", (req, res) => {
   res.json(realtimeAdapter.getStatus());
@@ -1335,3 +1208,89 @@ if (typeof process !== "undefined" && !process.env.CF_WORKER) {
   });
 }
 
+import { Readable } from "stream";
+
+let cloudflareKvStoreInstance: CloudflareKVSessionStore | undefined;
+let cloudflareDoStoreInstance: CloudflareDOSessionStore | undefined;
+
+async function handleRequestWithExpress(request: Request, env: any, ctx: any): Promise<Response> {
+  if (env && env.SESSION_DO) {
+    if (!cloudflareDoStoreInstance) {
+      cloudflareDoStoreInstance = new CloudflareDOSessionStore(env.SESSION_DO);
+      sessionManager = new SessionManager({ store: cloudflareDoStoreInstance });
+    }
+  } else if (env && env.LBV_SESSIONS_KV) {
+    if (!cloudflareKvStoreInstance) {
+      cloudflareKvStoreInstance = new CloudflareKVSessionStore(env.LBV_SESSIONS_KV);
+      await cloudflareKvStoreInstance.initAsync();
+      sessionManager = new SessionManager({ store: cloudflareKvStoreInstance });
+    }
+  }
+
+  return new Promise(async (resolve) => {
+    const url = new URL(request.url);
+    const headers: Record<string, string> = {};
+    for (const [key, value] of request.headers.entries()) {
+      headers[key] = value;
+    }
+
+    const bodyBuffer = request.body ? await request.arrayBuffer() : undefined;
+    const reqStream = new Readable();
+    if (bodyBuffer) {
+      reqStream.push(Buffer.from(bodyBuffer));
+    }
+    reqStream.push(null);
+
+    const req = Object.assign(reqStream, {
+      method: request.method,
+      url: url.pathname + url.search,
+      headers,
+      connection: { encrypted: url.protocol === "https:" }
+    });
+
+    let resStatusCode = 200;
+    let resHeaders: Record<string, string> = {};
+    const chunks: Buffer[] = [];
+
+    const res = {
+      setHeader(name: string, value: string | string[]) {
+        resHeaders[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
+      },
+      getHeader(name: string) {
+        return resHeaders[name.toLowerCase()];
+      },
+      removeHeader(name: string) {
+        delete resHeaders[name.toLowerCase()];
+      },
+      writeHead(statusCode: number, headersObj?: any) {
+        resStatusCode = statusCode;
+        if (headersObj) {
+          for (const [k, v] of Object.entries(headersObj)) {
+            resHeaders[k.toLowerCase()] = String(v);
+          }
+        }
+      },
+      write(chunk: any) {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      },
+      end(chunk?: any) {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const body = Buffer.concat(chunks);
+        resolve(new Response(body, {
+          status: resStatusCode,
+          headers: resHeaders
+        }));
+      }
+    };
+
+    app(req as any, res as any);
+  });
+}
+
+export { SessionDurableObject };
+
+export default {
+  async fetch(request: Request, env: any, ctx: any): Promise<Response> {
+    return handleRequestWithExpress(request, env, ctx);
+  }
+};

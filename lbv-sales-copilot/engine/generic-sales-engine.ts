@@ -191,22 +191,10 @@ export class GenericSalesEngine {
     const toolDefinitions = activeAdapter.getTools();
     const functionDeclarations = this.buildGeminiFunctionDeclarations(toolDefinitions);
 
-    // Incorporate prior conversation history context if provided or present in session
-    const effectiveHistory = session?.conversationHistory || isolatedHistory || this.conversationHistory;
-    const currentContents: any[] = [];
-
-    if (effectiveHistory && effectiveHistory.length > 0) {
-      for (const turn of effectiveHistory) {
-        if (turn.text) {
-          currentContents.push({
-            role: turn.role === "user" ? "user" : "model",
-            parts: [{ text: turn.text }]
-          });
-        }
-      }
-    }
-
-    currentContents.push({ role: "user", parts: [{ text: prospectPrompt }] });
+    // Initial conversation contents
+    const currentContents: any[] = [
+      { role: "user", parts: [{ text: prospectPrompt }] }
+    ];
 
     let turnsCount = 1;
 
