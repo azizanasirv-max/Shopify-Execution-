@@ -104,39 +104,40 @@ Behavior (verified with `wrangler deploy --dry-run`):
 
 ## 5. D1 setup and migration sequence
 
-`wrangler.toml` ships an **intentional placeholder** `database_id`. The build will not stop you,
-so the guard script does:
+**Current configuration:** the production database `lbv-sales-sessions` exists and its real id
+(`b1e94824-0128-4b48-9b88-89827a126acb`) is set in `wrangler.toml` on the `DB` binding. The guard
+script still blocks deployment if a placeholder id is ever reintroduced:
 
 ```bash
-npm run check:deploy   # FAILS (exit 1) while the placeholder is present
+npm run check:deploy   # exit 1 on a placeholder id; passes with the real id
 ```
 
-Safe sequence (run by the project owner, with Cloudflare credentials — never automated in CI):
+**Remaining step (owner):** the schema has **not** been applied to the remote database from this
+repository. Apply it once, with Cloudflare credentials (never in CI):
 
 ```bash
-# 1. Authenticate
 npx wrangler login
-
-# 2. Create the database (records its real database_id). DO NOT do this in CI.
-npx wrangler d1 create lbv-sales-sessions
-
-# 3. Put the REAL database_id into wrangler.toml (replace the 00000000-... placeholder).
-#    Keep it explicit per environment; do not reuse another environment's id.
-
-# 4. Apply the schema migrations to the remote database.
 npx wrangler d1 migrations apply lbv-sales-sessions --remote
-
-# 5. Confirm the guard now passes
-npm run check:deploy
 ```
 
-Schema (preserved as-is): `migrations/0001_sessions_schema.sql` creates `sessions` and
-`conversation_turns` (with `ON DELETE CASCADE` and lookup indexes). Session/turn semantics are
-unchanged. Migrations are **forward-only**; take a D1 backup (`wrangler d1 export`) before future
-schema changes.
+For additional environments, create a separate database and set its own explicit `database_id`;
+never reuse another environment's id.
 
-> Do not invent or hardcode a database id. For multiple environments, use Wrangler environments
-> (`[env.staging]`, `[env.production]`) each with its own explicit `database_id`.
+### Migration `0001_sessions_schema.sql` — expected effects
+
+Creates two tables and four indexes:
+- `sessions(id TEXT PK, auth_token TEXT NOT NULL, product_id TEXT NOT NULL, room_name TEXT NOT NULL,
+  created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+  metadata_json TEXT NOT NULL DEFAULT '{}')` — `version` drives optimistic concurrency.
+- `conversation_turns(id INTEGER PK AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id)
+  ON DELETE CASCADE, turn_index INTEGER NOT NULL, role TEXT NOT NULL CHECK(role IN ('user','model')),
+  text TEXT, tool_calls_json TEXT, timestamp INTEGER NOT NULL)`.
+- Indexes: `idx_sessions_product`, `idx_sessions_auth_token`, `idx_sessions_last_activity`,
+  `idx_turns_session_index(session_id, turn_index)`.
+
+These columns exactly match the SQL used by `CloudflareD1SessionStore`
+(`lbv-sales-copilot/engine/session-manager.ts`). Migrations are **forward-only**; take a backup
+(`npx wrangler d1 export lbv-sales-sessions --remote --output backup.sql`) before future changes.
 
 ---
 
@@ -326,24 +327,10 @@ re-run `npm run build` then `npm run deploy` (do not assume success from the Wor
 
 ## 13. CI
 
-The CI workflow is committed at **`ci/github-actions-ci.yml`**. It runs on every push/PR to `main`:
-TypeScript check, the full deterministic test suite (a **dummy** Gemini value is set only to satisfy
-any legacy assumption; no real key is needed), the production build, and a Wrangler dry-run. CI never
-deploys and never uses real secrets.
-
-**One-time install (required):** the automation used to prepare this change cannot create files under
-`.github/workflows/` (the GitHub App token lacks the `workflows` permission). A repository owner must
-move the file into place once:
-
-```bash
-mkdir -p .github/workflows
-git mv ci/github-actions-ci.yml .github/workflows/ci.yml
-git commit -m "ci: enable GitHub Actions workflow"
-git push
-```
-
-Or use the GitHub UI: create `.github/workflows/ci.yml` and paste the contents of
-`ci/github-actions-ci.yml`. After that, CI runs automatically on pushes and PRs to `main`.
+**Installed:** `.github/workflows/ci.yml` runs on every push/PR to `main` — TypeScript check, the
+full deterministic test suite (a **dummy** `GEMINI_API_KEY` is set only to satisfy any legacy
+assumption; no real key is needed), the production build, and a Wrangler dry-run. CI never deploys
+and never uses real secrets. Latest run on `main`: **success**.
 
 A deploy workflow is intentionally not included; deployment is performed manually by the owner after
 `npm run check:deploy` passes.
@@ -352,8 +339,9 @@ A deploy workflow is intentionally not included; deployment is performed manuall
 
 ## 14. Remaining manual steps (require Cloudflare/credential access)
 
-1. Create the D1 database and set the real `database_id` (section 5).
-2. Apply remote migrations (section 5).
+1. ~~Create the D1 database and set the real `database_id`~~ — **done**: `lbv-sales-sessions`
+   exists and `wrangler.toml` carries its real id (section 5).
+2. **Apply remote migrations** — `npx wrangler d1 migrations apply lbv-sales-sessions --remote` (section 5).
 3. Create the Worker secrets: `GROQ_API_KEY`, `ADMIN_API_KEY`, and LiveKit secrets (sections 3, 6, 9).
 4. Set vars: `ALLOWED_ORIGINS`, `LIVEKIT_URL`, and any `LLM_*`/token-budget overrides.
 5. Run the deployment sequence (section 10) and the health checks (section 11).
@@ -369,16 +357,16 @@ attempted here.
 ### A. Before deployment (repo + credentials)
 
 **Repository / CI**
-- [ ] `main` is at the intended commit.
-- [ ] CI workflow installed at `.github/workflows/ci.yml` (move it from `ci/github-actions-ci.yml`; see §13) and green on `main`.
+- [x] `main` is at the intended commit.
+- [x] CI workflow installed at `.github/workflows/ci.yml` and green on `main` (§13).
 - [ ] Locally: `npm run lint`, `npm test`, `npm run build`, and `npm run deploy:dry-run` all pass.
 
 **Cloudflare account**
 - [ ] `npx wrangler login` (or `CLOUDFLARE_API_TOKEN` with *Workers Scripts:Edit* + *D1:Edit*).
 
 **D1**
-- [ ] `npx wrangler d1 create lbv-sales-sessions`; set the real `database_id` in `wrangler.toml`.
-- [ ] `npx wrangler d1 migrations apply lbv-sales-sessions --remote`.
+- [x] Database `lbv-sales-sessions` created; real `database_id` set in `wrangler.toml`.
+- [ ] `npx wrangler d1 migrations apply lbv-sales-sessions --remote` (schema not yet applied remotely).
 - [ ] `npm run check:deploy` passes (no placeholder).
 
 **Groq + admin credentials**
