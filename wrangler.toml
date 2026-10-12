@@ -1,17 +1,37 @@
 name = "lbv-sales-copilot"
 main = "worker.ts"
-compatibility_date = "2024-03-20"
+# Raised from 2024-03-20 to a date that supports modern Workers Static Assets
+# and the current nodejs_compat behavior. See DEPLOYMENT.md.
+compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-[site]
-bucket = "dist"
+# ---------------------------------------------------------------------------
+# Static frontend assets
+#
+# Vite builds the SPA into ./dist. The Worker is invoked only for requests that
+# do NOT match an asset (so /api/* always reaches worker.ts), and non-asset
+# navigation is handled by not_found_handling = "single-page-application".
+# The built assets are exposed to the Worker through the ASSETS binding, which
+# worker.ts delegates to via env.ASSETS.fetch().
+# ---------------------------------------------------------------------------
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
 
 [vars]
 NODE_ENV = "production"
 
+# ---------------------------------------------------------------------------
+# D1 session persistence
+#
+# database_id below is an intentional PLACEHOLDER. It is NOT production-ready.
+# `npm run check:deploy` fails while this placeholder is present, so the Worker
+# cannot be deployed against a non-existent database by accident.
+# See DEPLOYMENT.md section "D1 setup" for the safe sequence.
+# ---------------------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"
 database_name = "lbv-sales-sessions"
-database_id = "00000000-0000-0000-0000-000000000000" # REPLACE with your real D1 database ID before deploying
+database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
-

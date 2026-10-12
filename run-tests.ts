@@ -20,14 +20,26 @@ import { runServiceProfileTests } from "./lbv-sales-copilot/validation/service-p
 
 dotenv.config();
 
-const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-  console.error("Error: GEMINI_API_KEY environment variable is not set. Please add it to your .env file.");
-  process.exit(1);
+const apiKey = process.env.GEMINI_API_KEY || "";
+
+/**
+ * Only the live-model suites (adversarial, stage2, classification) require a
+ * real Gemini API key. The deterministic suites (hardening, isolation,
+ * approval-gate, worker, d1, persistence, realtime, llm, service) run fully
+ * offline and MUST NOT require a real key. A placeholder value (e.g. "dummy")
+ * is accepted for those offline suites.
+ */
+function requireGeminiApiKeyForLiveSuites(): void {
+  if (!apiKey || apiKey === "dummy" || apiKey === "MY_GEMINI_API_KEY") {
+    console.error(
+      "Error: a real GEMINI_API_KEY is required for the live-model suites (adversarial, stage2, classification)."
+    );
+    process.exit(1);
+  }
 }
 
 const ai = new GoogleGenAI({
-  apiKey,
+  apiKey: apiKey || "offline-suite-placeholder",
   httpOptions: {
     headers: {
       "User-Agent": "aistudio-build-cli-v2.1",
@@ -90,10 +102,13 @@ async function executeGroundedCallWithRetry(promptText: string, testProspectData
 const command = process.argv[2] || "adversarial";
 
 if (command === "adversarial") {
+  requireGeminiApiKeyForLiveSuites();
   runAdversarialSuite();
 } else if (command === "stage2") {
+  requireGeminiApiKeyForLiveSuites();
   runStage2Suite();
 } else if (command === "classification") {
+  requireGeminiApiKeyForLiveSuites();
   runClassificationUnitTests();
 } else if (command === "approval-gate") {
   runApprovalGateUnitTests().then(summary => {
