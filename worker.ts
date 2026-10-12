@@ -874,7 +874,7 @@ export default {
         pathname === "/api/save-baseline" ||
         pathname === "/api/load-baseline"
       ) {
-        if (env.NODE_ENV === "production") {
+        if (isProductionEnvironment(env)) {
           return errorResponse(
             "Internal test and evaluation endpoints are disabled in production.",
             "ENDPOINT_DISABLED_IN_PRODUCTION",

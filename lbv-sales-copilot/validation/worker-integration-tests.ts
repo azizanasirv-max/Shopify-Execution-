@@ -423,6 +423,46 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(!/[?&]key=/.test(capturedUrl), "Gemini request URL has no `key` query parameter");
   assert(capturedHeaders["x-goog-api-key"] === dummyGeminiKey, "Gemini API key is sent via the x-goog-api-key header");
 
+  // -------------------------------------------------------------
+  // TEST 11: Internal test/evaluation endpoints use isProductionEnvironment()
+  // -------------------------------------------------------------
+  console.log("\n[11] Testing internal test/evaluation endpoint production guard...");
+  const adminToken = "admin_secret_token_12345";
+  const makeAdminReq = (token?: string) =>
+    new Request("https://worker.local/api/run-adversarial-tests", {
+      method: "POST",
+      headers: token ? { "X-Admin-Token": token } : {}
+    });
+
+  // 11a: NODE_ENV absent -> disabled even with a valid admin token
+  const noEnvAdminEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken };
+  const noEnvAdminRes = await worker.fetch(makeAdminReq(adminToken), noEnvAdminEnv);
+  assert(noEnvAdminRes.status === 404, "Internal endpoints disabled when NODE_ENV is absent (valid admin token)");
+  const noEnvAdminData = await noEnvAdminRes.json() as any;
+  assert(noEnvAdminData.code === "ENDPOINT_DISABLED_IN_PRODUCTION", "Absent NODE_ENV returns ENDPOINT_DISABLED_IN_PRODUCTION");
+
+  // 11b: NODE_ENV absent -> production guard takes precedence over auth
+  const noEnvNoTokRes = await worker.fetch(makeAdminReq(), noEnvAdminEnv);
+  assert(noEnvNoTokRes.status === 404, "Internal endpoints disabled when NODE_ENV is absent (no token)");
+
+  // 11c: explicit development -> enabled, admin auth still enforced
+  const devEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken, NODE_ENV: "development" };
+  const devNoTokRes = await worker.fetch(makeAdminReq(), devEnv);
+  const devNoTokData = await devNoTokRes.json() as any;
+  assert(devNoTokRes.status === 403 && devNoTokData.code === "ADMIN_AUTHORIZATION_REQUIRED", "Development: unauthenticated admin request rejected with 403");
+  const devAuthRes = await worker.fetch(makeAdminReq(adminToken), devEnv);
+  const devAuthData = await devAuthRes.json() as any;
+  assert(devAuthData.code !== "ENDPOINT_DISABLED_IN_PRODUCTION", "Development: internal endpoints are not production-disabled");
+
+  // 11d: explicit test -> enabled, admin auth still enforced
+  const testAdminEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const testNoTokRes = await worker.fetch(makeAdminReq(), testAdminEnv);
+  const testNoTokData = await testNoTokRes.json() as any;
+  assert(testNoTokRes.status === 403 && testNoTokData.code === "ADMIN_AUTHORIZATION_REQUIRED", "Test: unauthenticated admin request rejected with 403");
+  const testAuthRes = await worker.fetch(makeAdminReq(adminToken), testAdminEnv);
+  const testAuthData = await testAuthRes.json() as any;
+  assert(testAuthData.code !== "ENDPOINT_DISABLED_IN_PRODUCTION", "Test: internal endpoints are not production-disabled");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");
