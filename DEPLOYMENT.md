@@ -189,18 +189,64 @@ npx wrangler secret put ADMIN_API_KEY
 
 ---
 
-## 9. LiveKit configuration
+## 9. LiveKit and speech-to-text (STT)
 
-Realtime token issuance and the transcript ingress require LiveKit credentials. Set `LIVEKIT_URL`
-as a var and the key/secret as secrets:
+### 9a. LiveKit
+
+Realtime token issuance and the transcript ingress require LiveKit credentials. `LIVEKIT_URL` is a
+var; the key/secret are secrets:
 
 ```bash
 npx wrangler secret put LIVEKIT_API_KEY
 npx wrangler secret put LIVEKIT_API_SECRET
 ```
 
-The LiveKit server URL is non-sensitive and can live in `[vars]` or the dashboard. LiveKit +
-AssemblyAI end-to-end integration is a separate, mandatory post-deployment phase.
+### 9b. STT / AssemblyAI — how transcription actually reaches the engine
+
+There is **no direct AssemblyAI (or other STT) SDK integration in this repository**, and the Worker
+does **not** read an `ASSEMBLYAI_API_KEY`. Speech-to-text runs inside the **LiveKit room**; the
+browser client consumes LiveKit transcription events (`RoomEvent.TranscriptionReceived`) and forwards
+final prospect segments to the Worker (`lbv-sales-copilot/app/LiveKitSalesRoom.tsx`). If AssemblyAI is
+the chosen STT engine, its credentials are configured **inside LiveKit / the LiveKit agent**, not in
+this Worker or its secrets.
+
+### 9c. Transcript ingress contract (enforced by the Worker)
+
+`POST /api/livekit/transcript` (buffered) and `POST /api/livekit/transcript/stream` (SSE):
+
+```json
+{ "sessionId": "...", "sessionToken": "...", "text": "...", "isFinal": true, "speaker": "prospect" }
+```
+
+Auth: the `x-session-token` header (or `sessionToken` in the body) must equal the session token.
+
+| Condition | Error |
+|---|---|
+| Missing `sessionId` | `400 SESSION_REQUIRED` |
+| Unknown session | `404 SESSION_NOT_FOUND` |
+| Bad/missing token | `403 UNAUTHORIZED_SESSION_ACCESS` |
+| `isFinal` not exactly `true` | `400 INVALID_FINAL_STATUS` |
+| `speaker` not `prospect`/`salesperson` | `400 INVALID_SPEAKER` |
+| Empty text | `400 INVALID_TRANSCRIPT` |
+| Text > 4000 chars | `400 TRANSCRIPT_TOO_LONG` |
+
+Only `speaker: "prospect"` with `isFinal: true` produces a recommendation; `salesperson` is accepted
+but yields no recommendation.
+
+### 9d. Partial/final, speaker, duplicates, ordering, reconnection
+
+- **Partial events:** filtered client-side; the Worker rejects `isFinal !== true`.
+- **Speaker:** derived client-side from the participant identity prefix (`prospect*`/`salesperson*`)
+  and validated server-side.
+- **Duplicates:** the client de-duplicates by provider segment id, the engine de-duplicates inside
+  `handleRealtimeTranscript`, and the Worker routes add a **best-effort per-isolate** guard (10s
+  window keyed by session + normalized text). Duplicates return `{ "duplicate": true,
+  "recommendation": null }` (HTTP 200) and never trigger a second model call. This is
+  defense-in-depth, not a durable exactly-once guarantee.
+- **Ordering / stale responses:** the client keeps a monotonic request counter and an
+  `AbortController`; superseded requests are cancelled and stale responses ignored.
+- **Reconnection:** LiveKit reconnect is handled by the client SDK; session history is persisted in
+  D1 and appended with optimistic concurrency (`addTurnsAtomicAsync`).
 
 ---
 
@@ -315,3 +361,65 @@ A deploy workflow is intentionally not included; deployment is performed manuall
 
 These cannot be automated from the repository without live credentials and are deliberately not
 attempted here.
+
+---
+
+## 15. Pre-deployment checklist
+
+### A. Before deployment (repo + credentials)
+
+**Repository / CI**
+- [ ] `main` is at the intended commit.
+- [ ] CI workflow installed at `.github/workflows/ci.yml` (move it from `ci/github-actions-ci.yml`; see §13) and green on `main`.
+- [ ] Locally: `npm run lint`, `npm test`, `npm run build`, and `npm run deploy:dry-run` all pass.
+
+**Cloudflare account**
+- [ ] `npx wrangler login` (or `CLOUDFLARE_API_TOKEN` with *Workers Scripts:Edit* + *D1:Edit*).
+
+**D1**
+- [ ] `npx wrangler d1 create lbv-sales-sessions`; set the real `database_id` in `wrangler.toml`.
+- [ ] `npx wrangler d1 migrations apply lbv-sales-sessions --remote`.
+- [ ] `npm run check:deploy` passes (no placeholder).
+
+**Groq + admin credentials**
+- [ ] `npx wrangler secret put GROQ_API_KEY`.
+- [ ] `npx wrangler secret put ADMIN_API_KEY`.
+- [ ] Vars: `LLM_PROVIDER=groq` (+ optional `LLM_MODEL`, `LLM_TIMEOUT_MS`, `LBV_MAX_TOTAL_TOKENS`, `LBV_MAX_REQUEST_TOKENS`).
+
+**LiveKit + STT**
+- [ ] `npx wrangler secret put LIVEKIT_API_KEY` and `... LIVEKIT_API_SECRET`.
+- [ ] Var: `LIVEKIT_URL=wss://<project>.livekit.cloud`.
+- [ ] Configure the transcription engine (e.g. AssemblyAI) **inside LiveKit / the LiveKit agent** — there is **no** STT key in this Worker (§9b).
+
+**CORS + secrets hygiene**
+- [ ] Var: `ALLOWED_ORIGINS` set to the deployed origin(s).
+- [ ] No secrets committed to the repository.
+
+### B. Deploy (commands in §10)
+
+### C. After deployment (see §11 and §16)
+
+- [ ] Health checks (§11) pass, including that the SPA shell is actually served.
+- [ ] Live-audio end-to-end tests (§16) pass.
+
+---
+
+## 16. Live-audio end-to-end tests (require the deployed app)
+
+These **cannot** be verified from the repository and require the deployed Worker, real credentials, and
+a real microphone. They have **not** been run yet.
+
+1. Open the deployed URL; confirm the SPA loads.
+2. `GET /api/livekit/status` reports LiveKit configured.
+3. Create a session (`POST /api/sessions`) and obtain a participant token (`POST /api/livekit/token`) — or use the UI.
+4. Join the room as `prospect` and `salesperson` (two browsers/devices).
+5. Speak as the prospect; confirm LiveKit transcription events arrive and a final segment produces a
+   recommendation in the SAY THIS NEXT panel.
+6. Confirm partial speech does not trigger a recommendation and that salesperson speech is ignored.
+7. Confirm streaming renders incrementally and a newer utterance supersedes an older one.
+8. Disconnect/reconnect; confirm session history persists (D1) and recommendations continue.
+9. Confirm CORS from the real origin works and unapproved origins are rejected.
+10. Confirm the internal admin endpoints return `404` in production.
+
+> Do not mark live-audio integration as verified until steps 1–10 have been executed against the
+deployed service with real credentials.

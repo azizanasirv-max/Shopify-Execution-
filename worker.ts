@@ -375,6 +375,32 @@ async function validateTranscriptIngress(
   return { ok: true, session, targetAdapter, text: text.trim(), speaker };
 }
 
+/**
+ * Best-effort, per-isolate idempotency guard for transcript ingress.
+ *
+ * The browser client already de-duplicates by provider segment id, and the
+ * engine de-duplicates inside handleRealtimeTranscript(), but the HTTP
+ * transcript routes call the engine directly and therefore need their own
+ * guard so a retried or duplicated final utterance cannot trigger a second
+ * model call.
+ *
+ * NOTE: Cloudflare Worker isolates are ephemeral and horizontally scaled, so
+ * this is defense-in-depth, not a durable exactly-once guarantee.
+ */
+const TRANSCRIPT_DEDUPE_WINDOW_MS = 10000;
+const recentTranscriptKeys = new Map<string, number>();
+
+function isDuplicateTranscript(sessionId: string, text: string): boolean {
+  const now = Date.now();
+  for (const [key, ts] of recentTranscriptKeys) {
+    if (now - ts > TRANSCRIPT_DEDUPE_WINDOW_MS) recentTranscriptKeys.delete(key);
+  }
+  const key = `${sessionId}::${text.trim().toLowerCase()}`;
+  if (recentTranscriptKeys.has(key)) return true;
+  recentTranscriptKeys.set(key, now);
+  return false;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: any): Promise<Response> {
     const corsHeaders = handleCorsHeaders(request, env);
@@ -876,6 +902,21 @@ export default {
         let recommendation: any = null;
 
         if (transcriptSpeaker === "prospect" && finalFlag) {
+          if (isDuplicateTranscript(session.id, transcriptText)) {
+            return jsonResponse(
+              {
+                success: true,
+                sessionId: session.id,
+                productId: session.productId,
+                speaker: transcriptSpeaker,
+                duplicate: true,
+                recommendation: null
+              },
+              200,
+              corsHeaders
+            );
+          }
+
           const rawRec = await salesEngine.generateRecommendation(transcriptText, {
             adapter: targetAdapter,
             session,
@@ -958,6 +999,18 @@ data: ${JSON.stringify(data)}
                   sessionId: session.id,
                   productId: session.productId,
                   speaker: transcriptSpeaker,
+                  recommendation: null
+                });
+                return;
+              }
+
+              if (isDuplicateTranscript(session.id, transcriptText)) {
+                send("final", {
+                  success: true,
+                  sessionId: session.id,
+                  productId: session.productId,
+                  speaker: transcriptSpeaker,
+                  duplicate: true,
                   recommendation: null
                 });
                 return;
