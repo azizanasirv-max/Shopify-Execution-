@@ -44,6 +44,26 @@ export interface LiveKitSalesRoomProps {
   productId?: string;
 }
 
+/**
+ * Minimal Server-Sent Events parser for the streaming recommendation endpoint.
+ * Returns null for keep-alive/comment frames.
+ */
+function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
+  const lines = rawEvent.split("\n");
+  let event = "message";
+  const dataLines: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  try {
+    return { event, data: JSON.parse(dataLines.join("\n")) };
+  } catch {
+    return null;
+  }
+}
+
 export default function LiveKitSalesRoom({
   sessionId: propSessionId,
   sessionToken: propSessionToken,
@@ -123,6 +143,7 @@ export default function LiveKitSalesRoom({
   const [isProcessingTranscript, setIsProcessingTranscript] = useState<boolean>(false);
   const processedSegmentIdsRef = useRef<Set<string>>(new Set());
   const monotonicReqSeqRef = useRef<number>(0);
+  const activeAbortRef = useRef<AbortController | null>(null);
 
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -370,47 +391,135 @@ export default function LiveKitSalesRoom({
               monotonicReqSeqRef.current += 1;
               const currentReqSeq = monotonicReqSeqRef.current;
 
+              // Cancel any in-flight recommendation request: a newer transcript supersedes it.
+              if (activeAbortRef.current) {
+                activeAbortRef.current.abort();
+              }
+              const abortController = new AbortController();
+              activeAbortRef.current = abortController;
+
               setIsProcessingTranscript(true);
               setErrorMessage(null);
 
-              try {
-                const transcriptRes = await fetch("/api/livekit/transcript", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
-                  },
-                  body: JSON.stringify({
-                    sessionId: currentSessionId,
-                    sessionToken: currentSessionToken,
-                    text: text.trim(),
-                    isFinal: true,
-                    speaker: "prospect"
-                  })
-                });
+              const requestHeaders = {
+                "Content-Type": "application/json",
+                ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
+              };
+              const requestBody = JSON.stringify({
+                sessionId: currentSessionId,
+                sessionToken: currentSessionToken,
+                text: text.trim(),
+                isFinal: true,
+                speaker: "prospect"
+              });
 
-                if (!transcriptRes.ok) {
-                  const errData = await transcriptRes.json().catch(() => ({}));
-                  // Defect 3: Unmark failed request so retries can occur safely
-                  processedSegmentIdsRef.current.delete(segmentId);
-                  setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
-                } else {
-                  const data = await transcriptRes.json();
-                  // Defect 3: Monotonic check for out-of-order response rejection
-                  if (currentReqSeq === monotonicReqSeqRef.current && data.recommendation) {
-                    setCurrentRecommendation({
-                      statement: data.recommendation.statement,
-                      status: data.recommendation.status,
-                      timestamp: Date.now(),
-                      toolsUsed: data.recommendation.toolsUsed
-                    });
+              try {
+                let streamingSucceeded = false;
+
+                // Preferred path: stream VALIDATED recommendation text (SSE).
+                try {
+                  const streamRes = await fetch("/api/livekit/transcript/stream", {
+                    method: "POST",
+                    headers: requestHeaders,
+                    body: requestBody,
+                    signal: abortController.signal
+                  });
+
+                  if (streamRes.ok && streamRes.body) {
+                    const reader = streamRes.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = "";
+                    let accumulated = "";
+                    let streamDone = false;
+
+                    while (!streamDone) {
+                      const chunk = await reader.read();
+                      streamDone = chunk.done;
+                      if (chunk.value) {
+                        buffer += decoder.decode(chunk.value, { stream: true });
+                      }
+                      const frames = buffer.split("\n\n");
+                      buffer = frames.pop() || "";
+
+                      for (const frame of frames) {
+                        const parsed = parseSseEvent(frame);
+                        if (!parsed) continue;
+                        if (parsed.event === "delta") {
+                          if (currentReqSeq === monotonicReqSeqRef.current && parsed.data?.text) {
+                            accumulated += parsed.data.text;
+                            setCurrentRecommendation({
+                              statement: accumulated,
+                              status: "APPROVED",
+                              timestamp: Date.now()
+                            });
+                            setIsProcessingTranscript(false);
+                            streamingSucceeded = true;
+                          }
+                        } else if (parsed.event === "final") {
+                          const rec = parsed.data?.recommendation;
+                          if (currentReqSeq === monotonicReqSeqRef.current && rec) {
+                            setCurrentRecommendation({
+                              statement: rec.statement,
+                              status: rec.status,
+                              timestamp: Date.now(),
+                              toolsUsed: rec.toolsUsed
+                            });
+                            streamingSucceeded = true;
+                          }
+                        } else if (parsed.event === "error") {
+                          throw new Error(parsed.data?.error || "Streaming recommendation failed.");
+                        }
+                      }
+                    }
+                  }
+
+                  if (!streamingSucceeded) {
+                    throw new Error("Streaming response produced no recommendation.");
+                  }
+                } catch (streamErr: any) {
+                  if (streamErr?.name === "AbortError") {
+                    // Superseded by a newer transcript; do not surface an error.
+                    throw streamErr;
+                  }
+                  console.warn("Streaming recommendation unavailable, falling back:", streamErr?.message || streamErr);
+                }
+
+                // Non-streaming fallback (retained for unsupported/failed streaming).
+                if (!streamingSucceeded) {
+                  const transcriptRes = await fetch("/api/livekit/transcript", {
+                    method: "POST",
+                    headers: requestHeaders,
+                    body: requestBody,
+                    signal: abortController.signal
+                  });
+
+                  if (!transcriptRes.ok) {
+                    const errData = await transcriptRes.json().catch(() => ({}));
+                    // Defect 3: Unmark failed request so retries can occur safely
+                    processedSegmentIdsRef.current.delete(segmentId);
+                    setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
+                  } else {
+                    const data = await transcriptRes.json();
+                    // Defect 3: Monotonic check for out-of-order response rejection
+                    if (currentReqSeq === monotonicReqSeqRef.current && data.recommendation) {
+                      setCurrentRecommendation({
+                        statement: data.recommendation.statement,
+                        status: data.recommendation.status,
+                        timestamp: Date.now(),
+                        toolsUsed: data.recommendation.toolsUsed
+                      });
+                    }
                   }
                 }
               } catch (txErr: any) {
-                console.error("Failed to process LiveKit transcript:", txErr);
-                // Defect 3: Unmark failed network request so retries can occur
-                processedSegmentIdsRef.current.delete(segmentId);
-                setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
+                if (txErr?.name === "AbortError") {
+                  // Cancelled by a newer transcript; intentionally silent.
+                } else {
+                  console.error("Failed to process LiveKit transcript:", txErr);
+                  // Defect 3: Unmark failed network request so retries can occur
+                  processedSegmentIdsRef.current.delete(segmentId);
+                  setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
+                }
               } finally {
                 if (currentReqSeq === monotonicReqSeqRef.current) {
                   setIsProcessingTranscript(false);
