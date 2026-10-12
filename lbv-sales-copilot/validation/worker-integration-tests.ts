@@ -13,7 +13,7 @@
  * 9. Sanitized error responses without leakage of internal details.
  */
 
-import worker, { Env } from "../../worker.js";
+import worker, { Env, GeminiWorkerModelProvider } from "../../worker.js";
 import { MockD1Database } from "./d1-persistence-tests.js";
 
 export async function runWorkerIntegrationTests(): Promise<{ passed: number; failed: number }> {
@@ -57,6 +57,87 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(optionsRes.status === 204, "OPTIONS preflight returns 204 No Content");
   assert(Boolean(optionsRes.headers.get("Access-Control-Allow-Methods")?.includes("POST")), "CORS allows POST method");
   assert(Boolean(optionsRes.headers.get("Access-Control-Allow-Headers")?.includes("X-Session-Token")), "CORS allows X-Session-Token header");
+
+  // TEST 1b: CORS fail-closed in Worker environment with NODE_ENV absent
+  console.log("\n[1b] Testing CORS fail-closed when NODE_ENV is absent...");
+  const noEnvProdEnv: Env = {
+    DB: mockDb,
+    ALLOWED_ORIGINS: "https://approved-store.com,https://dashboard.company.com"
+  };
+
+  const unapprovedCorsReq = new Request("https://worker.local/api/copilot", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://malicious-site.com",
+      "Access-Control-Request-Method": "POST"
+    }
+  });
+  const unapprovedCorsRes = await worker.fetch(unapprovedCorsReq, noEnvProdEnv);
+  assert(unapprovedCorsRes.headers.get("Access-Control-Allow-Origin") === "null", "Unapproved origin returns Access-Control-Allow-Origin: null when NODE_ENV is absent");
+
+  const approvedCorsReq = new Request("https://worker.local/api/copilot", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://approved-store.com",
+      "Access-Control-Request-Method": "POST"
+    }
+  });
+  const approvedCorsRes = await worker.fetch(approvedCorsReq, noEnvProdEnv);
+  assert(approvedCorsRes.headers.get("Access-Control-Allow-Origin") === "https://approved-store.com", "Explicitly approved origin returns origin header when NODE_ENV is absent");
+
+  // TEST 1c: CORS fail-closed when NODE_ENV is absent AND ALLOWED_ORIGINS is
+  // unset. This is the real fail-open regression: with a `process` polyfill
+  // present (nodejs_compat), the old logic defaulted to wildcard CORS and
+  // reflected any origin.
+  console.log("\n[1c] Testing CORS fail-closed with no NODE_ENV and no ALLOWED_ORIGINS...");
+  const bareProdEnv: Env = { DB: mockDb };
+  const bareUnapprovedReq = new Request("https://worker.local/api/copilot", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://evil.example",
+      "Access-Control-Request-Method": "POST"
+    }
+  });
+  const bareUnapprovedRes = await worker.fetch(bareUnapprovedReq, bareProdEnv);
+  assert(
+    bareUnapprovedRes.headers.get("Access-Control-Allow-Origin") === "null",
+    "Unapproved origin is never reflected when NODE_ENV and ALLOWED_ORIGINS are absent"
+  );
+
+  // TEST 1d: CORS fail-closed when the Node `process` object is unavailable.
+  // Simulates a pure Worker runtime without the nodejs_compat process polyfill.
+  console.log("\n[1d] Testing CORS fail-closed when `process` is unavailable...");
+  const savedProcess = (globalThis as any).process;
+  let processAbsentResult: { unapproved: string | null; approved: string | null };
+  try {
+    (globalThis as any).process = undefined;
+    const noProcEnv: Env = {
+      DB: mockDb,
+      ALLOWED_ORIGINS: "https://approved-store.com"
+    };
+    const noProcUnapprovedRes = await worker.fetch(
+      new Request("https://worker.local/api/copilot", {
+        method: "OPTIONS",
+        headers: { Origin: "https://malicious-site.com", "Access-Control-Request-Method": "POST" }
+      }),
+      noProcEnv
+    );
+    const noProcApprovedRes = await worker.fetch(
+      new Request("https://worker.local/api/copilot", {
+        method: "OPTIONS",
+        headers: { Origin: "https://approved-store.com", "Access-Control-Request-Method": "POST" }
+      }),
+      noProcEnv
+    );
+    processAbsentResult = {
+      unapproved: noProcUnapprovedRes.headers.get("Access-Control-Allow-Origin"),
+      approved: noProcApprovedRes.headers.get("Access-Control-Allow-Origin")
+    };
+  } finally {
+    (globalThis as any).process = savedProcess;
+  }
+  assert(processAbsentResult.unapproved === "null", "Unapproved origin is not reflected when `process` is unavailable");
+  assert(processAbsentResult.approved === "https://approved-store.com", "Approved origin still works when `process` is unavailable");
 
   // -------------------------------------------------------------
   // TEST 2: Request Body Size Limit (Reject > 64KB)
@@ -107,7 +188,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(unauthData.code === "GLOBAL_LISTING_FORBIDDEN", "Rejects global session enumeration across users");
 
   // Authenticated listing returns strictly user's session
-  const authListReq = new Request("https://worker.local/api/sessions", {
+  const authListReq = new Request(`https://worker.local/api/sessions?sessionId=${sessionData.sessionId}`, {
     method: "GET",
     headers: {
       "X-Session-Token": sessionData.sessionToken
@@ -117,7 +198,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(authListRes.status === 200, "GET /api/sessions with token returns 200");
   const authListData = await authListRes.json() as any;
   assert(authListData.sessions?.length === 1, "Returns strictly single matching session");
-  assert(authListData.sessions[0].id === sessionData.sessionId, "Session ID matches authorized user");
+  assert(authListData.sessions && authListData.sessions[0]?.id === sessionData.sessionId, "Session ID matches authorized user");
 
   // -------------------------------------------------------------
   // TEST 5: Session Inspection, History Clear, and Deletion
@@ -238,7 +319,7 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   // -------------------------------------------------------------
   // TEST 8: Production Startup Failure Enforcement (No Memory Fallback)
   // -------------------------------------------------------------
-  console.log("\n[8/8] Testing production startup failure enforcement...");
+  console.log("\n[8/9] Testing production startup failure enforcement...");
   const prodEnvWithoutDb: Env = {
     NODE_ENV: "production"
   };
@@ -253,6 +334,134 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   const prodErrData = await prodRes.json() as any;
   assert(prodErrData.code === "STARTUP_ERROR", "Error code is STARTUP_ERROR");
   assert(prodErrData.error.includes("Refusing insecure fallback to memory"), "Refuses fallback to local memory in production");
+
+  // -------------------------------------------------------------
+  // TEST 9: Transcript Ingress Validation Checks (Defects A1-A4)
+  // -------------------------------------------------------------
+  console.log("\n[9/9] Testing transcript ingress validation checks...");
+  // Non-boolean or non-true isFinal rejected
+  const nonBoolFinalReq = new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Token": sessionData.sessionToken
+    },
+    body: JSON.stringify({
+      sessionId: sessionData.sessionId,
+      text: "Hello",
+      isFinal: "true",
+      speaker: "prospect"
+    })
+  });
+  const nonBoolFinalRes = await worker.fetch(nonBoolFinalReq, testEnv);
+  assert(nonBoolFinalRes.status === 400, "Non-boolean isFinal rejected with 400");
+  const nonBoolData = await nonBoolFinalRes.json() as any;
+  assert(nonBoolData.code === "INVALID_FINAL_STATUS", "Error code is INVALID_FINAL_STATUS");
+
+  // false isFinal rejected
+  const falseFinalReq = new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Token": sessionData.sessionToken
+    },
+    body: JSON.stringify({
+      sessionId: sessionData.sessionId,
+      text: "Hello",
+      isFinal: false,
+      speaker: "prospect"
+    })
+  });
+  const falseFinalRes = await worker.fetch(falseFinalReq, testEnv);
+  assert(falseFinalRes.status === 400, "false isFinal rejected with 400");
+
+  // Invalid speaker rejected (must not default unknown speaker to prospect)
+  const invalidSpeakerReq = new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Token": sessionData.sessionToken
+    },
+    body: JSON.stringify({
+      sessionId: sessionData.sessionId,
+      text: "Hello",
+      isFinal: true,
+      speaker: "unknown_bot"
+    })
+  });
+  const invalidSpeakerRes = await worker.fetch(invalidSpeakerReq, testEnv);
+  assert(invalidSpeakerRes.status === 400, "Invalid speaker value rejected with 400");
+  const invSpeakerData = await invalidSpeakerRes.json() as any;
+  assert(invSpeakerData.code === "INVALID_SPEAKER", "Error code is INVALID_SPEAKER");
+
+  // -------------------------------------------------------------
+  // TEST 10: Gemini API key transport (header, never URL)
+  // -------------------------------------------------------------
+  console.log("\n[10/10] Testing Gemini API key is sent via header and not in the URL...");
+  const dummyGeminiKey = "DUMMY_TEST_KEY_NOT_A_REAL_SECRET";
+  let capturedUrl = "";
+  let capturedHeaders: Record<string, string> = {};
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init: any) => {
+    capturedUrl = typeof input === "string" ? input : input.url;
+    capturedHeaders = (init && init.headers) || {};
+    return new Response(
+      JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }) as any;
+  try {
+    const provider = new GeminiWorkerModelProvider(dummyGeminiKey, 5000);
+    await provider.generateContent({
+      model: "gemini-3.1-flash-lite",
+      contents: [{ role: "user", parts: [{ text: "hi" }] }]
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert(!capturedUrl.includes(dummyGeminiKey), "Gemini request URL does not contain the API key");
+  assert(!/[?&]key=/.test(capturedUrl), "Gemini request URL has no `key` query parameter");
+  assert(capturedHeaders["x-goog-api-key"] === dummyGeminiKey, "Gemini API key is sent via the x-goog-api-key header");
+
+  // -------------------------------------------------------------
+  // TEST 11: Internal test/evaluation endpoints use isProductionEnvironment()
+  // -------------------------------------------------------------
+  console.log("\n[11] Testing internal test/evaluation endpoint production guard...");
+  const adminToken = "admin_secret_token_12345";
+  const makeAdminReq = (token?: string) =>
+    new Request("https://worker.local/api/run-adversarial-tests", {
+      method: "POST",
+      headers: token ? { "X-Admin-Token": token } : {}
+    });
+
+  // 11a: NODE_ENV absent -> disabled even with a valid admin token
+  const noEnvAdminEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken };
+  const noEnvAdminRes = await worker.fetch(makeAdminReq(adminToken), noEnvAdminEnv);
+  assert(noEnvAdminRes.status === 404, "Internal endpoints disabled when NODE_ENV is absent (valid admin token)");
+  const noEnvAdminData = await noEnvAdminRes.json() as any;
+  assert(noEnvAdminData.code === "ENDPOINT_DISABLED_IN_PRODUCTION", "Absent NODE_ENV returns ENDPOINT_DISABLED_IN_PRODUCTION");
+
+  // 11b: NODE_ENV absent -> production guard takes precedence over auth
+  const noEnvNoTokRes = await worker.fetch(makeAdminReq(), noEnvAdminEnv);
+  assert(noEnvNoTokRes.status === 404, "Internal endpoints disabled when NODE_ENV is absent (no token)");
+
+  // 11c: explicit development -> enabled, admin auth still enforced
+  const devEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken, NODE_ENV: "development" };
+  const devNoTokRes = await worker.fetch(makeAdminReq(), devEnv);
+  const devNoTokData = await devNoTokRes.json() as any;
+  assert(devNoTokRes.status === 403 && devNoTokData.code === "ADMIN_AUTHORIZATION_REQUIRED", "Development: unauthenticated admin request rejected with 403");
+  const devAuthRes = await worker.fetch(makeAdminReq(adminToken), devEnv);
+  const devAuthData = await devAuthRes.json() as any;
+  assert(devAuthData.code !== "ENDPOINT_DISABLED_IN_PRODUCTION", "Development: internal endpoints are not production-disabled");
+
+  // 11d: explicit test -> enabled, admin auth still enforced
+  const testAdminEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const testNoTokRes = await worker.fetch(makeAdminReq(), testAdminEnv);
+  const testNoTokData = await testNoTokRes.json() as any;
+  assert(testNoTokRes.status === 403 && testNoTokData.code === "ADMIN_AUTHORIZATION_REQUIRED", "Test: unauthenticated admin request rejected with 403");
+  const testAuthRes = await worker.fetch(makeAdminReq(adminToken), testAdminEnv);
+  const testAuthData = await testAuthRes.json() as any;
+  assert(testAuthData.code !== "ENDPOINT_DISABLED_IN_PRODUCTION", "Test: internal endpoints are not production-disabled");
 
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);

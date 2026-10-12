@@ -248,13 +248,22 @@ export class CloudflareD1SessionStore implements SessionStore {
     providedAuthToken?: string,
     expectedVersion?: number
   ): Promise<SalesSession> {
+    return this.addTurnsAtomicAsync(sessionId, [turn], providedAuthToken, expectedVersion);
+  }
+
+  public async addTurnsAtomicAsync(
+    sessionId: string,
+    turns: ConversationTurn[],
+    providedAuthToken?: string,
+    expectedVersion?: number
+  ): Promise<SalesSession> {
     const db = this.ensureDb();
     const sessionRow = await db.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionId).first();
     if (!sessionRow) {
       throw new SessionNotFoundError(sessionId);
     }
 
-    if (providedAuthToken !== undefined && providedAuthToken !== sessionRow.auth_token) {
+    if (!providedAuthToken || providedAuthToken !== sessionRow.auth_token) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
 
@@ -267,21 +276,27 @@ export class CloudflareD1SessionStore implements SessionStore {
 
     // Get current turn count for sequential indexing
     const countRow = await db.prepare("SELECT COUNT(*) as count FROM conversation_turns WHERE session_id = ?").bind(sessionId).first();
-    const turnIndex = Number(countRow?.count || 0);
+    let turnIndex = Number(countRow?.count || 0);
     const now = Date.now();
-    const toolCallsJson = turn.toolCalls ? JSON.stringify(turn.toolCalls) : null;
 
-    // Atomic batch: insert turn AND update session last_activity_at + increment version conditionally
-    const batchRes = await db.batch([
-      db.prepare(
-        "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND version = ?)"
-      ).bind(sessionId, turnIndex, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now, sessionId, versionToMatch),
+    const statements: any[] = [];
+    for (const turn of turns) {
+      const toolCallsJson = turn.toolCalls ? JSON.stringify(turn.toolCalls) : null;
+      statements.push(
+        db.prepare(
+          "INSERT INTO conversation_turns (session_id, turn_index, role, text, tool_calls_json, timestamp) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND version = ?)"
+        ).bind(sessionId, turnIndex++, turn.role, turn.text || null, toolCallsJson, turn.timestamp || now, sessionId, versionToMatch)
+      );
+    }
+
+    statements.push(
       db.prepare(
         "UPDATE sessions SET last_activity_at = ?, version = version + 1 WHERE id = ? AND version = ?"
       ).bind(now, sessionId, versionToMatch)
-    ]);
+    );
 
-    const updateRes = batchRes[1];
+    const batchRes = await db.batch(statements);
+    const updateRes = batchRes[batchRes.length - 1];
     if (updateRes.meta && updateRes.meta.changes === 0) {
       throw new Error(`[CloudflareD1SessionStore] Optimistic concurrency conflict on session '${sessionId}'. Version mismatch.`);
     }
@@ -298,7 +313,7 @@ export class CloudflareD1SessionStore implements SessionStore {
       throw new SessionNotFoundError(sessionId);
     }
 
-    if (providedAuthToken !== undefined && providedAuthToken !== sessionRow.auth_token) {
+    if (!providedAuthToken || providedAuthToken !== sessionRow.auth_token) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
 
@@ -318,6 +333,18 @@ export class CloudflareD1SessionStore implements SessionStore {
     const cutoff = Date.now() - ttlMs;
     const res = await db.prepare("DELETE FROM sessions WHERE last_activity_at < ?").bind(cutoff).run();
     return Number(res.meta?.changes || 0);
+  }
+
+  public async findByTokenAsync(token: string, sessionId?: string): Promise<SalesSession | undefined> {
+    const db = this.ensureDb();
+    let row: any = null;
+    if (sessionId) {
+      row = await db.prepare("SELECT * FROM sessions WHERE auth_token = ? AND id = ?").bind(token, sessionId).first();
+    } else {
+      row = await db.prepare("SELECT * FROM sessions WHERE auth_token = ?").bind(token).first();
+    }
+    if (!row) return undefined;
+    return this.get(row.id);
   }
 }
 
@@ -460,6 +487,17 @@ export class SessionManager {
 
   public async findSessionByTokenAsync(token: string, sessionId?: string): Promise<SalesSession | undefined> {
     if (!token) return undefined;
+    if (this.store instanceof CloudflareD1SessionStore) {
+      const session = await this.store.findByTokenAsync(token, sessionId);
+      if (session) {
+        if (Date.now() - session.lastActivityAt > this.ttlMs) {
+          await this.store.delete(session.id);
+          return undefined;
+        }
+        return session;
+      }
+      return undefined;
+    }
     if (sessionId) {
       const session = await this.getSessionAsync(sessionId);
       if (session && session.authToken === token) {
@@ -628,25 +666,33 @@ export class SessionManager {
     providedAuthToken?: string,
     expectedVersion?: number
   ): Promise<void> {
+    await this.addTurnsAtomicAsync(sessionId, [turn], providedAuthToken, expectedVersion);
+  }
+
+  public async addTurnsAtomicAsync(
+    sessionId: string,
+    turns: ConversationTurn[],
+    providedAuthToken?: string,
+    expectedVersion?: number
+  ): Promise<void> {
     if (this.store instanceof CloudflareD1SessionStore) {
-      await this.store.addTurnAsync(sessionId, turn, providedAuthToken, expectedVersion);
+      await this.store.addTurnsAtomicAsync(sessionId, turns, providedAuthToken, expectedVersion);
       return;
     }
-    if (this.store instanceof CloudflareDOSessionStore) {
-      await this.store.addTurnAsync(sessionId, turn, providedAuthToken);
-      return;
-    }
-    await this.withSessionLock(sessionId, () => {
-      const session = this.getSession(sessionId);
+    await this.withSessionLock(sessionId, async () => {
+      const session = await this.getSessionAsync(sessionId);
       if (!session) {
         throw new SessionNotFoundError(sessionId);
       }
-      if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+      if (!providedAuthToken || providedAuthToken !== session.authToken) {
         throw new UnauthorizedSessionAccessError(sessionId);
       }
-      session.conversationHistory.push(turn);
+      for (const t of turns) {
+        session.conversationHistory.push(t);
+      }
       session.lastActivityAt = Date.now();
-      this.store.set(sessionId, session);
+      const res = this.store.set(sessionId, session);
+      if (res instanceof Promise) await res;
     });
   }
 
@@ -655,7 +701,7 @@ export class SessionManager {
     if (!session) {
       throw new SessionNotFoundError(sessionId);
     }
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     session.conversationHistory.push(turn);
@@ -675,7 +721,7 @@ export class SessionManager {
     if (!session) {
       throw new SessionNotFoundError(sessionId);
     }
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     session.conversationHistory = [];
@@ -689,7 +735,7 @@ export class SessionManager {
     if (!session) {
       throw new SessionNotFoundError(sessionId);
     }
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     session.conversationHistory = [];
@@ -703,7 +749,7 @@ export class SessionManager {
   public async deleteSessionAsync(sessionId: string, providedAuthToken?: string): Promise<boolean> {
     const session = await this.getSessionAsync(sessionId);
     if (!session) return false;
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     const res = this.store.delete(sessionId);
@@ -713,7 +759,7 @@ export class SessionManager {
   public deleteSession(sessionId: string, providedAuthToken?: string): boolean {
     const session = this.getSession(sessionId);
     if (!session) return false;
-    if (providedAuthToken !== undefined && providedAuthToken !== session.authToken) {
+    if (!providedAuthToken || providedAuthToken !== session.authToken) {
       throw new UnauthorizedSessionAccessError(sessionId);
     }
     return this.store.delete(sessionId) as boolean;
@@ -751,6 +797,15 @@ export class SessionDurableObject {
     }
 
     if (request.method === "GET" || action === "get") {
+      const token = url.searchParams.get("token") || url.searchParams.get("providedAuthToken");
+      if (this.session && this.session.authToken) {
+        if (!token || token !== this.session.authToken) {
+          return new Response(JSON.stringify({ error: "Unauthorized access: Valid token required to inspect session.", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
       return new Response(JSON.stringify(this.session), {
         headers: { "Content-Type": "application/json" }
       });
@@ -759,12 +814,12 @@ export class SessionDurableObject {
     if (request.method === "POST" || action === "set" || action === "update" || action === "delete" || action === "add_turn" || action === "clear") {
       const body = request.body ? await request.json().catch(() => ({})) as any : {};
       const reqAction = body.action || action;
+      const providedToken = body.providedAuthToken || body.authToken || url.searchParams.get("token");
 
       if (reqAction === "delete") {
         if (this.session && this.session.authToken) {
-          const token = body.providedAuthToken || body.authToken;
-          if (token !== this.session.authToken) {
-            return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+          if (!providedToken || providedToken !== this.session.authToken) {
+            return new Response(JSON.stringify({ error: "Unauthorized access: Valid token required to delete session.", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
               status: 403,
               headers: { "Content-Type": "application/json" }
             });
@@ -779,9 +834,8 @@ export class SessionDurableObject {
 
       if (reqAction === "set" || body.session) {
         if (this.session && this.session.authToken) {
-          const token = body.providedAuthToken || body.session?.authToken || body.authToken;
-          if (token !== this.session.authToken) {
-            return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
+          if (!providedToken || providedToken !== this.session.authToken) {
+            return new Response(JSON.stringify({ error: "Unauthorized access: Valid token required to update session.", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
               status: 403,
               headers: { "Content-Type": "application/json" }
             });
@@ -805,7 +859,8 @@ export class SessionDurableObject {
             headers: { "Content-Type": "application/json" }
           });
         }
-        if (body.providedAuthToken !== undefined && body.providedAuthToken !== this.session.authToken) {
+        const token = body.providedAuthToken || body.authToken;
+        if (!token || token !== this.session.authToken) {
           return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
             status: 403,
             headers: { "Content-Type": "application/json" }
@@ -826,7 +881,8 @@ export class SessionDurableObject {
             headers: { "Content-Type": "application/json" }
           });
         }
-        if (body.providedAuthToken !== undefined && body.providedAuthToken !== this.session.authToken) {
+        const token = body.providedAuthToken || body.authToken;
+        if (!token || token !== this.session.authToken) {
           return new Response(JSON.stringify({ error: "Unauthorized", code: "UNAUTHORIZED_SESSION_ACCESS" }), {
             status: 403,
             headers: { "Content-Type": "application/json" }

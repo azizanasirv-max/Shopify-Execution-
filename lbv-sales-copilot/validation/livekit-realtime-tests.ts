@@ -86,7 +86,8 @@ export async function runRealtimeValidationTests(): Promise<{ passed: number; fa
   const mockAi = new MockModelProvider();
   const salesEngine = new GenericSalesEngine({
     modelProvider: mockAi,
-    modelName: "test-model"
+    modelName: "test-model",
+    defaultAdapter: shopifyAdapter
   });
 
   const realtimeAdapter = new LiveKitRealtimeAdapter(salesEngine, registry);
@@ -252,6 +253,55 @@ export async function runRealtimeValidationTests(): Promise<{ passed: number; fa
   const reconnectedSession = sessionManager.getSession(shopifySession.id);
   assert(reconnectedSession?.conversationHistory.length === 1, "Session conversation history remains intact across leave/rejoin");
   assert(Boolean(reconnectedSession?.conversationHistory[0].text?.includes("conversion rate lift")), "Turn content preserved in session history");
+
+  // ----------------------------------------------------
+  // TEST 8: Transcript-to-Recommendation Flow Integration
+  // ----------------------------------------------------
+  console.log("\n[8/8] Testing End-to-End Prospect Transcript to Silent Recommendation Flow...");
+  const transcriptSession = sessionManager.createSession(shopifyAdapter.id);
+  let recommendationReceived: any = null;
+
+  await salesEngine.handleRealtimeTranscript(
+    {
+      speaker: "prospect",
+      text: "What is the pilot price?",
+      isFinal: true,
+      timestamp: Date.now()
+    },
+    (rec) => {
+      recommendationReceived = rec;
+    }
+  );
+
+  assert(recommendationReceived !== null, "Final prospect transcript generates a recommendation");
+  assert(recommendationReceived.statement === "Realtime test recommendation", "Recommendation statement delivered as text payload");
+  assert(recommendationReceived.status === "APPROVED", "Recommendation status is APPROVED");
+
+  // Test interim transcript suppression (Defect B1)
+  let interimReceived = false;
+  await salesEngine.handleRealtimeTranscript(
+    {
+      speaker: "prospect",
+      text: "What is the pilot...",
+      isFinal: false,
+      timestamp: Date.now()
+    },
+    () => { interimReceived = true; }
+  );
+  assert(!interimReceived, "Interim transcript events do not invoke recommendation model");
+
+  // Test salesperson speech suppression (Defect B2)
+  let salespersonReceived = false;
+  await salesEngine.handleRealtimeTranscript(
+    {
+      speaker: "salesperson",
+      text: "Our pilot price is $400.",
+      isFinal: true,
+      timestamp: Date.now()
+    },
+    () => { salespersonReceived = true; }
+  );
+  assert(!salespersonReceived, "Salesperson transcripts do not trigger prospect recommendations");
 
   console.log("--------------------------------------------------");
   console.log(`Realtime Validation Tests Summary: Passed: ${passed} | Failed: ${failed} | Total: ${passed + failed}`);

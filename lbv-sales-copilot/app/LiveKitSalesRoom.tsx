@@ -113,6 +113,17 @@ export default function LiveKitSalesRoom({
   } | null>(null);
   const [checkingConfig, setCheckingConfig] = useState(true);
 
+  // Realtime "SAY THIS NEXT" recommendation state
+  const [currentRecommendation, setCurrentRecommendation] = useState<{
+    statement: string;
+    status: "APPROVED" | "RECOVERY_REQUIRED" | "BLOCKED";
+    timestamp: number;
+    toolsUsed?: any[];
+  } | null>(null);
+  const [isProcessingTranscript, setIsProcessingTranscript] = useState<boolean>(false);
+  const processedSegmentIdsRef = useRef<Set<string>>(new Set());
+  const monotonicReqSeqRef = useRef<number>(0);
+
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
@@ -325,6 +336,90 @@ export default function LiveKitSalesRoom({
           setConnectionState(ConnectionState.Disconnected);
           setParticipants([]);
         });
+
+      // Wire RoomEvent.TranscriptionReceived to convert prospect speech transcripts to recommendations
+      if ((RoomEvent as any).TranscriptionReceived) {
+        room.on((RoomEvent as any).TranscriptionReceived, async (transcriptions: any[], participant?: RemoteParticipant | LocalParticipant) => {
+          if (!transcriptions || transcriptions.length === 0) return;
+          for (const publication of transcriptions) {
+            // Defect 3: Only explicitly final segments (isFinal === true)
+            const isFinal = publication.isFinal === true || publication.final === true;
+            const text = publication.text || publication.transcript || "";
+
+            // Defect 3: Prefer stable segment ID supplied by provider. If none, generate unique ID per event instance (no text-based collision!)
+            const segmentId = publication.id || publication.segmentId || `seg_${publication.participantIdentity || participant?.identity || 'p'}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+            // Defect 3: Trustworthy participant identity resolution
+            const rawIdentity = participant?.identity || publication.participantIdentity;
+            let speakerRole: "prospect" | "salesperson" | "other" = "other";
+            if (rawIdentity) {
+              const lower = rawIdentity.toLowerCase();
+              if (lower === "prospect" || lower.startsWith("prospect_")) {
+                speakerRole = "prospect";
+              } else if (lower === "salesperson" || lower.startsWith("salesperson_")) {
+                speakerRole = "salesperson";
+              }
+            }
+
+            // Defect 3: Process strictly final prospect transcripts only
+            if (isFinal && text.trim().length > 0 && speakerRole === "prospect") {
+              if (processedSegmentIdsRef.current.has(segmentId)) continue;
+              processedSegmentIdsRef.current.add(segmentId);
+
+              // Defect 3: Monotonic request sequence counter for stale-response rejection
+              monotonicReqSeqRef.current += 1;
+              const currentReqSeq = monotonicReqSeqRef.current;
+
+              setIsProcessingTranscript(true);
+              setErrorMessage(null);
+
+              try {
+                const transcriptRes = await fetch("/api/livekit/transcript", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
+                  },
+                  body: JSON.stringify({
+                    sessionId: currentSessionId,
+                    sessionToken: currentSessionToken,
+                    text: text.trim(),
+                    isFinal: true,
+                    speaker: "prospect"
+                  })
+                });
+
+                if (!transcriptRes.ok) {
+                  const errData = await transcriptRes.json().catch(() => ({}));
+                  // Defect 3: Unmark failed request so retries can occur safely
+                  processedSegmentIdsRef.current.delete(segmentId);
+                  setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
+                } else {
+                  const data = await transcriptRes.json();
+                  // Defect 3: Monotonic check for out-of-order response rejection
+                  if (currentReqSeq === monotonicReqSeqRef.current && data.recommendation) {
+                    setCurrentRecommendation({
+                      statement: data.recommendation.statement,
+                      status: data.recommendation.status,
+                      timestamp: Date.now(),
+                      toolsUsed: data.recommendation.toolsUsed
+                    });
+                  }
+                }
+              } catch (txErr: any) {
+                console.error("Failed to process LiveKit transcript:", txErr);
+                // Defect 3: Unmark failed network request so retries can occur
+                processedSegmentIdsRef.current.delete(segmentId);
+                setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
+              } finally {
+                if (currentReqSeq === monotonicReqSeqRef.current) {
+                  setIsProcessingTranscript(false);
+                }
+              }
+            }
+          }
+        });
+      }
 
       // 3. Connect to LiveKit Room
       await room.connect(serverUrl, token);
@@ -587,6 +682,45 @@ export default function LiveKitSalesRoom({
         <div className="mt-4 bg-rose-500/10 border border-rose-500/30 rounded-xl p-3 text-xs text-rose-300 flex gap-2.5 items-center">
           <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
           <span>{errorMessage}</span>
+        </div>
+      )}
+
+      {/* Live "SAY THIS NEXT" Silent Copilot Banner */}
+      {(currentRecommendation || isProcessingTranscript) && (
+        <div className="mt-5 bg-gradient-to-r from-indigo-950/80 via-slate-900 to-purple-950/80 border border-indigo-500/40 rounded-2xl p-5 shadow-2xl animate-fadeIn">
+          <div className="flex items-center justify-between mb-3 border-b border-indigo-500/20 pb-2.5">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-400" />
+              <span className="text-xs font-bold text-indigo-300 uppercase tracking-wider">
+                Silent Sales Copilot Guidance
+              </span>
+            </div>
+            {currentRecommendation && (
+              <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono border ${
+                currentRecommendation.status === "BLOCKED"
+                  ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
+                  : "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+              }`}>
+                {currentRecommendation.status === "BLOCKED" ? "BLOCKED (SAFE FALLBACK)" : "APPROVED"}
+              </span>
+            )}
+          </div>
+
+          <div className="space-y-1">
+            <span className="text-[10px] uppercase tracking-widest text-slate-400 font-extrabold block">
+              SAY THIS NEXT
+            </span>
+            <div className="text-base font-bold text-slate-100 bg-slate-950/90 border border-slate-800 p-4 rounded-xl leading-relaxed">
+              {isProcessingTranscript ? (
+                <span className="text-indigo-300 flex items-center gap-2 animate-pulse text-sm">
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  Analyzing prospect utterance and evaluating deterministic compliance gate...
+                </span>
+              ) : (
+                currentRecommendation?.statement
+              )}
+            </div>
+          </div>
         </div>
       )}
 
