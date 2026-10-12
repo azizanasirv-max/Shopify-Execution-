@@ -13,7 +13,7 @@
  * 9. Sanitized error responses without leakage of internal details.
  */
 
-import worker, { Env } from "../../worker.js";
+import worker, { Env, GeminiWorkerModelProvider } from "../../worker.js";
 import { MockD1Database } from "./d1-persistence-tests.js";
 
 export async function runWorkerIntegrationTests(): Promise<{ passed: number; failed: number }> {
@@ -84,6 +84,60 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   });
   const approvedCorsRes = await worker.fetch(approvedCorsReq, noEnvProdEnv);
   assert(approvedCorsRes.headers.get("Access-Control-Allow-Origin") === "https://approved-store.com", "Explicitly approved origin returns origin header when NODE_ENV is absent");
+
+  // TEST 1c: CORS fail-closed when NODE_ENV is absent AND ALLOWED_ORIGINS is
+  // unset. This is the real fail-open regression: with a `process` polyfill
+  // present (nodejs_compat), the old logic defaulted to wildcard CORS and
+  // reflected any origin.
+  console.log("\n[1c] Testing CORS fail-closed with no NODE_ENV and no ALLOWED_ORIGINS...");
+  const bareProdEnv: Env = { DB: mockDb };
+  const bareUnapprovedReq = new Request("https://worker.local/api/copilot", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://evil.example",
+      "Access-Control-Request-Method": "POST"
+    }
+  });
+  const bareUnapprovedRes = await worker.fetch(bareUnapprovedReq, bareProdEnv);
+  assert(
+    bareUnapprovedRes.headers.get("Access-Control-Allow-Origin") === "null",
+    "Unapproved origin is never reflected when NODE_ENV and ALLOWED_ORIGINS are absent"
+  );
+
+  // TEST 1d: CORS fail-closed when the Node `process` object is unavailable.
+  // Simulates a pure Worker runtime without the nodejs_compat process polyfill.
+  console.log("\n[1d] Testing CORS fail-closed when `process` is unavailable...");
+  const savedProcess = (globalThis as any).process;
+  let processAbsentResult: { unapproved: string | null; approved: string | null };
+  try {
+    (globalThis as any).process = undefined;
+    const noProcEnv: Env = {
+      DB: mockDb,
+      ALLOWED_ORIGINS: "https://approved-store.com"
+    };
+    const noProcUnapprovedRes = await worker.fetch(
+      new Request("https://worker.local/api/copilot", {
+        method: "OPTIONS",
+        headers: { Origin: "https://malicious-site.com", "Access-Control-Request-Method": "POST" }
+      }),
+      noProcEnv
+    );
+    const noProcApprovedRes = await worker.fetch(
+      new Request("https://worker.local/api/copilot", {
+        method: "OPTIONS",
+        headers: { Origin: "https://approved-store.com", "Access-Control-Request-Method": "POST" }
+      }),
+      noProcEnv
+    );
+    processAbsentResult = {
+      unapproved: noProcUnapprovedRes.headers.get("Access-Control-Allow-Origin"),
+      approved: noProcApprovedRes.headers.get("Access-Control-Allow-Origin")
+    };
+  } finally {
+    (globalThis as any).process = savedProcess;
+  }
+  assert(processAbsentResult.unapproved === "null", "Unapproved origin is not reflected when `process` is unavailable");
+  assert(processAbsentResult.approved === "https://approved-store.com", "Approved origin still works when `process` is unavailable");
 
   // -------------------------------------------------------------
   // TEST 2: Request Body Size Limit (Reject > 64KB)
@@ -339,6 +393,35 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(invalidSpeakerRes.status === 400, "Invalid speaker value rejected with 400");
   const invSpeakerData = await invalidSpeakerRes.json() as any;
   assert(invSpeakerData.code === "INVALID_SPEAKER", "Error code is INVALID_SPEAKER");
+
+  // -------------------------------------------------------------
+  // TEST 10: Gemini API key transport (header, never URL)
+  // -------------------------------------------------------------
+  console.log("\n[10/10] Testing Gemini API key is sent via header and not in the URL...");
+  const dummyGeminiKey = "DUMMY_TEST_KEY_NOT_A_REAL_SECRET";
+  let capturedUrl = "";
+  let capturedHeaders: Record<string, string> = {};
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init: any) => {
+    capturedUrl = typeof input === "string" ? input : input.url;
+    capturedHeaders = (init && init.headers) || {};
+    return new Response(
+      JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }) as any;
+  try {
+    const provider = new GeminiWorkerModelProvider(dummyGeminiKey, 5000);
+    await provider.generateContent({
+      model: "gemini-3.1-flash-lite",
+      contents: [{ role: "user", parts: [{ text: "hi" }] }]
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert(!capturedUrl.includes(dummyGeminiKey), "Gemini request URL does not contain the API key");
+  assert(!/[?&]key=/.test(capturedUrl), "Gemini request URL has no `key` query parameter");
+  assert(capturedHeaders["x-goog-api-key"] === dummyGeminiKey, "Gemini API key is sent via the x-goog-api-key header");
 
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
