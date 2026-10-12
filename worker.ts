@@ -27,6 +27,13 @@ import {
   SessionStore
 } from "./lbv-sales-copilot/engine/session-manager.js";
 import { ModelProvider } from "./lbv-sales-copilot/engine/types.js";
+import {
+  createLlmProvider,
+  resolveProviderId,
+  LegacyModelProviderAdapter,
+  TokenBudget,
+  UsageTracker
+} from "./lbv-sales-copilot/engine/llm/index.js";
 
 export interface Env {
   DB?: any; // Cloudflare D1
@@ -38,6 +45,14 @@ export interface Env {
   NODE_ENV?: string;
   LBV_SESSION_STORE?: string;
   ALLOWED_ORIGINS?: string;
+  // Provider-agnostic LLM configuration (Groq is the default provider).
+  LLM_PROVIDER?: string;
+  LLM_MODEL?: string;
+  LLM_TIMEOUT_MS?: string;
+  GROQ_API_KEY?: string;
+  /** Optional global cumulative token budget (0/unset disables enforcement). */
+  LBV_MAX_TOTAL_TOKENS?: string;
+  LBV_MAX_REQUEST_TOKENS?: string;
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
 }
 
@@ -177,22 +192,45 @@ export function createWorkerServices(env: Env) {
 
   const sessionManager = new SessionManager({ store: sessionStore });
 
-  // 3. Model Provider
-  const apiKey = env.GEMINI_API_KEY || (typeof process !== "undefined" ? process.env.GEMINI_API_KEY : "") || "";
-  const modelProvider: ModelProvider = apiKey
-    ? new GeminiWorkerModelProvider(apiKey)
+  // 3. Model Provider (provider-agnostic; Groq is the initial/default provider)
+  const providerEnv = {
+    LLM_PROVIDER: env.LLM_PROVIDER,
+    LLM_MODEL: env.LLM_MODEL,
+    LLM_TIMEOUT_MS: env.LLM_TIMEOUT_MS,
+    GROQ_API_KEY: env.GROQ_API_KEY || (typeof process !== "undefined" ? process.env.GROQ_API_KEY : undefined),
+    GEMINI_API_KEY: env.GEMINI_API_KEY || (typeof process !== "undefined" ? process.env.GEMINI_API_KEY : undefined)
+  };
+  const llmProvider = createLlmProvider(providerEnv);
+  const providerId = llmProvider ? llmProvider.id : resolveProviderId(providerEnv);
+  const modelProvider: ModelProvider = llmProvider
+    ? new LegacyModelProviderAdapter(llmProvider)
     : {
         generateContent: async () => {
-          throw new Error("GEMINI_API_KEY is not configured in Worker environment.");
+          throw new Error(
+            `LLM provider '${providerId}' is not configured. Set the corresponding API key as a Worker secret.`
+          );
         }
       };
+
+  const usageTracker = new UsageTracker();
+  const maxTotalTokens = env.LBV_MAX_TOTAL_TOKENS ? parseInt(env.LBV_MAX_TOTAL_TOKENS, 10) : 0;
+  const maxRequestTokens = env.LBV_MAX_REQUEST_TOKENS ? parseInt(env.LBV_MAX_REQUEST_TOKENS, 10) : 0;
+  const tokenBudget = new TokenBudget({
+    maxTotalTokens: Number.isFinite(maxTotalTokens) ? maxTotalTokens : 0,
+    maxRequestTokens: Number.isFinite(maxRequestTokens) ? maxRequestTokens : 0
+  });
 
   // 4. Generic Sales Engine
   const salesEngine = new GenericSalesEngine({
     modelProvider,
-    modelName: "gemini-3.1-flash-lite",
+    modelName: env.LLM_MODEL || (llmProvider ? llmProvider.defaultModel : "llama-3.1-8b-instant"),
     defaultAdapter: shopifyAdapter,
-    adapterRegistry
+    adapterRegistry,
+    providerId,
+    tokenBudget,
+    usageTracker,
+    deterministicRouting: true,
+    conciseOutput: { enabled: true, minWords: 15, maxWords: 35 }
   });
 
   // 5. Realtime Adapter
@@ -210,7 +248,9 @@ export function createWorkerServices(env: Env) {
     sessionStore,
     sessionManager,
     salesEngine,
-    realtimeAdapter
+    realtimeAdapter,
+    providerId,
+    usageTracker
   };
 }
 
@@ -273,6 +313,63 @@ function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Session-Token, X-Session-Id, X-Admin-Token",
     "Access-Control-Max-Age": "86400"
   };
+}
+
+/**
+ * Shared, strict validation for LiveKit transcript ingress.
+ *
+ * Used by BOTH the buffered and streaming transcript routes so their security
+ * checks (session lookup, token auth, isFinal, speaker, text bounds) can never
+ * drift apart. Returns a ready-to-send Response on failure.
+ */
+async function validateTranscriptIngress(
+  request: Request,
+  sessionManager: SessionManager,
+  adapterRegistry: AdapterRegistry,
+  corsHeaders: Record<string, string>
+): Promise<
+  | { ok: true; session: any; targetAdapter: any; text: string; speaker: string }
+  | { ok: false; response: Response }
+> {
+  const body = (await request.json().catch(() => ({}))) as any;
+  const { sessionId, sessionToken, text, isFinal, speaker } = body;
+  const tokenHeader =
+    request.headers.get("x-session-token") ||
+    request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+    sessionToken;
+
+  if (!sessionId || typeof sessionId !== "string") {
+    return { ok: false, response: errorResponse("sessionId is required for transcript ingress.", "SESSION_REQUIRED", 400, corsHeaders) };
+  }
+
+  const session = await sessionManager.getSessionAsync(sessionId);
+  if (!session) {
+    return { ok: false, response: errorResponse("Sales session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders) };
+  }
+
+  if (!tokenHeader || tokenHeader !== session.authToken) {
+    return { ok: false, response: errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders) };
+  }
+
+  // Strict boolean isFinal check (reject missing, null, string, or false values)
+  if (typeof isFinal !== "boolean" || isFinal !== true) {
+    return { ok: false, response: errorResponse("isFinal must be an explicit boolean true value for recommendation generation.", "INVALID_FINAL_STATUS", 400, corsHeaders) };
+  }
+
+  // Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)
+  if (speaker !== "prospect" && speaker !== "salesperson") {
+    return { ok: false, response: errorResponse("Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", "INVALID_SPEAKER", 400, corsHeaders) };
+  }
+
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return { ok: false, response: errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders) };
+  }
+  if (text.length > 4000) {
+    return { ok: false, response: errorResponse("Transcript text exceeds maximum allowed length of 4000 characters.", "TRANSCRIPT_TOO_LONG", 400, corsHeaders) };
+  }
+
+  const targetAdapter = adapterRegistry.resolve(session.productId);
+  return { ok: true, session, targetAdapter, text: text.trim(), speaker };
 }
 
 export default {
@@ -768,52 +865,15 @@ export default {
       // ROUTE: POST /api/livekit/transcript
       // =========================================================================
       if (pathname === "/api/livekit/transcript" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
-        const { sessionId, sessionToken, text, isFinal, speaker } = body;
-        const tokenHeader =
-          request.headers.get("x-session-token") ||
-          request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
-          sessionToken;
-
-        if (!sessionId || typeof sessionId !== "string") {
-          return errorResponse("sessionId is required for transcript ingress.", "SESSION_REQUIRED", 400, corsHeaders);
-        }
-
-        const session = await sessionManager.getSessionAsync(sessionId);
-        if (!session) {
-          return errorResponse("Sales session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
-        }
-
-        if (!tokenHeader || tokenHeader !== session.authToken) {
-          return errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
-        }
-
-        // Defect A1 & A2: Strict boolean isFinal check (reject missing, null, string, or false values)
-        if (typeof isFinal !== "boolean" || isFinal !== true) {
-          return errorResponse("isFinal must be an explicit boolean true value for recommendation generation.", "INVALID_FINAL_STATUS", 400, corsHeaders);
-        }
-
-        // Defect A3: Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)
-        if (speaker !== "prospect" && speaker !== "salesperson") {
-          return errorResponse("Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", "INVALID_SPEAKER", 400, corsHeaders);
-        }
-
-        // Defect A4: Validate text length and format (non-empty string <= 4000 characters)
-        if (!text || typeof text !== "string" || !text.trim()) {
-          return errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders);
-        }
-        if (text.length > 4000) {
-          return errorResponse("Transcript text exceeds maximum allowed length of 4000 characters.", "TRANSCRIPT_TOO_LONG", 400, corsHeaders);
-        }
-
-        const targetAdapter = adapterRegistry.resolve(session.productId);
-        const transcriptSpeaker = speaker;
-        const finalFlag = isFinal === true;
+        const ingress = await validateTranscriptIngress(request, sessionManager, adapterRegistry, corsHeaders);
+        if (!ingress.ok) return ingress.response;
+        const { session, targetAdapter, text: transcriptText, speaker: transcriptSpeaker } = ingress;
+        const finalFlag = true;
 
         let recommendation: any = null;
 
         if (transcriptSpeaker === "prospect" && finalFlag) {
-          const rawRec = await salesEngine.generateRecommendation(text.trim(), {
+          const rawRec = await salesEngine.generateRecommendation(transcriptText, {
             adapter: targetAdapter,
             session,
             history: session.conversationHistory
@@ -856,6 +916,93 @@ export default {
           200,
           corsHeaders
         );
+      }
+
+      // =========================================================================
+      // ROUTE: POST /api/livekit/transcript/stream (Server-Sent Events)
+      //
+      // Streams a recommendation incrementally to the "SAY THIS NEXT" panel.
+      // SECURITY: only VALIDATED text is emitted - the engine runs the
+      // deterministic approval gate first and the raw model tokens are never
+      // forwarded. The buffered route above remains the non-streaming fallback.
+      // =========================================================================
+      if (pathname === "/api/livekit/transcript/stream" && request.method === "POST") {
+        const ingress = await validateTranscriptIngress(request, sessionManager, adapterRegistry, corsHeaders);
+        if (!ingress.ok) return ingress.response;
+        const { session, targetAdapter, text: transcriptText, speaker: transcriptSpeaker } = ingress;
+
+        const encoder = new TextEncoder();
+        const sseHeaders: Record<string, string> = {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no"
+        };
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            const send = (event: string, data: any) => {
+              controller.enqueue(encoder.encode(`event: ${event}
+data: ${JSON.stringify(data)}
+
+`));
+            };
+            try {
+              if (transcriptSpeaker !== "prospect") {
+                send("final", {
+                  success: true,
+                  sessionId: session.id,
+                  productId: session.productId,
+                  speaker: transcriptSpeaker,
+                  recommendation: null
+                });
+                return;
+              }
+
+              send("status", { status: "analyzing" });
+
+              const rawRec = await salesEngine.generateRecommendationStream(
+                transcriptText,
+                { adapter: targetAdapter, session, history: session.conversationHistory },
+                (delta) => send("delta", { text: delta })
+              );
+
+              // Persist new turns atomically (identical contract to the buffered route)
+              if (session.conversationHistory.length >= 2) {
+                const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
+                const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
+                if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
+                  await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
+                }
+              }
+
+              const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
+              delete (sanitizedMetadata as any).rawUnapprovedStatement;
+
+              send("final", {
+                success: true,
+                sessionId: session.id,
+                productId: session.productId,
+                speaker: transcriptSpeaker,
+                recommendation: {
+                  statement: rawRec.statement,
+                  status: rawRec.status,
+                  toolsUsed: rawRec.toolsUsed,
+                  validationReport: rawRec.validationReport,
+                  engineMetadata: sanitizedMetadata
+                }
+              });
+            } catch (streamErr: any) {
+              console.error("[Worker Realtime Stream] error:", streamErr);
+              send("error", { error: streamErr?.message || "Streaming recommendation failed." });
+            } finally {
+              controller.close();
+            }
+          }
+        });
+
+        return new Response(stream, { status: 200, headers: sseHeaders });
       }
 
       // =========================================================================
