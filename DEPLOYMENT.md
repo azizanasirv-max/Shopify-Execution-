@@ -65,7 +65,8 @@ npm install --legacy-peer-deps
 # TypeScript check (must pass with 0 errors)
 node_modules/.bin/tsc --noEmit
 
-# Run all test suites
+# Run the complete deterministic validation suite (all eight suites).
+# See section 5.1 for per-suite commands.
 GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts hardening
 
 # Build static assets
@@ -74,6 +75,35 @@ npm run build
 # Deploy to Cloudflare Workers
 wrangler deploy
 ```
+
+## 5.1 Running the Validation Test Suites
+
+The test runner is `run-tests.ts`, invoked through `tsx`. For the deterministic suites below, `GEMINI_API_KEY=dummy` is sufficient. The separate `adversarial`, `stage2`, and `classification` commands require a real `GEMINI_API_KEY` and are not part of the eight deterministic validation suites.
+
+### Run the complete suite (all eight suites)
+
+There **is** a single command that runs all eight deterministic validation suites in one process:
+
+```bash
+GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts hardening
+# or, equivalently:
+GEMINI_API_KEY=dummy npm run test:hardening
+```
+
+> **Naming note:** despite its name, the `hardening` command is **not** hardening-only. Its handler runs all eight suites (hardening unit, approval gate, adapter isolation, session access control, realtime, session persistence, D1 persistence, and worker integration). There is currently no command that runs the hardening suite by itself.
+
+### Run the individual suites
+
+| # | Suite | Command |
+|---|-------|---------|
+| 1 | Hardening unit tests | *(no standalone command — runs only as part of `hardening`)* |
+| 2 | Approval gate | `npm run test:approval-gate` |
+| 3 | Adapter isolation | `npm run test:isolation` |
+| 4 | Session access control | `GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts access-control` |
+| 5 | Realtime (LiveKit) | `GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts realtime` |
+| 6 | Session persistence | `GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts persistence` |
+| 7 | D1 persistence | `npm run test:d1` |
+| 8 | Worker integration | `npm run test:worker` |
 
 ## 6. Switching LLM Providers
 
