@@ -505,6 +505,39 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   const apiPostRes = await worker.fetch(new Request("https://worker.local/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }), assetEnv);
   assert(apiPostRes.status === 400, "POST API route validation still runs with ASSETS bound");
 
+  // -------------------------------------------------------------
+  // TEST 13: Server-side duplicate transcript suppression
+  // -------------------------------------------------------------
+  console.log("\n[13] Testing server-side duplicate transcript suppression...");
+  const dedupeSessionRes = await worker.fetch(new Request("https://worker.local/api/sessions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ productId: "shopify" })
+  }), testEnv);
+  const dedupeSession = await dedupeSessionRes.json() as any;
+  const dedupeText = "Could you walk me through the pilot scope for our team?";
+  const dedupeBody = JSON.stringify({ sessionId: dedupeSession.sessionId, sessionToken: dedupeSession.sessionToken, text: dedupeText, isFinal: true, speaker: "prospect" });
+  const firstTxRes = await worker.fetch(new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST", headers: { "Content-Type": "application/json", "x-session-token": dedupeSession.sessionToken }, body: dedupeBody
+  }), testEnv);
+  const firstTxData = await firstTxRes.json() as any;
+  assert(firstTxRes.status === 200 && firstTxData.duplicate !== true, "First final transcript is processed normally");
+  const secondTxRes = await worker.fetch(new Request("https://worker.local/api/livekit/transcript", {
+    method: "POST", headers: { "Content-Type": "application/json", "x-session-token": dedupeSession.sessionToken }, body: dedupeBody
+  }), testEnv);
+  const secondTxData = await secondTxRes.json() as any;
+  assert(secondTxRes.status === 200, "Duplicate transcript returns HTTP 200 (idempotent)");
+  assert(secondTxData.duplicate === true && secondTxData.recommendation === null, "Duplicate final transcript is suppressed without a second recommendation");
+
+  const streamDupText = "Which platforms do you support for short-form clips?";
+  const streamDupBody = JSON.stringify({ sessionId: dedupeSession.sessionId, sessionToken: dedupeSession.sessionToken, text: streamDupText, isFinal: true, speaker: "prospect" });
+  await worker.fetch(new Request("https://worker.local/api/livekit/transcript/stream", {
+    method: "POST", headers: { "Content-Type": "application/json", "x-session-token": dedupeSession.sessionToken }, body: streamDupBody
+  }), testEnv);
+  const dupStreamRes = await worker.fetch(new Request("https://worker.local/api/livekit/transcript/stream", {
+    method: "POST", headers: { "Content-Type": "application/json", "x-session-token": dedupeSession.sessionToken }, body: streamDupBody
+  }), testEnv);
+  const dupStreamText = await dupStreamRes.text();
+  assert(dupStreamRes.status === 200 && dupStreamText.includes('"duplicate":true'), "Streaming route also suppresses duplicate transcripts");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");
