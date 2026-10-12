@@ -42,6 +42,24 @@ export interface Env {
 }
 
 /**
+ * Determine whether the worker must run in production (fail-closed) mode.
+ *
+ * Security rationale: Cloudflare Workers configured with the `nodejs_compat`
+ * flag expose a `process` polyfill, so `typeof process` CANNOT be used to
+ * distinguish a Cloudflare Worker from Node.js. The previous implementation
+ * relied on it and therefore failed OPEN (enabling wildcard CORS) whenever
+ * `NODE_ENV` was absent in a Worker with `process` defined.
+ *
+ * Policy: treat the environment as production unless it is *explicitly*
+ * configured as a non-production environment (`development` or `test`).
+ * This makes secure behavior the default and requires an explicit opt-in
+ * for development conveniences such as wildcard CORS.
+ */
+export function isProductionEnvironment(env: Env): boolean {
+  return env.NODE_ENV !== "development" && env.NODE_ENV !== "test";
+}
+
+/**
  * Worker-native Gemini REST Model Provider using standard fetch.
  * Guarantees zero Node.js runtime dependencies and respects request timeouts.
  */
@@ -145,10 +163,7 @@ export function createWorkerServices(env: Env) {
 
   // 2. Authoritative Session Store Selection (D1 authoritative, zero fallback in production)
   let sessionStore: SessionStore;
-  const isProd =
-    env.NODE_ENV === "production" ||
-    (!env.NODE_ENV && typeof process !== "undefined" && process.env?.NODE_ENV === "production") ||
-    (!env.NODE_ENV && typeof process === "undefined"); // Fail closed in Worker environment if NODE_ENV is unspecified
+  const isProd = isProductionEnvironment(env);
 
   if (env.DB) {
     sessionStore = new CloudflareD1SessionStore(env.DB);
@@ -236,10 +251,7 @@ function errorResponse(
 
 // Helper to handle CORS
 function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
-  const isProd =
-    env.NODE_ENV === "production" ||
-    (!env.NODE_ENV && typeof process !== "undefined" && process.env?.NODE_ENV === "production") ||
-    (!env.NODE_ENV && typeof process === "undefined"); // Fail closed in Worker environment if NODE_ENV is unspecified
+  const isProd = isProductionEnvironment(env);
   const origin = request.headers.get("Origin") || "";
 
   // Explicit allowed origin policy in production
@@ -862,7 +874,7 @@ export default {
         pathname === "/api/save-baseline" ||
         pathname === "/api/load-baseline"
       ) {
-        if (env.NODE_ENV === "production") {
+        if (isProductionEnvironment(env)) {
           return errorResponse(
             "Internal test and evaluation endpoints are disabled in production.",
             "ENDPOINT_DISABLED_IN_PRODUCTION",
