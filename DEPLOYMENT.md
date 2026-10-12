@@ -280,10 +280,27 @@ re-run `npm run build` then `npm run deploy` (do not assume success from the Wor
 
 ## 13. CI
 
-`.github/workflows/ci.yml` runs on every push/PR to `main`: TypeScript check, the full deterministic
-test suite (with a **dummy** Gemini value only), the production build, and a Wrangler dry-run.
-CI never deploys and never uses real secrets. A deploy workflow is intentionally not included;
-deployment is performed manually by the owner after `npm run check:deploy` passes.
+The CI workflow is committed at **`ci/github-actions-ci.yml`**. It runs on every push/PR to `main`:
+TypeScript check, the full deterministic test suite (a **dummy** Gemini value is set only to satisfy
+any legacy assumption; no real key is needed), the production build, and a Wrangler dry-run. CI never
+deploys and never uses real secrets.
+
+**One-time install (required):** the automation used to prepare this change cannot create files under
+`.github/workflows/` (the GitHub App token lacks the `workflows` permission). A repository owner must
+move the file into place once:
+
+```bash
+mkdir -p .github/workflows
+git mv ci/github-actions-ci.yml .github/workflows/ci.yml
+git commit -m "ci: enable GitHub Actions workflow"
+git push
+```
+
+Or use the GitHub UI: create `.github/workflows/ci.yml` and paste the contents of
+`ci/github-actions-ci.yml`. After that, CI runs automatically on pushes and PRs to `main`.
+
+A deploy workflow is intentionally not included; deployment is performed manually by the owner after
+`npm run check:deploy` passes.
 
 ---
 
