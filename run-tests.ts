@@ -16,6 +16,7 @@ import { runSessionPersistenceTests } from "./lbv-sales-copilot/validation/sessi
 import { runD1PersistenceTests } from "./lbv-sales-copilot/validation/d1-persistence-tests.js";
 import { runWorkerIntegrationTests } from "./lbv-sales-copilot/validation/worker-integration-tests.js";
 import { runLlmProviderTests } from "./lbv-sales-copilot/validation/llm-provider-tests.js";
+import { runServiceProfileTests } from "./lbv-sales-copilot/validation/service-profile-tests.js";
 
 dotenv.config();
 
@@ -126,6 +127,10 @@ if (command === "adversarial") {
   runLlmProviderTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "service" || command === "service-profile" || command === "profiles") {
+  runServiceProfileTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
 } else if (command === "hardening" || command === "unit" || command === "engine") {
   Promise.all([
     runHardeningUnitTests(),
@@ -136,9 +141,10 @@ if (command === "adversarial") {
     runSessionPersistenceTests(),
     runD1PersistenceTests(),
     runWorkerIntegrationTests(),
-    runLlmProviderTests()
-  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9]) => {
-    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed;
+    runLlmProviderTests(),
+    runServiceProfileTests()
+  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed + s10.failed;
     process.exit(totalFailed === 0 ? 0 : 1);
   });
 } else {

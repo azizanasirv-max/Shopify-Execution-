@@ -14,6 +14,7 @@ import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwrit
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
 import { SalesApiAdapter } from "./lbv-sales-copilot/engine/types.js";
 import { AdapterRegistry, UnknownProductError } from "./lbv-sales-copilot/engine/adapter-registry.js";
+import { registerServiceProfiles } from "./lbv-sales-copilot/sales-api/profiles/index.js";
 import { FileSessionStore } from "./lbv-sales-copilot/engine/file-session-store.js";
 import { SessionManager, SessionNotFoundError, MismatchedSessionProductError, UnauthorizedSessionAccessError, InMemorySessionStore, CloudflareDOSessionStore, CloudflareD1SessionStore, SessionDurableObject, SessionStore } from "./lbv-sales-copilot/engine/session-manager.js";
 
@@ -41,6 +42,8 @@ const ghostwriterAdapter = new GhostwriterSalesAdapter();
 const adapterRegistry = new AdapterRegistry();
 adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
 adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
+// Service-profile adapters (data-driven). Adding a service = adding a profile.
+registerServiceProfiles(adapterRegistry);
 
 // Isolated Session Manager with Production Store Selection & Startup Failure enforcement
 const requirePersistentStore = isProd || process.env.LBV_SESSION_STORE === "file";
