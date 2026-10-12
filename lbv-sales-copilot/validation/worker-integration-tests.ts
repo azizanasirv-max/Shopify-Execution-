@@ -463,6 +463,48 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   const testAuthData = await testAuthRes.json() as any;
   assert(testAuthData.code !== "ENDPOINT_DISABLED_IN_PRODUCTION", "Test: internal endpoints are not production-disabled");
 
+  // -------------------------------------------------------------
+  // TEST 12: Static asset serving + SPA fallback (env.ASSETS binding)
+  // -------------------------------------------------------------
+  console.log("\n[12] Testing static asset serving and SPA fallback...");
+  const assetFiles: Record<string, string> = {
+    "/index.html": "<!doctype html><html><body><div id=\"root\">LBV_SPA_ROOT</div></body></html>",
+    "/assets/app.js": "console.log('lbv-app');"
+  };
+  const assetsBinding = {
+    async fetch(assetReq: Request): Promise<Response> {
+      const assetPath = new URL(assetReq.url).pathname;
+      const body = assetFiles[assetPath];
+      if (body === undefined) return new Response("Not found", { status: 404 });
+      const isHtml = assetPath.endsWith(".html");
+      return new Response(body, { status: 200, headers: { "Content-Type": isHtml ? "text/html" : "application/javascript" } });
+    }
+  };
+  const assetEnv: Env = { DB: mockDb, ADMIN_API_KEY: adminToken, NODE_ENV: "test", ASSETS: assetsBinding as any };
+
+  const rootRes = await worker.fetch(new Request("https://worker.local/", { method: "GET" }), assetEnv);
+  assert(rootRes.status === 200, "Root request is served (SPA index fallback)");
+  assert((await rootRes.text()).includes("LBV_SPA_ROOT"), "Root request returns the built index.html");
+
+  const spaRes = await worker.fetch(new Request("https://worker.local/dashboard", { method: "GET" }), assetEnv);
+  assert(spaRes.status === 200, "SPA navigation route returns 200 via index fallback");
+  assert((await spaRes.text()).includes("LBV_SPA_ROOT"), "SPA navigation returns the app shell");
+
+  const jsRes = await worker.fetch(new Request("https://worker.local/assets/app.js", { method: "GET" }), assetEnv);
+  assert(jsRes.status === 200 && (await jsRes.text()).includes("lbv-app"), "Hashed static asset is served directly");
+
+  const statusWithAssets = await worker.fetch(new Request("https://worker.local/api/livekit/status", { method: "GET" }), assetEnv);
+  assert(statusWithAssets.status === 200, "API route still responds when ASSETS is bound");
+  assert(Boolean(statusWithAssets.headers.get("content-type")?.includes("application/json")), "API route is not swallowed by SPA fallback");
+
+  const apiUnknownRes = await worker.fetch(new Request("https://worker.local/api/does-not-exist", { method: "GET" }), assetEnv);
+  assert(apiUnknownRes.status === 404, "Unknown API path returns 404, not the SPA shell");
+  const apiUnknownData = await apiUnknownRes.json() as any;
+  assert(apiUnknownData.code === "NOT_FOUND", "Unknown API path returns a JSON NOT_FOUND error");
+
+  const apiPostRes = await worker.fetch(new Request("https://worker.local/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }), assetEnv);
+  assert(apiPostRes.status === 400, "POST API route validation still runs with ASSETS bound");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");

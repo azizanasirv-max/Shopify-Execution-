@@ -1049,10 +1049,27 @@ data: ${JSON.stringify(data)}
       }
 
       // =========================================================================
-      // Static Assets (Cloudflare Pages / Worker Assets fallback)
+      // Static Assets (Cloudflare Workers Static Assets via the ASSETS binding)
+      //
+      // Every /api/* route is handled above and never reaches this point, so
+      // static asset handling cannot interfere with API routes. Non-asset
+      // requests are delegated to the asset binding, which applies
+      // `not_found_handling = "single-page-application"`. A defensive
+      // index.html fallback is added for GET/HEAD navigations.
       // =========================================================================
       if (env.ASSETS && typeof env.ASSETS.fetch === "function") {
-        return await env.ASSETS.fetch(request);
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+        if ((request.method === "GET" || request.method === "HEAD") && !pathname.startsWith("/api/")) {
+          const indexRequest = new Request(new URL("/index.html", request.url).toString(), { method: "GET" });
+          const indexResponse = await env.ASSETS.fetch(indexRequest);
+          if (indexResponse.status !== 404) {
+            return indexResponse;
+          }
+        }
+        return errorResponse(`Not Found: ${pathname}`, "NOT_FOUND", 404, corsHeaders);
       }
 
       return errorResponse(`Not Found: ${pathname}`, "NOT_FOUND", 404, corsHeaders);

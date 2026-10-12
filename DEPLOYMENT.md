@@ -1,125 +1,300 @@
 # LBV Sales Engine — Production Deployment Guide
 
-This document covers deployment of the LBV Sales Engine on **Cloudflare Workers** (backend API + static assets) and **Cloudflare D1** (session persistence), using **LiveKit Cloud** for real-time audio transport and transcription.
+Deployment target: **Cloudflare Workers** (API + static frontend) with **Cloudflare D1**
+(session persistence), **Groq** as the default LLM provider, and **LiveKit Cloud** for
+real-time audio/transcription.
 
-## 1. Architecture Overview
+> Status: this document describes the *verified* deployment procedure. The repository
+> currently ships an intentional **D1 placeholder** and **no secrets**; `npm run check:deploy`
+> fails until the database id is supplied. Nothing in this document deploys for you.
 
-- **Frontend (React 19 + Vite + Tailwind CSS):** Served as static assets from the Cloudflare Worker via the `[site]` bucket (`dist/`). Built via `npm run build`. Connects to LiveKit Cloud and receives real-time "SAY THIS NEXT" recommendations via Worker API calls triggered by LiveKit transcription events.
+---
 
-- **Backend Sales Engine (Cloudflare Worker / TypeScript):** Entry point: `worker.ts` (pure Web-standard Request/Response, zero Node.js runtime dependencies). Implements deterministic approval gates, product adapters (Shopify, Ghostwriter), session authorization, CORS, and sanitized error responses.
+## 1. Architecture
 
-- **LLM Provider:** Gemini via `GeminiWorkerModelProvider` (implements the `ModelProvider` interface in `lbv-sales-copilot/engine/types.ts`). Switching providers requires implementing `ModelProvider` and updating worker initialization — no engine changes needed.
+- **Frontend (React 19 + Vite + Tailwind):** built by `npm run build` into `./dist` and served
+  as Cloudflare Workers **Static Assets** through the `ASSETS` binding (`wrangler.toml [assets]`).
+- **Worker (`worker.ts`):** pure Web-standard Request/Response entry point. Handles all `/api/*`
+  routes, CORS, session auth, approval gates, and provider calls. The Worker is only invoked for
+  requests that do **not** match a static asset, so static assets never shadow the API.
+- **LLM:** provider-agnostic layer (`lbv-sales-copilot/engine/llm/`). **Groq is the default**;
+  Gemini remains selectable via `LLM_PROVIDER=gemini`.
+- **Persistence (production):** Cloudflare D1 via the `DB` binding (`CloudflareD1SessionStore`).
+  The Worker **fails closed** (HTTP 500 `STARTUP_ERROR`) if `DB` is missing in production.
+- **Persistence (local/tests):** in-memory store.
 
-- **Session Persistence (Production):** Cloudflare D1 (`CloudflareD1SessionStore`). The `DB` binding must be set in `wrangler.toml`. The worker **fails closed** (500) if `DB` is absent in production — no in-memory fallback.
+---
 
-- **Session Persistence (Dev/Test):** In-memory store (`InMemorySessionStore`).
+## 2. Prerequisites
 
-## 2. Required Configuration Before Deploying
+- Node.js 20+ and npm.
+- A Cloudflare account with Workers + D1 enabled.
+- Wrangler v4 (`npx wrangler@4 --version`) and Cloudflare authentication:
+  `npx wrangler login` (browser OAuth) or `CLOUDFLARE_API_TOKEN` with *Workers Scripts:Edit*
+  and *D1:Edit* permissions. CI uses `cloudflare/wrangler-action` with an API token secret.
+- A Groq API key (https://console.groq.com).
+- Optional: a LiveKit Cloud project for realtime features.
 
-### Secrets (set via `wrangler secret put <NAME>` — never commit to source)
+---
 
-| Secret             | Description                                     |
-|--------------------|-------------------------------------------------|
-| `GEMINI_API_KEY`   | Gemini API key for the LLM provider             |
-| `LIVEKIT_API_KEY`  | LiveKit API key                                 |
-| `LIVEKIT_API_SECRET` | LiveKit API secret                            |
-| `ADMIN_API_KEY`    | Admin API key for protected internal endpoints  |
+## 3. Configuration reference
 
-### Vars (set in Cloudflare dashboard or `wrangler.toml [vars]`)
+There are three distinct kinds of configuration. Do not mix them up.
 
-| Variable         | Description                                              |
-|------------------|----------------------------------------------------------|
-| `NODE_ENV`       | Must be `"production"` (already set in wrangler.toml)    |
-| `LIVEKIT_URL`    | LiveKit server URL (`wss://your-project.livekit.cloud`)  |
-| `ALLOWED_ORIGINS`| Comma-separated approved CORS origins                    |
+### 3a. Cloudflare Worker **secrets** (sensitive — `wrangler secret put <NAME>`)
 
-## 3. D1 Database Setup
+| Secret               | Required | Purpose                                             |
+|----------------------|----------|-----------------------------------------------------|
+| `GROQ_API_KEY`       | Yes (default provider) | Groq API key for the LLM provider       |
+| `ADMIN_API_KEY`      | Recommended | Authorization for internal test endpoints        |
+| `LIVEKIT_API_KEY`    | Realtime only | LiveKit API key                                 |
+| `LIVEKIT_API_SECRET` | Realtime only | LiveKit API secret                              |
+| `GEMINI_API_KEY`     | Only if `LLM_PROVIDER=gemini` | Gemini API key               |
 
-The `wrangler.toml` contains a **placeholder `database_id`** (`00000000-0000-0000-0000-000000000000`). Replace it with your real D1 database ID before deploying:
+### 3b. Cloudflare Worker **vars** (non-sensitive — dashboard or `wrangler.toml [vars]`)
+
+| Var                    | Default            | Purpose                                                        |
+|------------------------|--------------------|----------------------------------------------------------------|
+| `NODE_ENV`             | `"production"`     | `"production"` (or absent) ⇒ fail-closed CORS; `"development"`/`"test"` ⇒ dev CORS |
+| `LLM_PROVIDER`         | `groq`             | `groq` (default) or `gemini`                                   |
+| `LLM_MODEL`            | provider default   | e.g. Groq `llama-3.1-8b-instant`                               |
+| `LLM_TIMEOUT_MS`       | `20000`            | Per-request provider timeout                                    |
+| `LBV_MAX_TOTAL_TOKENS` | `0` (disabled)     | Global cumulative token budget for the isolate                 |
+| `LBV_MAX_REQUEST_TOKENS`| `0` (disabled)    | Per-request token cap                                          |
+| `LIVEKIT_URL`          | —                  | `wss://your-project.livekit.cloud`                             |
+| `ALLOWED_ORIGINS`      | —                  | Comma-separated approved CORS origins                          |
+
+### 3c. Cloudflare **bindings** (in `wrangler.toml`)
+
+| Binding  | Type          | Source                                             |
+|----------|---------------|----------------------------------------------------|
+| `DB`     | D1 database   | `[[d1_databases]]` — see section 5                 |
+| `ASSETS` | Static assets | `[assets]` — see section 4                         |
+
+### 3d. Local `.env` (development only)
+
+`.env` (copied from `.env.example`) is used **only** by local tooling (`npm run dev`, `npm run test:*`).
+The Worker never reads a `.env` file; in production it reads the secrets/vars/bindings above.
+
+---
+
+## 4. Static assets configuration
+
+The repository uses modern **Workers Static Assets** (not the legacy Workers Sites `[site]`):
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+```
+
+Behavior (verified with `wrangler deploy --dry-run`):
+- Wrangler reads the built files from `./dist` and exposes them via `env.ASSETS`.
+- The Worker script is invoked **only** for requests that do not match an asset, so `/api/*`
+  always reaches `worker.ts` and cannot be shadowed by the SPA.
+- `not_found_handling = "single-page-application"` serves `index.html` for client-side routes
+  (e.g. `/dashboard`). `worker.ts` also has a defensive `index.html` fallback for `GET`/`HEAD`
+  navigations, and returns JSON `404 NOT_FOUND` for unknown `/api/*` paths (never the SPA shell).
+
+> The frontend is **not** considered deployed just because the Worker bundles. Confirm the asset
+> upload and the served HTML during the post-deployment checks (section 11).
+
+---
+
+## 5. D1 setup and migration sequence
+
+`wrangler.toml` ships an **intentional placeholder** `database_id`. The build will not stop you,
+so the guard script does:
 
 ```bash
-# Create the D1 database and note the database_id in output
-wrangler d1 create lbv-sales-sessions
-
-# Edit wrangler.toml: replace the placeholder database_id with the real one
-
-# Apply D1 schema migrations
-wrangler d1 migrations apply lbv-sales-sessions --remote
+npm run check:deploy   # FAILS (exit 1) while the placeholder is present
 ```
 
-## 4. CORS Configuration
-
-In production (or when `NODE_ENV` is absent in a Cloudflare Worker environment), CORS is fail-closed: requests with missing or untrusted origins receive `Access-Control-Allow-Origin: null`. Absent `NODE_ENV` in a Worker environment is treated as production — permissive dev CORS is never accidentally enabled.
-
-Set `ALLOWED_ORIGINS` to your production frontend domains:
-```
-ALLOWED_ORIGINS=https://your-store.myshopify.com,https://dashboard.yourdomain.com
-```
-
-## 5. Deployment Steps
+Safe sequence (run by the project owner, with Cloudflare credentials — never automated in CI):
 
 ```bash
-# Install dependencies
+# 1. Authenticate
+npx wrangler login
+
+# 2. Create the database (records its real database_id). DO NOT do this in CI.
+npx wrangler d1 create lbv-sales-sessions
+
+# 3. Put the REAL database_id into wrangler.toml (replace the 00000000-... placeholder).
+#    Keep it explicit per environment; do not reuse another environment's id.
+
+# 4. Apply the schema migrations to the remote database.
+npx wrangler d1 migrations apply lbv-sales-sessions --remote
+
+# 5. Confirm the guard now passes
+npm run check:deploy
+```
+
+Schema (preserved as-is): `migrations/0001_sessions_schema.sql` creates `sessions` and
+`conversation_turns` (with `ON DELETE CASCADE` and lookup indexes). Session/turn semantics are
+unchanged. Migrations are **forward-only**; take a D1 backup (`wrangler d1 export`) before future
+schema changes.
+
+> Do not invent or hardcode a database id. For multiple environments, use Wrangler environments
+> (`[env.staging]`, `[env.production]`) each with its own explicit `database_id`.
+
+---
+
+## 6. LLM provider (Groq default)
+
+Groq is the initial/default provider. The Worker selects it via `LLM_PROVIDER` (default `groq`) and
+reads `GROQ_API_KEY` from the secret binding. Details:
+
+- **Default model:** `llama-3.1-8b-instant` (override with `LLM_MODEL`).
+- **Auth:** sent only via the `Authorization: Bearer` header — never in the URL, never logged.
+- **Errors:** HTTP 429 → rate-limit error; other non-2xx → provider error; timeouts via `LLM_TIMEOUT_MS`.
+- **Fail closed:** if the selected provider's key is missing, the engine returns a `BLOCKED`
+  recommendation with the safe fallback (no crash, no unapproved text).
+- **Gemini remains selectable:** set `LLM_PROVIDER=gemini` and provide `GEMINI_API_KEY` (sent via the
+  `x-goog-api-key` header).
+- **Token budget:** `LBV_MAX_TOTAL_TOKENS` / `LBV_MAX_REQUEST_TOKENS` (0 disables). Exceeding the
+  budget yields a `BLOCKED` (fail-closed) recommendation and records usage in `engineMetadata.usage`.
+
+```bash
+npx wrangler secret put GROQ_API_KEY
+# Optional: npx wrangler secret put GEMINI_API_KEY   (only for LLM_PROVIDER=gemini)
+```
+
+---
+
+## 7. CORS / allowed origins
+
+CORS is **fail-closed** in production: when `NODE_ENV` is `"production"` *or absent in a Worker*,
+unapproved or missing origins receive `Access-Control-Allow-Origin: null`. Only explicit
+`ALLOWED_ORIGINS` entries are reflected. Development wildcard CORS requires an explicit
+`NODE_ENV=development`.
+
+Set `ALLOWED_ORIGINS` to your real frontend origins (comma-separated), e.g.:
+```
+ALLOWED_ORIGINS=https://lbv-sales-copilot.example.workers.dev,https://dashboard.example.com
+```
+
+---
+
+## 8. Administrative authentication
+
+The internal test/evaluation endpoints (`/api/run-adversarial-tests`, `/api/run-stage2-validation`,
+`/api/save-baseline`, `/api/load-baseline`) are:
+- **disabled (404 `ENDPOINT_DISABLED_IN_PRODUCTION`) in production**, including when `NODE_ENV` is absent; and
+- otherwise require the `X-Admin-Token`/`Authorization` value to equal `ADMIN_API_KEY` (403 otherwise).
+
+```bash
+npx wrangler secret put ADMIN_API_KEY
+```
+
+---
+
+## 9. LiveKit configuration
+
+Realtime token issuance and the transcript ingress require LiveKit credentials. Set `LIVEKIT_URL`
+as a var and the key/secret as secrets:
+
+```bash
+npx wrangler secret put LIVEKIT_API_KEY
+npx wrangler secret put LIVEKIT_API_SECRET
+```
+
+The LiveKit server URL is non-sensitive and can live in `[vars]` or the dashboard. LiveKit +
+AssemblyAI end-to-end integration is a separate, mandatory post-deployment phase.
+
+---
+
+## 10. Build and deploy sequence
+
+```bash
+# 0. Install dependencies
 npm install --legacy-peer-deps
 
-# TypeScript check (must pass with 0 errors)
-node_modules/.bin/tsc --noEmit
+# 1. TypeScript check (must be 0 errors)
+npm run lint
 
-# Run the complete deterministic validation suite (all eight suites).
-# See section 5.1 for per-suite commands.
-GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts hardening
+# 2. Full deterministic test suite (offline; no real API key required)
+npm test            # = tsx run-tests.ts hardening (all 10 suites)
 
-# Build static assets
-npm run build
+# 3. Build the frontend
+npm run build       # -> ./dist
 
-# Deploy to Cloudflare Workers
-wrangler deploy
+# 4. Authenticate
+npx wrangler login
+
+# 5. Ensure D1 is configured (section 5) and the guard passes
+npm run check:deploy
+
+# 6. Dry-run (bundles the Worker and reads ./dist assets; uploads nothing)
+npm run deploy:dry-run
+
+# 7. Deploy (predeploy runs check:deploy automatically and blocks on the placeholder)
+npm run deploy
 ```
 
-## 5.1 Running the Validation Test Suites
+Expected `deploy:dry-run` output includes the asset directory and bindings:
+```
+✨ Read N files from the assets directory .../dist
+env.DB (lbv-sales-sessions)            D1 Database
+env.ASSETS                             Assets
+env.NODE_ENV ("production")            Environment Variable
+```
 
-The test runner is `run-tests.ts`, invoked through `tsx`. For the deterministic suites below, `GEMINI_API_KEY=dummy` is sufficient. The separate `adversarial`, `stage2`, and `classification` commands require a real `GEMINI_API_KEY` and are not part of the eight deterministic validation suites.
+---
 
-### Run the complete suite (all eight suites)
-
-There **is** a single command that runs all eight deterministic validation suites in one process:
+## 11. Post-deployment health checks
 
 ```bash
-GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts hardening
-# or, equivalently:
-GEMINI_API_KEY=dummy npm run test:hardening
+# Worker is up and LiveKit config is reported (no auth required)
+curl -s https://<worker-host>/api/livekit/status
+
+# The frontend is actually served (HTML, not JSON / not 404)
+curl -sI https://<worker-host>/ | head -n 1
+curl -s  https://<worker-host>/ | grep -q '<div id="root">' && echo 'SPA shell OK'
+
+# SPA deep link falls back to the app shell
+curl -s https://<worker-host>/dashboard | grep -q '<div id="root">' && echo 'SPA fallback OK'
+
+# Unknown API path returns JSON 404 (not the SPA shell)
+curl -s https://<worker-host>/api/does-not-exist
+
+# Internal endpoints are disabled in production
+curl -s -o /dev/null -w '%{http_code}\n' https://<worker-host>/api/load-baseline
 ```
 
-> **Naming note:** despite its name, the `hardening` command is **not** hardening-only. Its handler runs all eight suites (hardening unit, approval gate, adapter isolation, session access control, realtime, session persistence, D1 persistence, and worker integration). There is currently no command that runs the hardening suite by itself.
+Also verify in the Cloudflare dashboard: the D1 binding `DB` points at the expected database, and
+the Worker shows the `ASSETS` binding. If the SPA shell is missing, the frontend was not uploaded —
+re-run `npm run build` then `npm run deploy` (do not assume success from the Worker bundle alone).
 
-### Run the individual suites
+---
 
-| # | Suite | Command |
-|---|-------|---------|
-| 1 | Hardening unit tests | *(no standalone command — runs only as part of `hardening`)* |
-| 2 | Approval gate | `npm run test:approval-gate` |
-| 3 | Adapter isolation | `npm run test:isolation` |
-| 4 | Session access control | `GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts access-control` |
-| 5 | Realtime (LiveKit) | `GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts realtime` |
-| 6 | Session persistence | `GEMINI_API_KEY=dummy node_modules/.bin/tsx run-tests.ts persistence` |
-| 7 | D1 persistence | `npm run test:d1` |
-| 8 | Worker integration | `npm run test:worker` |
+## 12. Rollback
 
-## 6. Switching LLM Providers
+- **Worker code:** `npx wrangler rollback` (reverts to the previous deployment), or redeploy a known
+  good commit with `npm run deploy`.
+- **Static assets:** rolled back together with the Worker version (assets are part of the deployment).
+- **D1:** migrations are forward-only. Restore data with `wrangler d1 export` backups; do not run
+  destructive SQL in production. Test schema changes on a non-production database first.
 
-The `ModelProvider` interface decouples the engine from Gemini. To switch (e.g., to Groq or another OpenAI-compatible endpoint):
-1. Implement `ModelProvider` in a new file (e.g., `lbv-sales-copilot/engine/groq-provider.ts`).
-2. Update provider instantiation in `worker.ts`.
-3. Add the new API key as a Worker Secret.
-No changes to engine, adapters, or session management are needed.
+---
 
-## 7. Remaining Blockers for Production
+## 13. CI
 
-The following must be supplied by the project owner before going live:
+`.github/workflows/ci.yml` runs on every push/PR to `main`: TypeScript check, the full deterministic
+test suite (with a **dummy** Gemini value only), the production build, and a Wrangler dry-run.
+CI never deploys and never uses real secrets. A deploy workflow is intentionally not included;
+deployment is performed manually by the owner after `npm run check:deploy` passes.
 
-- **Real D1 `database_id`** — replace placeholder UUID in `wrangler.toml`
-- **`GEMINI_API_KEY`** — `wrangler secret put GEMINI_API_KEY`
-- **`LIVEKIT_API_KEY`** and **`LIVEKIT_API_SECRET`** — `wrangler secret put`
-- **`LIVEKIT_URL`** — set in Cloudflare dashboard vars
-- **`ADMIN_API_KEY`** — `wrangler secret put ADMIN_API_KEY`
-- **`ALLOWED_ORIGINS`** — set in Cloudflare dashboard vars with production frontend domains
+---
+
+## 14. Remaining manual steps (require Cloudflare/credential access)
+
+1. Create the D1 database and set the real `database_id` (section 5).
+2. Apply remote migrations (section 5).
+3. Create the Worker secrets: `GROQ_API_KEY`, `ADMIN_API_KEY`, and LiveKit secrets (sections 3, 6, 9).
+4. Set vars: `ALLOWED_ORIGINS`, `LIVEKIT_URL`, and any `LLM_*`/token-budget overrides.
+5. Run the deployment sequence (section 10) and the health checks (section 11).
+6. Configure a `CLOUDFLARE_API_TOKEN` GitHub secret only if you later add a deploy workflow.
+
+These cannot be automated from the repository without live credentials and are deliberately not
+attempted here.
