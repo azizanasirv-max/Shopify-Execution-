@@ -17,6 +17,7 @@ import { ShopifySalesAdapter } from "./lbv-sales-copilot/sales-api/shopify-adapt
 import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwriter-adapter.js";
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
 import { AdapterRegistry } from "./lbv-sales-copilot/engine/adapter-registry.js";
+import { registerServiceProfiles } from "./lbv-sales-copilot/sales-api/profiles/index.js";
 import {
   SessionManager,
   SessionNotFoundError,
@@ -175,6 +176,8 @@ export function createWorkerServices(env: Env) {
   const adapterRegistry = new AdapterRegistry();
   adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
   adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
+  // Service-profile adapters (data-driven). Adding a service = adding a profile.
+  registerServiceProfiles(adapterRegistry);
 
   // 2. Authoritative Session Store Selection (D1 authoritative, zero fallback in production)
   let sessionStore: SessionStore;

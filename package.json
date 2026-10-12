@@ -16,7 +16,8 @@
     "test:worker": "tsx run-tests.ts worker",
     "test:adversarial": "tsx run-tests.ts adversarial",
     "test:stage2": "tsx run-tests.ts stage2",
-    "test:llm": "tsx run-tests.ts llm"
+    "test:llm": "tsx run-tests.ts llm",
+    "test:service": "tsx run-tests.ts service"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

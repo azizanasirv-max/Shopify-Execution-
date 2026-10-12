@@ -10,3 +10,6 @@ export * from "./session-manager.js";
 export * from "./adapter-registry.js";
 export { ShopifySalesAdapter } from "../sales-api/shopify-adapter.js";
 export { GhostwriterSalesAdapter } from "../sales-api/ghostwriter-adapter.js";
+export * from "./service-profile.js";
+export * from "./master-sales-template.js";
+export * from "./profile-adapter.js";
