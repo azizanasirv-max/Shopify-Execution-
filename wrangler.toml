@@ -25,13 +25,13 @@ NODE_ENV = "production"
 # ---------------------------------------------------------------------------
 # D1 session persistence
 #
-# database_id below is an intentional PLACEHOLDER. It is NOT production-ready.
-# `npm run check:deploy` fails while this placeholder is present, so the Worker
-# cannot be deployed against a non-existent database by accident.
-# See DEPLOYMENT.md section "D1 setup" for the safe sequence.
+# Production database: lbv-sales-sessions (binding "DB").
+# The id below is the real production database id (a resource identifier, not a
+# secret). `npm run check:deploy` still fails if a placeholder id is ever
+# reintroduced. See DEPLOYMENT.md section 5 for the migration sequence.
 # ---------------------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"
 database_name = "lbv-sales-sessions"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "b1e94824-0128-4b48-9b88-89827a126acb"
 migrations_dir = "migrations"
