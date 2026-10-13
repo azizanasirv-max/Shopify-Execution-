@@ -175,7 +175,7 @@ jobs:
           WORKING_DIRECTORY: agent
 
       - name: Wait for the agent to reach the Running state
-        if: steps.op.outputs.operation != 'skip'
+        if: steps.op.outputs.operation == 'deploy'
         uses: livekit/deploy-action@v2.12.2
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
