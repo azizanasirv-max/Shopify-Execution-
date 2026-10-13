@@ -342,18 +342,35 @@ export default function Page() {
     setError(null);
     setResult(null);
     try {
+      let currentSessId = sessionId;
+      let currentSessTok = sessionToken;
+      if (!currentSessId || !currentSessTok) {
+        const createRes = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ productId: selectedProductAdapter })
+        });
+        if (createRes.ok) {
+          const createData = await createRes.json();
+          currentSessId = createData.sessionId;
+          currentSessTok = createData.sessionToken;
+          setSessionId(currentSessId);
+          setSessionToken(currentSessTok);
+        }
+      }
+
       const res = await fetch("/api/copilot", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(sessionToken ? { "x-session-token": sessionToken } : {})
+          ...(currentSessTok ? { "x-session-token": currentSessTok } : {})
         },
         body: JSON.stringify({ 
           prompt: customPrompt, 
           scenarioId: selectedScenarioId,
           productId: selectedProductAdapter,
-          sessionId: sessionId || undefined,
-          sessionToken: sessionToken || undefined
+          sessionId: currentSessId || undefined,
+          sessionToken: currentSessTok || undefined
         })
       });
       if (!res.ok) {
