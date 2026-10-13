@@ -1,0 +1,23 @@
+{
+  "name": "lbv-livekit-agent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "LBV Sales Engine LiveKit Agent: joins a room, transcribes audio with the direct AssemblyAI API, and publishes transcription events into the room so the salesperson UI receives them.",
+  "scripts": {
+    "dev": "tsx agent.ts dev",
+    "start": "tsx agent.ts start",
+    "download-files": "tsx agent.ts download-files",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@livekit/agents": "^1.9.2",
+    "@livekit/agents-plugin-assemblyai": "^1.9.2",
+    "@livekit/agents-plugin-silero": "^1.9.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2",
+    "@types/node": "^22.14.0"
+  }
+}

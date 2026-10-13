@@ -32,9 +32,14 @@ export default function ProspectCall() {
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<HTMLAudioElement[]>([]);
 
-  const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
-  const sessionId = params.get("sessionId") || "";
-  const inviteToken = params.get("token") || "";
+  // Capture the invitation ONCE (the URL is rewritten after validation so the
+  // token does not linger in the address bar / history / referrer).
+  const [invite] = useState(() => {
+    const p = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
+    return { sessionId: p.get("sessionId") || "", token: p.get("token") || "" };
+  });
+  const sessionId = invite.sessionId;
+  const inviteToken = invite.token;
 
   // 1. Validate the invitation (no private data is returned).
   useEffect(() => {
@@ -55,6 +60,13 @@ export default function ProspectCall() {
           return;
         }
         setProductName(data.productName || null);
+        // Remove the invitation token from the address bar/history now that it
+        // has been validated (reduces exposure via history, screenshots, referrer).
+        try {
+          if (typeof window !== "undefined" && window.location.search.includes("token=")) {
+            window.history.replaceState({}, "", `${window.location.pathname}?join=1`);
+          }
+        } catch {}
         setPhase("ready");
       } catch (err: any) {
         if (cancelled) return;

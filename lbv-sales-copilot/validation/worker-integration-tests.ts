@@ -669,6 +669,45 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   assert(sawRateLimit, "Abusive session creation is rejected with 429");
   assert(rateLimitCode === "RATE_LIMITED", "Rate-limited creation returns RATE_LIMITED");
 
+  // -------------------------------------------------------------
+  // TEST 18: PR #9 fixes — copilot abuse guard, call revocation, token hygiene
+  // -------------------------------------------------------------
+  console.log("\n[18] Testing copilot abuse guard, call revocation, and token hygiene...");
+
+  // 18a: unauthenticated /api/copilot creation is bounded by the same limit
+  const copilotRateEnv: Env = { DB: new MockD1Database(), ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const copilotBody = JSON.stringify({ productId: "shopify", prompt: "What is the price?" });
+  let copilotRateLimited = false;
+  for (let i = 0; i < 70; i++) {
+    const r = await worker.fetch(new Request("https://worker.local/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: copilotBody }), copilotRateEnv);
+    if (r.status === 429) { copilotRateLimited = true; break; }
+  }
+  assert(copilotRateLimited, "Unauthenticated /api/copilot session creation is rate-limited (no bypass)");
+
+  // 18b: ending a session revokes the invitation
+  const endCreateRes = await worker.fetch(new Request("https://worker.local/api/sessions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ productId: "shopify" })
+  }), testEnv);
+  const endSession = await endCreateRes.json() as any;
+  const endDeleteRes = await worker.fetch(new Request(`https://worker.local/api/sessions/${encodeURIComponent(endSession.sessionId)}`, {
+    method: "DELETE", headers: { "x-session-token": endSession.sessionToken }
+  }), testEnv);
+  const endDeleteData = await endDeleteRes.json() as any;
+  assert(endDeleteRes.status === 200 && endDeleteData.invitationRevoked === true, "Ending a session revokes the invitation");
+  assert(endDeleteData.liveKitRoomClosed === false, "Room teardown reports false when LiveKit is not configured (no false claim)");
+
+  const afterEndInviteRes = await worker.fetch(new Request(`https://worker.local/api/livekit/invite?sessionId=${encodeURIComponent(endSession.sessionId)}&token=${encodeURIComponent(endSession.inviteToken)}`, { method: "GET" }), testEnv);
+  assert(afterEndInviteRes.status === 404, "Invitation no longer validates after the session is ended");
+
+  const afterEndTokenRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite-token", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: endSession.sessionId, inviteToken: endSession.inviteToken })
+  }), testEnv);
+  assert(afterEndTokenRes.status === 404, "A revoked invitation cannot mint a new prospect token");
+
+  // 18c: token hygiene headers on invitation responses
+  assert(invValidateRes.headers.get("Referrer-Policy") === "no-referrer", "Invitation responses set Referrer-Policy: no-referrer");
+  assert(invValidateRes.headers.get("Cache-Control") === "no-store", "Invitation responses set Cache-Control: no-store");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");

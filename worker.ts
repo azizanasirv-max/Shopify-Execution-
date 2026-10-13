@@ -16,6 +16,7 @@ import { GenericSalesEngine } from "./lbv-sales-copilot/engine/generic-sales-eng
 import { ShopifySalesAdapter } from "./lbv-sales-copilot/sales-api/shopify-adapter.js";
 import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwriter-adapter.js";
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
+import { RoomServiceClient } from "livekit-server-sdk";
 import { AdapterRegistry } from "./lbv-sales-copilot/engine/adapter-registry.js";
 import { registerServiceProfiles } from "./lbv-sales-copilot/sales-api/profiles/index.js";
 import {
@@ -314,7 +315,11 @@ function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Session-Token, X-Session-Id, X-Admin-Token",
-    "Access-Control-Max-Age": "86400"
+    "Access-Control-Max-Age": "86400",
+    // Do not leak invitation/session URLs (which may contain tokens) to third
+    // parties, and never cache API responses containing tokens.
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store"
   };
 }
 
@@ -486,6 +491,64 @@ function isValidInvite(session: any, provided: unknown): boolean {
 }
 
 /**
+ * Durable session-creation guard shared by every route that can create a
+ * session (POST /api/sessions AND the unauthenticated POST /api/copilot
+ * fallback). Returns a 429 Response when the window limit is exceeded, or null
+ * when creation may proceed.
+ */
+async function enforceSessionCreationLimit(
+  sessionManager: SessionManager,
+  corsHeaders: Record<string, string>
+): Promise<Response | null> {
+  const store: any = sessionManager.getStore();
+  if (!store || typeof store.countSessionsCreatedSince !== "function") return null;
+  try {
+    const recent = await store.countSessionsCreatedSince(Date.now() - SESSION_CREATION_WINDOW_MS);
+    if (recent >= SESSION_CREATION_MAX_PER_WINDOW) {
+      return errorResponse(
+        "Too many sessions created recently. Please retry shortly.",
+        "RATE_LIMITED",
+        429,
+        corsHeaders
+      );
+    }
+  } catch (limitErr) {
+    // Do not block all legitimate traffic on a transient limiter error.
+    console.error("[Worker] Session rate-limit check failed:", limitErr);
+  }
+  return null;
+}
+
+function liveKitHttpHost(serverUrl: string): string {
+  return serverUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
+}
+
+/**
+ * Terminates the LiveKit room for a session (best effort).
+ *
+ * Deleting the D1 session record revokes the INVITATION (no new token can be
+ * issued) but does NOT invalidate an already-issued LiveKit JWT. Deleting the
+ * room is what actually stops participation and prevents rejoining with a
+ * previously issued token. Returns true only when the LiveKit API call succeeds.
+ */
+async function terminateLiveKitRoom(env: Env, roomName: string): Promise<boolean> {
+  try {
+    const apiKey = env.LIVEKIT_API_KEY || (typeof process !== "undefined" ? process.env.LIVEKIT_API_KEY : undefined);
+    const apiSecret = env.LIVEKIT_API_SECRET || (typeof process !== "undefined" ? process.env.LIVEKIT_API_SECRET : undefined);
+    const serverUrl = env.LIVEKIT_URL || (typeof process !== "undefined" ? process.env.LIVEKIT_URL : undefined);
+    if (!apiKey || !apiSecret || !serverUrl || apiKey.includes("MY_") || apiSecret.includes("MY_")) {
+      return false;
+    }
+    const roomService = new RoomServiceClient(liveKitHttpHost(serverUrl), apiKey, apiSecret);
+    await roomService.deleteRoom(roomName);
+    return true;
+  } catch (err: any) {
+    console.error("[Worker] LiveKit room teardown failed:", err?.message || err);
+    return false;
+  }
+}
+
+/**
  * Retention window for scheduled session cleanup.
  *
  * Sessions idle beyond the SessionManager TTL (1h) are already rejected on
@@ -604,6 +667,10 @@ export default {
         const targetAdapter = adapterRegistry.resolve(targetProductId);
 
         if (!session) {
+          // This route is unauthenticated and can create a session, so it must
+          // honour the same durable creation limit as POST /api/sessions.
+          const copilotLimit = await enforceSessionCreationLimit(sessionManager, corsHeaders);
+          if (copilotLimit) return copilotLimit;
           session = await sessionManager.createSessionAsync(targetAdapter.id, { inviteToken: generateInviteToken() });
         }
 
@@ -741,23 +808,8 @@ export default {
         const adapter = adapterRegistry.resolve(productId);
 
         // Durable abuse guard: bound how many sessions can be created per window.
-        const creationStore: any = sessionManager.getStore();
-        if (creationStore && typeof creationStore.countSessionsCreatedSince === "function") {
-          try {
-            const recent = await creationStore.countSessionsCreatedSince(Date.now() - SESSION_CREATION_WINDOW_MS);
-            if (recent >= SESSION_CREATION_MAX_PER_WINDOW) {
-              return errorResponse(
-                "Too many sessions created recently. Please retry shortly.",
-                "RATE_LIMITED",
-                429,
-                corsHeaders
-              );
-            }
-          } catch (limitErr) {
-            // Do not block all legitimate traffic on a transient limiter error.
-            console.error("[Worker] Session rate-limit check failed:", limitErr);
-          }
-        }
+        const createLimit = await enforceSessionCreationLimit(sessionManager, corsHeaders);
+        if (createLimit) return createLimit;
 
         const inviteToken = generateInviteToken();
         const session = await sessionManager.createSessionAsync(adapter.id, { inviteToken });
@@ -910,11 +962,29 @@ export default {
         }
 
         try {
+          // Capture the room name BEFORE deletion so we can tear the room down.
+          const sessionBeforeDelete = await sessionManager.getSessionAsync(sessionId);
+          const roomNameToClose = sessionBeforeDelete?.roomName;
+
           const deleted = await sessionManager.deleteSessionAsync(sessionId, token);
           if (!deleted) {
             return errorResponse("Session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
           }
-          return jsonResponse({ success: true, message: `Session ${sessionId} deleted.` }, 200, corsHeaders);
+
+          // Revoke live access: deleting the D1 record revokes the invitation but
+          // not already-issued JWTs, so the room is deleted explicitly.
+          const roomClosed = roomNameToClose ? await terminateLiveKitRoom(env, roomNameToClose) : false;
+
+          return jsonResponse(
+            {
+              success: true,
+              message: `Session ${sessionId} deleted.`,
+              invitationRevoked: true,
+              liveKitRoomClosed: roomClosed
+            },
+            200,
+            corsHeaders
+          );
         } catch (err: any) {
           if (err instanceof UnauthorizedSessionAccessError || err.code === "UNAUTHORIZED_SESSION_ACCESS") {
             return errorResponse(err.message, "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
