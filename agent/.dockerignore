@@ -1,0 +1,29 @@
+# Keep the LiveKit Cloud build context small (1 GB upload limit).
+# node_modules is reinstalled inside the image by `npm ci`.
+
+# Node.js dependencies
+node_modules
+npm-debug.log
+
+# Environment variables - never ship secrets in the image
+.env
+.env.*
+.env.local
+.env.example
+
+# Local tooling output
+*.log
+.tmp
+.cache
+
+# VCS, editor, OS
+.git
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+.DS_Store
+
+# Docs
+README.md
