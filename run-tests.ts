@@ -15,17 +15,31 @@ import { runRealtimeValidationTests } from "./lbv-sales-copilot/validation/livek
 import { runSessionPersistenceTests } from "./lbv-sales-copilot/validation/session-persistence-tests.js";
 import { runD1PersistenceTests } from "./lbv-sales-copilot/validation/d1-persistence-tests.js";
 import { runWorkerIntegrationTests } from "./lbv-sales-copilot/validation/worker-integration-tests.js";
+import { runLlmProviderTests } from "./lbv-sales-copilot/validation/llm-provider-tests.js";
+import { runServiceProfileTests } from "./lbv-sales-copilot/validation/service-profile-tests.js";
 
 dotenv.config();
 
-const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-  console.error("Error: GEMINI_API_KEY environment variable is not set. Please add it to your .env file.");
-  process.exit(1);
+const apiKey = process.env.GEMINI_API_KEY || "";
+
+/**
+ * Only the live-model suites (adversarial, stage2, classification) require a
+ * real Gemini API key. The deterministic suites (hardening, isolation,
+ * approval-gate, worker, d1, persistence, realtime, llm, service) run fully
+ * offline and MUST NOT require a real key. A placeholder value (e.g. "dummy")
+ * is accepted for those offline suites.
+ */
+function requireGeminiApiKeyForLiveSuites(): void {
+  if (!apiKey || apiKey === "dummy" || apiKey === "MY_GEMINI_API_KEY") {
+    console.error(
+      "Error: a real GEMINI_API_KEY is required for the live-model suites (adversarial, stage2, classification)."
+    );
+    process.exit(1);
+  }
 }
 
 const ai = new GoogleGenAI({
-  apiKey,
+  apiKey: apiKey || "offline-suite-placeholder",
   httpOptions: {
     headers: {
       "User-Agent": "aistudio-build-cli-v2.1",
@@ -88,10 +102,13 @@ async function executeGroundedCallWithRetry(promptText: string, testProspectData
 const command = process.argv[2] || "adversarial";
 
 if (command === "adversarial") {
+  requireGeminiApiKeyForLiveSuites();
   runAdversarialSuite();
 } else if (command === "stage2") {
+  requireGeminiApiKeyForLiveSuites();
   runStage2Suite();
 } else if (command === "classification") {
+  requireGeminiApiKeyForLiveSuites();
   runClassificationUnitTests();
 } else if (command === "approval-gate") {
   runApprovalGateUnitTests().then(summary => {
@@ -121,6 +138,14 @@ if (command === "adversarial") {
   runWorkerIntegrationTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "llm" || command === "llm-provider" || command === "provider") {
+  runLlmProviderTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
+} else if (command === "service" || command === "service-profile" || command === "profiles") {
+  runServiceProfileTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
 } else if (command === "hardening" || command === "unit" || command === "engine") {
   Promise.all([
     runHardeningUnitTests(),
@@ -130,9 +155,11 @@ if (command === "adversarial") {
     runRealtimeValidationTests(),
     runSessionPersistenceTests(),
     runD1PersistenceTests(),
-    runWorkerIntegrationTests()
-  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8]) => {
-    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed;
+    runWorkerIntegrationTests(),
+    runLlmProviderTests(),
+    runServiceProfileTests()
+  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed + s10.failed;
     process.exit(totalFailed === 0 ? 0 : 1);
   });
 } else {

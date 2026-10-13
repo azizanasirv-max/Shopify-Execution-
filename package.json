@@ -15,7 +15,14 @@
     "test:d1": "tsx run-tests.ts d1",
     "test:worker": "tsx run-tests.ts worker",
     "test:adversarial": "tsx run-tests.ts adversarial",
-    "test:stage2": "tsx run-tests.ts stage2"
+    "test:stage2": "tsx run-tests.ts stage2",
+    "test:llm": "tsx run-tests.ts llm",
+    "test:service": "tsx run-tests.ts service",
+    "check:deploy": "node scripts/check-deploy-config.mjs",
+    "deploy:dry-run": "npx wrangler deploy --dry-run",
+    "deploy": "npx wrangler deploy",
+    "predeploy": "node scripts/check-deploy-config.mjs",
+    "test": "tsx run-tests.ts hardening"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

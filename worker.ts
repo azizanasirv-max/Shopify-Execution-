@@ -17,6 +17,7 @@ import { ShopifySalesAdapter } from "./lbv-sales-copilot/sales-api/shopify-adapt
 import { GhostwriterSalesAdapter } from "./lbv-sales-copilot/sales-api/ghostwriter-adapter.js";
 import { LiveKitRealtimeAdapter } from "./lbv-sales-copilot/engine/realtime-adapter.js";
 import { AdapterRegistry } from "./lbv-sales-copilot/engine/adapter-registry.js";
+import { registerServiceProfiles } from "./lbv-sales-copilot/sales-api/profiles/index.js";
 import {
   SessionManager,
   SessionNotFoundError,
@@ -27,6 +28,13 @@ import {
   SessionStore
 } from "./lbv-sales-copilot/engine/session-manager.js";
 import { ModelProvider } from "./lbv-sales-copilot/engine/types.js";
+import {
+  createLlmProvider,
+  resolveProviderId,
+  LegacyModelProviderAdapter,
+  TokenBudget,
+  UsageTracker
+} from "./lbv-sales-copilot/engine/llm/index.js";
 
 export interface Env {
   DB?: any; // Cloudflare D1
@@ -38,6 +46,14 @@ export interface Env {
   NODE_ENV?: string;
   LBV_SESSION_STORE?: string;
   ALLOWED_ORIGINS?: string;
+  // Provider-agnostic LLM configuration (Groq is the default provider).
+  LLM_PROVIDER?: string;
+  LLM_MODEL?: string;
+  LLM_TIMEOUT_MS?: string;
+  GROQ_API_KEY?: string;
+  /** Optional global cumulative token budget (0/unset disables enforcement). */
+  LBV_MAX_TOTAL_TOKENS?: string;
+  LBV_MAX_REQUEST_TOKENS?: string;
   ASSETS?: { fetch: (request: Request) => Promise<Response> };
 }
 
@@ -160,6 +176,8 @@ export function createWorkerServices(env: Env) {
   const adapterRegistry = new AdapterRegistry();
   adapterRegistry.register(shopifyAdapter, ["shopify", "shopify-pilot", "shopify-conversion"]);
   adapterRegistry.register(ghostwriterAdapter, ["ghostwriter", "ghostwriting", "executive-ghostwriter"]);
+  // Service-profile adapters (data-driven). Adding a service = adding a profile.
+  registerServiceProfiles(adapterRegistry);
 
   // 2. Authoritative Session Store Selection (D1 authoritative, zero fallback in production)
   let sessionStore: SessionStore;
@@ -177,22 +195,45 @@ export function createWorkerServices(env: Env) {
 
   const sessionManager = new SessionManager({ store: sessionStore });
 
-  // 3. Model Provider
-  const apiKey = env.GEMINI_API_KEY || (typeof process !== "undefined" ? process.env.GEMINI_API_KEY : "") || "";
-  const modelProvider: ModelProvider = apiKey
-    ? new GeminiWorkerModelProvider(apiKey)
+  // 3. Model Provider (provider-agnostic; Groq is the initial/default provider)
+  const providerEnv = {
+    LLM_PROVIDER: env.LLM_PROVIDER,
+    LLM_MODEL: env.LLM_MODEL,
+    LLM_TIMEOUT_MS: env.LLM_TIMEOUT_MS,
+    GROQ_API_KEY: env.GROQ_API_KEY || (typeof process !== "undefined" ? process.env.GROQ_API_KEY : undefined),
+    GEMINI_API_KEY: env.GEMINI_API_KEY || (typeof process !== "undefined" ? process.env.GEMINI_API_KEY : undefined)
+  };
+  const llmProvider = createLlmProvider(providerEnv);
+  const providerId = llmProvider ? llmProvider.id : resolveProviderId(providerEnv);
+  const modelProvider: ModelProvider = llmProvider
+    ? new LegacyModelProviderAdapter(llmProvider)
     : {
         generateContent: async () => {
-          throw new Error("GEMINI_API_KEY is not configured in Worker environment.");
+          throw new Error(
+            `LLM provider '${providerId}' is not configured. Set the corresponding API key as a Worker secret.`
+          );
         }
       };
+
+  const usageTracker = new UsageTracker();
+  const maxTotalTokens = env.LBV_MAX_TOTAL_TOKENS ? parseInt(env.LBV_MAX_TOTAL_TOKENS, 10) : 0;
+  const maxRequestTokens = env.LBV_MAX_REQUEST_TOKENS ? parseInt(env.LBV_MAX_REQUEST_TOKENS, 10) : 0;
+  const tokenBudget = new TokenBudget({
+    maxTotalTokens: Number.isFinite(maxTotalTokens) ? maxTotalTokens : 0,
+    maxRequestTokens: Number.isFinite(maxRequestTokens) ? maxRequestTokens : 0
+  });
 
   // 4. Generic Sales Engine
   const salesEngine = new GenericSalesEngine({
     modelProvider,
-    modelName: "gemini-3.1-flash-lite",
+    modelName: env.LLM_MODEL || (llmProvider ? llmProvider.defaultModel : "llama-3.1-8b-instant"),
     defaultAdapter: shopifyAdapter,
-    adapterRegistry
+    adapterRegistry,
+    providerId,
+    tokenBudget,
+    usageTracker,
+    deterministicRouting: true,
+    conciseOutput: { enabled: true, minWords: 15, maxWords: 35 }
   });
 
   // 5. Realtime Adapter
@@ -210,7 +251,9 @@ export function createWorkerServices(env: Env) {
     sessionStore,
     sessionManager,
     salesEngine,
-    realtimeAdapter
+    realtimeAdapter,
+    providerId,
+    usageTracker
   };
 }
 
@@ -275,6 +318,190 @@ function handleCorsHeaders(request: Request, env: Env): Record<string, string> {
   };
 }
 
+/**
+ * Shared, strict validation for LiveKit transcript ingress.
+ *
+ * Used by BOTH the buffered and streaming transcript routes so their security
+ * checks (session lookup, token auth, isFinal, speaker, text bounds) can never
+ * drift apart. Returns a ready-to-send Response on failure.
+ */
+async function validateTranscriptIngress(
+  request: Request,
+  sessionManager: SessionManager,
+  adapterRegistry: AdapterRegistry,
+  corsHeaders: Record<string, string>
+): Promise<
+  | { ok: true; session: any; targetAdapter: any; text: string; speaker: string }
+  | { ok: false; response: Response }
+> {
+  const body = (await readJsonBody(request, 65536, {})) as any;
+  const { sessionId, sessionToken, text, isFinal, speaker } = body;
+  const tokenHeader =
+    request.headers.get("x-session-token") ||
+    request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+    sessionToken;
+
+  if (!sessionId || typeof sessionId !== "string") {
+    return { ok: false, response: errorResponse("sessionId is required for transcript ingress.", "SESSION_REQUIRED", 400, corsHeaders) };
+  }
+
+  const session = await sessionManager.getSessionAsync(sessionId);
+  if (!session) {
+    return { ok: false, response: errorResponse("Sales session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders) };
+  }
+
+  if (!tokenHeader || tokenHeader !== session.authToken) {
+    return { ok: false, response: errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders) };
+  }
+
+  // Strict boolean isFinal check (reject missing, null, string, or false values)
+  if (typeof isFinal !== "boolean" || isFinal !== true) {
+    return { ok: false, response: errorResponse("isFinal must be an explicit boolean true value for recommendation generation.", "INVALID_FINAL_STATUS", 400, corsHeaders) };
+  }
+
+  // Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)
+  if (speaker !== "prospect" && speaker !== "salesperson") {
+    return { ok: false, response: errorResponse("Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", "INVALID_SPEAKER", 400, corsHeaders) };
+  }
+
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return { ok: false, response: errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders) };
+  }
+  if (text.length > 4000) {
+    return { ok: false, response: errorResponse("Transcript text exceeds maximum allowed length of 4000 characters.", "TRANSCRIPT_TOO_LONG", 400, corsHeaders) };
+  }
+
+  const targetAdapter = adapterRegistry.resolve(session.productId);
+  return { ok: true, session, targetAdapter, text: text.trim(), speaker };
+}
+
+/**
+ * Best-effort, per-isolate idempotency guard for transcript ingress.
+ *
+ * The browser client already de-duplicates by provider segment id, and the
+ * engine de-duplicates inside handleRealtimeTranscript(), but the HTTP
+ * transcript routes call the engine directly and therefore need their own
+ * guard so a retried or duplicated final utterance cannot trigger a second
+ * model call.
+ *
+ * NOTE: Cloudflare Worker isolates are ephemeral and horizontally scaled, so
+ * this is defense-in-depth, not a durable exactly-once guarantee.
+ */
+const TRANSCRIPT_DEDUPE_WINDOW_MS = 10000;
+const recentTranscriptKeys = new Map<string, number>();
+
+function isDuplicateTranscript(sessionId: string, text: string): boolean {
+  const now = Date.now();
+  for (const [key, ts] of recentTranscriptKeys) {
+    if (now - ts > TRANSCRIPT_DEDUPE_WINDOW_MS) recentTranscriptKeys.delete(key);
+  }
+  const key = `${sessionId}::${text.trim().toLowerCase()}`;
+  if (recentTranscriptKeys.has(key)) return true;
+  recentTranscriptKeys.set(key, now);
+  return false;
+}
+
+/**
+ * Length-constant string comparison for secret material (invite tokens).
+ * Avoids early-exit timing differences.
+ */
+function safeEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length || a.length === 0) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/** Thrown when a request body exceeds the allowed size. */
+export class PayloadTooLargeError extends Error {
+  public readonly code = "PAYLOAD_TOO_LARGE";
+  constructor(public readonly limitBytes: number) {
+    super(`Payload Too Large: maximum request size is ${Math.floor(limitBytes / 1024)}KB.`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+/**
+ * Reads and parses a JSON request body while enforcing a hard byte cap that does
+ * NOT depend on the Content-Length header (a chunked/streamed body may omit it).
+ * Returns `fallback` for empty or malformed bodies, matching the previous
+ * `.json().catch(...)` behaviour.
+ */
+async function readJsonBody(request: Request, maxBytes: number, fallback: any = {}): Promise<any> {
+  const declared = request.headers.get("Content-Length");
+  if (declared && parseInt(declared, 10) > maxBytes) {
+    throw new PayloadTooLargeError(maxBytes);
+  }
+  if (!request.body) return fallback;
+  const reader = (request.body as any).getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        received += value.byteLength;
+        if (received > maxBytes) throw new PayloadTooLargeError(maxBytes);
+        text += decoder.decode(value, { stream: true });
+      }
+    }
+    text += decoder.decode();
+  } finally {
+    if (typeof reader.releaseLock === "function") reader.releaseLock();
+  }
+  if (!text.trim()) return fallback;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * High-entropy invitation token. Stored server-side in the session metadata and
+ * shared with the prospect via the invitation link. It grants ONLY the ability
+ * to validate the invitation and obtain a prospect-scoped, audio-only room
+ * token - never the salesperson session token or any recommendation data.
+ */
+function generateInviteToken(): string {
+  const bytes = new Uint8Array(24);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sessionInviteToken(session: any): string | undefined {
+  const token = session?.metadata?.inviteToken;
+  return typeof token === "string" && token.length > 0 ? token : undefined;
+}
+
+function isValidInvite(session: any, provided: unknown): boolean {
+  const expected = sessionInviteToken(session);
+  return Boolean(expected) && safeEqual(provided, expected);
+}
+
+/**
+ * Retention window for scheduled session cleanup.
+ *
+ * Sessions idle beyond the SessionManager TTL (1h) are already rejected on
+ * read; this longer window is used only by the cron handler to delete stale
+ * rows so the D1 tables cannot grow without bound.
+ */
+const SESSION_CLEANUP_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Durable session-creation limit (D1-backed, consistent across isolates).
+ * This is a coarse global abuse guard; Cloudflare Rate Limiting rules remain
+ * the recommended platform-level control for production traffic shaping.
+ */
+const SESSION_CREATION_WINDOW_MS = 60 * 1000;
+const SESSION_CREATION_MAX_PER_WINDOW = 60;
+
 export default {
   async fetch(request: Request, env: Env, ctx?: any): Promise<Response> {
     const corsHeaders = handleCorsHeaders(request, env);
@@ -310,7 +537,7 @@ export default {
       // ROUTE: POST /api/copilot
       // =========================================================================
       if (pathname === "/api/copilot" && request.method === "POST") {
-        const body = (await request.json().catch(() => null)) as any;
+        const body = (await readJsonBody(request, 65536, null)) as any;
         if (!body || typeof body !== "object") {
           return errorResponse("Malformed request: valid JSON body is required.", "INVALID_REQUEST", 400, corsHeaders);
         }
@@ -377,7 +604,23 @@ export default {
         const targetAdapter = adapterRegistry.resolve(targetProductId);
 
         if (!session) {
-          session = await sessionManager.createSessionAsync(targetAdapter.id);
+          const creationStore: any = services.sessionStore;
+          if (creationStore && typeof creationStore.countSessionsCreatedSince === "function") {
+            try {
+              const recent = await creationStore.countSessionsCreatedSince(Date.now() - SESSION_CREATION_WINDOW_MS);
+              if (recent >= SESSION_CREATION_MAX_PER_WINDOW) {
+                return errorResponse(
+                  "Too many sessions created recently. Please retry shortly.",
+                  "RATE_LIMITED",
+                  429,
+                  corsHeaders
+                );
+              }
+            } catch (limitErr) {
+              console.warn("[Worker] Session creation limit check failed, failing open for availability:", limitErr);
+            }
+          }
+          session = await sessionManager.createSessionAsync(targetAdapter.id, { inviteToken: generateInviteToken() });
         }
 
         const recommendation = await salesEngine.generateRecommendation(prompt, {
@@ -459,7 +702,7 @@ export default {
       // ROUTE: POST /api/engine/adapters/switch
       // =========================================================================
       if (pathname === "/api/engine/adapters/switch" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const { adapterId } = body;
         if (!adapterId || typeof adapterId !== "string") {
           return errorResponse("adapterId is required.", "INVALID_ADAPTER_ID", 400, corsHeaders);
@@ -500,7 +743,7 @@ export default {
       // ROUTE: POST /api/sessions (Create Session)
       // =========================================================================
       if (pathname === "/api/sessions" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const { productId } = body;
         if (!productId || !adapterRegistry.has(productId)) {
           return errorResponse(
@@ -512,12 +755,36 @@ export default {
         }
 
         const adapter = adapterRegistry.resolve(productId);
-        const session = await sessionManager.createSessionAsync(adapter.id);
 
+        // Durable abuse guard: bound how many sessions can be created per window.
+        const creationStore: any = sessionManager.getStore();
+        if (creationStore && typeof creationStore.countSessionsCreatedSince === "function") {
+          try {
+            const recent = await creationStore.countSessionsCreatedSince(Date.now() - SESSION_CREATION_WINDOW_MS);
+            if (recent >= SESSION_CREATION_MAX_PER_WINDOW) {
+              return errorResponse(
+                "Too many sessions created recently. Please retry shortly.",
+                "RATE_LIMITED",
+                429,
+                corsHeaders
+              );
+            }
+          } catch (limitErr) {
+            // Do not block all legitimate traffic on a transient limiter error.
+            console.error("[Worker] Session rate-limit check failed:", limitErr);
+          }
+        }
+
+        const inviteToken = generateInviteToken();
+        const session = await sessionManager.createSessionAsync(adapter.id, { inviteToken });
+
+        // `inviteToken` is returned ONLY to the creator (salesperson). It must
+        // never be included in prospect-facing responses.
         return jsonResponse(
           {
             sessionId: session.id,
             sessionToken: session.authToken,
+            inviteToken,
             productId: session.productId,
             roomName: session.roomName,
             createdAt: session.createdAt
@@ -565,7 +832,10 @@ export default {
                 roomName: authorizedSession.roomName,
                 createdAt: authorizedSession.createdAt,
                 lastActivityAt: authorizedSession.lastActivityAt,
-                historyCount: authorizedSession.conversationHistory.length
+                historyCount: authorizedSession.conversationHistory.length,
+                // Returned ONLY to the authenticated session owner (salesperson)
+                // so the invitation link can be recovered after a reload.
+                inviteToken: sessionInviteToken(authorizedSession)
               }
             ]
           },
@@ -618,7 +888,7 @@ export default {
       // =========================================================================
       if (pathname.startsWith("/api/sessions/") && pathname.endsWith("/clear") && request.method === "POST") {
         const sessionId = pathname.replace("/api/sessions/", "").replace("/clear", "");
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const token =
           request.headers.get("x-session-token") ||
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
@@ -673,7 +943,7 @@ export default {
       // ROUTE: POST /api/livekit/token
       // =========================================================================
       if (pathname === "/api/livekit/token" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const { sessionId, sessionToken, productId, roomName, identity, name, permissions, grants } = body;
         const tokenHeader =
           request.headers.get("x-session-token") ||
@@ -765,55 +1035,121 @@ export default {
       }
 
       // =========================================================================
+      // ROUTE: GET /api/livekit/invite (public invitation validation)
+      //
+      // Lets the prospect page validate an invitation link WITHOUT exposing any
+      // private data (no session auth token, no recommendations, no prompts).
+      // =========================================================================
+      if (pathname === "/api/livekit/invite" && request.method === "GET") {
+        const inviteSessionId = url.searchParams.get("sessionId") || "";
+        const inviteTokenParam = url.searchParams.get("token") || "";
+
+        if (!inviteSessionId || !inviteTokenParam) {
+          return errorResponse("A valid invitation requires a sessionId and token.", "INVALID_INVITATION", 400, corsHeaders);
+        }
+
+        const inviteSession = await sessionManager.getSessionAsync(inviteSessionId);
+        if (!inviteSession) {
+          return errorResponse("This invitation is invalid or has expired.", "INVITATION_NOT_FOUND", 404, corsHeaders);
+        }
+
+        if (!isValidInvite(inviteSession, inviteTokenParam)) {
+          return errorResponse("This invitation is invalid or has expired.", "INVALID_INVITATION", 403, corsHeaders);
+        }
+
+        const inviteAdapter = adapterRegistry.has(inviteSession.productId)
+          ? adapterRegistry.resolve(inviteSession.productId)
+          : undefined;
+
+        return jsonResponse(
+          {
+            valid: true,
+            sessionId: inviteSession.id,
+            status: "ready",
+            productName: inviteAdapter ? inviteAdapter.name : undefined,
+            livekitConfigured: realtimeAdapter.isConfigured()
+          },
+          200,
+          corsHeaders
+        );
+      }
+
+      // =========================================================================
+      // ROUTE: POST /api/livekit/invite-token (prospect-only, audio-only token)
+      //
+      // Issues a least-privilege LiveKit token for the prospect identified by a
+      // valid invitation. The identity is FIXED to "prospect" and video sources
+      // are not granted; clients cannot request the salesperson identity or
+      // elevate permissions.
+      // =========================================================================
+      if (pathname === "/api/livekit/invite-token" && request.method === "POST") {
+        const inviteBody = (await readJsonBody(request, 65536, {})) as any;
+        const inviteSessionId = inviteBody?.sessionId;
+        const inviteTokenParam = inviteBody?.inviteToken;
+        const inviteDisplayName = inviteBody?.displayName;
+
+        if (!inviteSessionId || typeof inviteSessionId !== "string" || !inviteTokenParam || typeof inviteTokenParam !== "string") {
+          return errorResponse("A valid invitation requires a sessionId and token.", "INVALID_INVITATION", 400, corsHeaders);
+        }
+
+        const inviteSession = await sessionManager.getSessionAsync(inviteSessionId);
+        if (!inviteSession) {
+          return errorResponse("This invitation is invalid or has expired.", "INVITATION_NOT_FOUND", 404, corsHeaders);
+        }
+
+        if (!isValidInvite(inviteSession, inviteTokenParam)) {
+          return errorResponse("This invitation is invalid or has expired.", "INVALID_INVITATION", 403, corsHeaders);
+        }
+
+        try {
+          const prospectToken = await realtimeAdapter.createParticipantToken({
+            session: inviteSession,
+            identity: "prospect",
+            displayName:
+              typeof inviteDisplayName === "string" && inviteDisplayName.trim()
+                ? inviteDisplayName.trim().slice(0, 60)
+                : "Prospect",
+            audioOnly: true
+          });
+          return jsonResponse({ ...prospectToken, sessionId: inviteSession.id }, 200, corsHeaders);
+        } catch (inviteErr: any) {
+          return errorResponse(
+            inviteErr?.message || "Failed to issue a prospect token for this invitation.",
+            "TOKEN_ISSUE_FAILED",
+            500,
+            corsHeaders
+          );
+        }
+      }
+
+      // =========================================================================
       // ROUTE: POST /api/livekit/transcript
       // =========================================================================
       if (pathname === "/api/livekit/transcript" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
-        const { sessionId, sessionToken, text, isFinal, speaker } = body;
-        const tokenHeader =
-          request.headers.get("x-session-token") ||
-          request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
-          sessionToken;
-
-        if (!sessionId || typeof sessionId !== "string") {
-          return errorResponse("sessionId is required for transcript ingress.", "SESSION_REQUIRED", 400, corsHeaders);
-        }
-
-        const session = await sessionManager.getSessionAsync(sessionId);
-        if (!session) {
-          return errorResponse("Sales session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
-        }
-
-        if (!tokenHeader || tokenHeader !== session.authToken) {
-          return errorResponse("Unauthorized access: Valid session authorization token is required.", "UNAUTHORIZED_SESSION_ACCESS", 403, corsHeaders);
-        }
-
-        // Defect A1 & A2: Strict boolean isFinal check (reject missing, null, string, or false values)
-        if (typeof isFinal !== "boolean" || isFinal !== true) {
-          return errorResponse("isFinal must be an explicit boolean true value for recommendation generation.", "INVALID_FINAL_STATUS", 400, corsHeaders);
-        }
-
-        // Defect A3: Speaker must be strictly 'prospect' or 'salesperson' (do not default unknown speakers)
-        if (speaker !== "prospect" && speaker !== "salesperson") {
-          return errorResponse("Invalid speaker value. Speaker must be strictly 'prospect' or 'salesperson'.", "INVALID_SPEAKER", 400, corsHeaders);
-        }
-
-        // Defect A4: Validate text length and format (non-empty string <= 4000 characters)
-        if (!text || typeof text !== "string" || !text.trim()) {
-          return errorResponse("Non-empty transcript text is required.", "INVALID_TRANSCRIPT", 400, corsHeaders);
-        }
-        if (text.length > 4000) {
-          return errorResponse("Transcript text exceeds maximum allowed length of 4000 characters.", "TRANSCRIPT_TOO_LONG", 400, corsHeaders);
-        }
-
-        const targetAdapter = adapterRegistry.resolve(session.productId);
-        const transcriptSpeaker = speaker;
-        const finalFlag = isFinal === true;
+        const ingress = await validateTranscriptIngress(request, sessionManager, adapterRegistry, corsHeaders);
+        if (!ingress.ok) return ingress.response;
+        const { session, targetAdapter, text: transcriptText, speaker: transcriptSpeaker } = ingress;
+        const finalFlag = true;
 
         let recommendation: any = null;
 
         if (transcriptSpeaker === "prospect" && finalFlag) {
-          const rawRec = await salesEngine.generateRecommendation(text.trim(), {
+          if (isDuplicateTranscript(session.id, transcriptText)) {
+            return jsonResponse(
+              {
+                success: true,
+                sessionId: session.id,
+                productId: session.productId,
+                speaker: transcriptSpeaker,
+                duplicate: true,
+                recommendation: null
+              },
+              200,
+              corsHeaders
+            );
+          }
+
+          const rawRec = await salesEngine.generateRecommendation(transcriptText, {
             adapter: targetAdapter,
             session,
             history: session.conversationHistory
@@ -859,6 +1195,105 @@ export default {
       }
 
       // =========================================================================
+      // ROUTE: POST /api/livekit/transcript/stream (Server-Sent Events)
+      //
+      // Streams a recommendation incrementally to the "SAY THIS NEXT" panel.
+      // SECURITY: only VALIDATED text is emitted - the engine runs the
+      // deterministic approval gate first and the raw model tokens are never
+      // forwarded. The buffered route above remains the non-streaming fallback.
+      // =========================================================================
+      if (pathname === "/api/livekit/transcript/stream" && request.method === "POST") {
+        const ingress = await validateTranscriptIngress(request, sessionManager, adapterRegistry, corsHeaders);
+        if (!ingress.ok) return ingress.response;
+        const { session, targetAdapter, text: transcriptText, speaker: transcriptSpeaker } = ingress;
+
+        const encoder = new TextEncoder();
+        const sseHeaders: Record<string, string> = {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no"
+        };
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            const send = (event: string, data: any) => {
+              controller.enqueue(encoder.encode(`event: ${event}
+data: ${JSON.stringify(data)}
+
+`));
+            };
+            try {
+              if (transcriptSpeaker !== "prospect") {
+                send("final", {
+                  success: true,
+                  sessionId: session.id,
+                  productId: session.productId,
+                  speaker: transcriptSpeaker,
+                  recommendation: null
+                });
+                return;
+              }
+
+              if (isDuplicateTranscript(session.id, transcriptText)) {
+                send("final", {
+                  success: true,
+                  sessionId: session.id,
+                  productId: session.productId,
+                  speaker: transcriptSpeaker,
+                  duplicate: true,
+                  recommendation: null
+                });
+                return;
+              }
+
+              send("status", { status: "analyzing" });
+
+              const rawRec = await salesEngine.generateRecommendationStream(
+                transcriptText,
+                { adapter: targetAdapter, session, history: session.conversationHistory },
+                (delta) => send("delta", { text: delta })
+              );
+
+              // Persist new turns atomically (identical contract to the buffered route)
+              if (session.conversationHistory.length >= 2) {
+                const lastModelTurn = session.conversationHistory[session.conversationHistory.length - 1];
+                const lastUserTurn = session.conversationHistory[session.conversationHistory.length - 2];
+                if (lastUserTurn && lastModelTurn && lastUserTurn.role === "user" && lastModelTurn.role === "model") {
+                  await sessionManager.addTurnsAtomicAsync(session.id, [lastUserTurn, lastModelTurn], session.authToken);
+                }
+              }
+
+              const sanitizedMetadata = rawRec.engineMetadata ? { ...rawRec.engineMetadata } : {};
+              delete (sanitizedMetadata as any).rawUnapprovedStatement;
+
+              send("final", {
+                success: true,
+                sessionId: session.id,
+                productId: session.productId,
+                speaker: transcriptSpeaker,
+                recommendation: {
+                  statement: rawRec.statement,
+                  status: rawRec.status,
+                  toolsUsed: rawRec.toolsUsed,
+                  validationReport: rawRec.validationReport,
+                  engineMetadata: sanitizedMetadata
+                }
+              });
+            } catch (streamErr: any) {
+              console.error("[Worker Realtime Stream] error:", streamErr);
+              send("error", { error: streamErr?.message || "Streaming recommendation failed." });
+            } finally {
+              controller.close();
+            }
+          }
+        });
+
+        return new Response(stream, { status: 200, headers: sseHeaders });
+      }
+
+      // =========================================================================
       // ROUTE: GET /api/livekit/status
       // =========================================================================
       if (pathname === "/api/livekit/status" && request.method === "GET") {
@@ -899,14 +1334,39 @@ export default {
       }
 
       // =========================================================================
-      // Static Assets (Cloudflare Pages / Worker Assets fallback)
+      // Static Assets (Cloudflare Workers Static Assets via the ASSETS binding)
+      //
+      // Every /api/* route is handled above and never reaches this point, so
+      // static asset handling cannot interfere with API routes. Non-asset
+      // requests are delegated to the asset binding, which applies
+      // `not_found_handling = "single-page-application"`. A defensive
+      // index.html fallback is added for GET/HEAD navigations.
       // =========================================================================
       if (env.ASSETS && typeof env.ASSETS.fetch === "function") {
-        return await env.ASSETS.fetch(request);
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+        if ((request.method === "GET" || request.method === "HEAD") && !pathname.startsWith("/api/")) {
+          const indexRequest = new Request(new URL("/index.html", request.url).toString(), { method: "GET" });
+          const indexResponse = await env.ASSETS.fetch(indexRequest);
+          if (indexResponse.status !== 404) {
+            return indexResponse;
+          }
+        }
+        return errorResponse(`Not Found: ${pathname}`, "NOT_FOUND", 404, corsHeaders);
       }
 
       return errorResponse(`Not Found: ${pathname}`, "NOT_FOUND", 404, corsHeaders);
     } catch (err: any) {
+      if (err?.code === "PAYLOAD_TOO_LARGE") {
+        return errorResponse(
+          err.message || "Payload Too Large: maximum request size is 64KB.",
+          "PAYLOAD_TOO_LARGE",
+          413,
+          corsHeaders
+        );
+      }
       console.error("[Worker Uncaught Error]", err);
       return errorResponse(
         "An unexpected internal error occurred while processing the request.",
@@ -914,6 +1374,27 @@ export default {
         500,
         corsHeaders
       );
+    }
+  },
+
+  /**
+   * Cron handler (configured via [triggers] in wrangler.toml).
+   *
+   * Best-effort cleanup of sessions (and, via ON DELETE CASCADE, their
+   * conversation turns) that have been idle beyond the retention window.
+   * Failures are logged and never thrown, so a cleanup error cannot take the
+   * Worker down.
+   */
+  async scheduled(_controller: any, env: Env, _ctx?: any): Promise<void> {
+    try {
+      const services = getServices(env);
+      const store: any = services.sessionStore;
+      if (store && typeof store.cleanupExpired === "function") {
+        const removed = await store.cleanupExpired(SESSION_CLEANUP_RETENTION_MS);
+        console.log(`[Worker Scheduled] Removed ${removed} expired session(s).`);
+      }
+    } catch (err: any) {
+      console.error("[Worker Scheduled] Session cleanup failed:", err?.message || err);
     }
   }
 };
