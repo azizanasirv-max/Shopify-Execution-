@@ -73,7 +73,12 @@ export default defineAgent({
 
     session.on(voice.AgentSessionEventTypes.UserInputTranscribed, (event: any) => {
       if (event?.isFinal) {
-        log().info(`[lbv-agent] final transcript (${event.speakerId ?? "speaker"}): ${event.transcript}`);
+        // PRIVACY: never log transcript text. It is sensitive prospect content.
+        // Log only non-content diagnostics so transcription can still be
+        // confirmed as received/processed.
+        const speaker = event.speakerId ?? "speaker";
+        const charCount = typeof event.transcript === "string" ? event.transcript.length : 0;
+        log().info(`[lbv-agent] final transcript received (speaker=${speaker}, chars=${charCount})`);
       }
     });
 
