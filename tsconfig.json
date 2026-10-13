@@ -23,5 +23,9 @@
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
-  }
+  },
+  // The LiveKit agent is a separate long-running Node process with its own
+  // dependencies and tsconfig (see agent/). It is excluded here so the main
+  // application's CI does not require the agent dependencies to be installed.
+  "exclude": ["agent", "node_modules", "dist"]
 }

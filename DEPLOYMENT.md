@@ -21,6 +21,9 @@ real-time audio/transcription.
   Gemini remains selectable via `LLM_PROVIDER=gemini`.
 - **Persistence (production):** Cloudflare D1 via the `DB` binding (`CloudflareD1SessionStore`).
   The Worker **fails closed** (HTTP 500 `STARTUP_ERROR`) if `DB` is missing in production.
+- **Scheduled session cleanup:** an hourly cron trigger (`[triggers] crons` in `wrangler.toml`)
+  invokes the Worker's `scheduled` handler, which deletes sessions idle beyond a 24h retention window
+  (and, via `ON DELETE CASCADE`, their conversation turns).
 - **Persistence (local/tests):** in-memory store.
 
 ---
@@ -138,6 +141,10 @@ Creates two tables and four indexes:
 These columns exactly match the SQL used by `CloudflareD1SessionStore`
 (`lbv-sales-copilot/engine/session-manager.ts`). Migrations are **forward-only**; take a backup
 (`npx wrangler d1 export lbv-sales-sessions --remote --output backup.sql`) before future changes.
+
+**Automated cleanup:** sessions are rejected on read once idle beyond the 1h TTL, and the hourly cron
+(see §1) deletes rows idle beyond a 24h retention window so the tables do not grow without bound.
+No manual cleanup is required once the Worker (with its `[triggers]` config) is deployed.
 
 ---
 
@@ -411,3 +418,217 @@ a real microphone. They have **not** been run yet.
 
 > Do not mark live-audio integration as verified until steps 1–10 have been executed against the
 deployed service with real credentials.
+
+---
+
+## 17. Sales call, prospect invitation, and transcription architecture
+
+### 17a. Flow and endpoints
+
+| Step | Endpoint | Auth | Notes |
+|---|---|---|---|
+| Salesperson creates a session | `POST /api/sessions` | none (rate-limited) | Returns `sessionId`, `sessionToken`, **`inviteToken`**, `roomName` |
+| Prospect link validation | `GET /api/livekit/invite?sessionId=&token=` | invite token | Returns `{valid, productName, status}` only — no private data |
+| Prospect joins | `POST /api/livekit/invite-token` | invite token | Issues a **prospect-fixed, audio-only** room token |
+| Salesperson joins | `POST /api/livekit/token` | session token | Salesperson identity only |
+| Transcript ingress | `POST /api/livekit/transcript[/stream]` | session token | Salesperson client forwards final prospect segments |
+| End session | `DELETE /api/sessions/:id` | session token | Revokes the session and its invitation |
+
+Invitation link format: `https://<host>/?join=1&sessionId=<id>&token=<inviteToken>`
+
+- Renders the **prospect-only** audio page (`lbv-sales-copilot/app/ProspectCall.tsx`); the salesperson
+dashboard is never rendered for a prospect (`src/App.tsx` routes on `?join=1`).
+- Carries only the scoped invite token — **never** the session auth token.
+- Audio only: no camera/video is requested or published; prospect tokens grant the microphone source only.
+- Revoked on `DELETE /api/sessions/:id` (End Session) or when the session TTL expires.
+
+### 17b. Which component produces the transcript
+
+- **Producer:** LiveKit room transcription, delivered to the **salesperson's browser** as
+`RoomEvent.TranscriptionReceived`. The salesperson client filters final prospect segments and POSTs them
+to the Worker.
+- **The Worker does not run speech-to-text.** It validates, de-duplicates, and feeds the segment to the
+sales engine (approval gate → salesperson-only recommendation).
+- **AssemblyAI:** not integrated in this repository and **no `ASSEMBLYAI_API_KEY` is read by the Worker**.
+If AssemblyAI is the chosen STT engine it must be configured **inside LiveKit / a LiveKit agent**
+(e.g. an agent worker using the AssemblyAI STT plugin). The browser then receives the resulting
+transcription events with no change to this codebase.
+
+### 17c. Credentials and where to configure them
+
+| Credential | Purpose | Where |
+|---|---|---|
+| `GROQ_API_KEY` | Default LLM provider | Worker secret (`wrangler secret put`) |
+| `ADMIN_API_KEY` | Internal test endpoints | Worker secret |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Mint room tokens (server-side) | Worker secrets |
+| `LIVEKIT_URL` | LiveKit websocket URL | Worker var |
+| `ALLOWED_ORIGINS` | CORS allow-list | Worker var |
+| AssemblyAI key (if used) | Speech-to-text | **LiveKit / agent configuration** — not the Worker |
+| Cloudflare API token | CI deploy (optional) | GitHub secret |
+
+### 17d. Abuse protection
+
+- Session creation is bounded by a **durable, D1-backed** limit (60 creations/minute across isolates),
+returning `429 RATE_LIMITED`. It is a coarse global guard, not a substitute for platform protection.
+- For production traffic shaping, add a **Cloudflare Rate Limiting rule** on `/api/sessions` and
+`/api/livekit/invite-token`. Do not rely on an isolate-local counter.
+
+### 17e. Testing the call and transcription workflow
+
+**Automated (CI, offline)** — session creation + invite token issuance, invitation validation
+(valid/wrong/expired/unknown), prospect-only identity enforcement, transcript validation and
+deduplication, approval gates, salesperson-only visibility, session cleanup, request-size validation
+(including bodies without `Content-Length`), and the session-creation limit.
+
+**Requires a real microphone and a deployed environment** — two-party audio, real LiveKit tokens,
+real STT (LiveKit/AssemblyAI), reconnection behaviour, and end-to-end recommendation latency.
+
+Manual live-call test:
+1. Deploy (section 10) and confirm the health checks (section 11).
+2. Open the dashboard, create a session, and tap **Copy Prospect Invitation Link**.
+3. Open that link on a phone; confirm it shows the prospect audio page (no salesperson content).
+4. Tap **Join Call**, allow the microphone, and speak as the prospect.
+5. Confirm the salesperson dashboard shows “Prospect joined”, the prospect transcript, and an
+   approved **SAY THIS NEXT** recommendation; confirm the prospect page shows no recommendations.
+6. Toggle mute, leave, rejoin, and finally tap **End Session**; confirm the invitation link is revoked.
+
+---
+
+## 18. LiveKit Agent + direct AssemblyAI STT
+
+### 18a. Why a separate component is required
+
+The Worker cannot run speech-to-text (stateless request/response, no persistent media
+connection). The repository now includes the missing component at **`agent/`**: a long-running
+LiveKit Agent that joins the room, streams audio to the **direct AssemblyAI API** (your own
+AssemblyAI key / free tier — *not* LiveKit Inference), and publishes transcription into the room.
+
+Data path:
+```
+prospect mic → LiveKit room → agent (agent/) → AssemblyAI streaming STT
+                                    └→ publishes transcription into the room
+salesperson browser (RoomEvent.TranscriptionReceived)
+   → POST /api/livekit/transcript[/stream] → approval gate → SAY THIS NEXT
+```
+The salesperson UI and the Worker already consume `RoomEvent.TranscriptionReceived` and forward
+**final prospect** segments; **no frontend or Worker change is required** for the agent to be useful.
+
+> Status: the agent code typechecks against `@livekit/agents@1.9.2` (+ AssemblyAI and Silero plugins),
+> but **no real call has been made**. Speech-to-text is **not verified** until a live call is run.
+
+### 18b. Agent hosting
+
+The agent is a persistent Node.js process, so it does **not** run on Cloudflare Workers. Options:
+
+| Option | Notes |
+|---|---|
+| LiveKit Cloud agent deploy (`lk agent deploy`) | Managed; simplest if you use LiveKit Cloud |
+| Fly.io / Railway / Render | Long-running container; `npm start` in `agent/` |
+| A VPS / Docker host | Full control |
+
+Requirements: Node.js 20+, outbound network to LiveKit and `api.assemblyai.com`, and the agent env
+vars below. Run `cd agent && npm install && npm run typecheck && npm run dev` locally first.
+
+### 18c. Call termination semantics (important)
+
+`DELETE /api/sessions/:id` now:
+1. deletes the D1 session (revokes the **invitation** — no new token can be minted), and
+2. calls `RoomServiceClient.deleteRoom(roomName)` when LiveKit is configured.
+
+The response reports `invitationRevoked: true` and `liveKitRoomClosed: <bool>` so the caller can tell
+whether the room teardown actually succeeded. **Deleting a D1 record does not by itself invalidate an
+already-issued LiveKit JWT** — deleting the *room* is what stops participation and prevents rejoining.
+Keep LiveKit token TTLs short as defence in depth.
+
+### 18d. Abuse protection
+
+- `/api/sessions` **and** the unauthenticated `/api/copilot` session-creation fallback now share the
+  same **durable, D1-backed** limit (60 creations/minute across isolates → `429 RATE_LIMITED`).
+- This is a coarse application-level guard. It is **not** equivalent to platform protection. Add
+  **Cloudflare Rate Limiting** rules for `/api/sessions`, `/api/livekit/invite-token` and
+  `/api/copilot` in production.
+
+### 18e. Invitation-token hygiene
+
+- Responses set `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+- `index.html` declares `<meta name="referrer" content="no-referrer">`.
+- The prospect page removes the token from the address bar (`history.replaceState`) once validated.
+- Residual exposure: the token is present in the invitation URL the salesperson shares; treat the link
+  as a secret and revoke by ending the session.
+
+---
+
+## 19. Credential checklist (exact)
+
+### A. Cloudflare Worker (secrets via `wrangler secret put`, vars in `[vars]`)
+
+| Name | Status | Purpose | Where | Consumer | How to obtain |
+|---|---|---|---|---|---|
+| `DB` (binding) | **Required** | D1 session persistence | `wrangler.toml` | Worker | `wrangler d1 create lbv-sales-sessions` |
+| `ASSETS` (binding) | **Required** | Serve the SPA | `wrangler.toml [assets]` | Worker | Build (`npm run build`) |
+| `NODE_ENV` | **Required** (var) | `production` fail-closed CORS | `[vars]` | Worker | Literal `production` |
+| `GROQ_API_KEY` | **Required** (default provider) | LLM recommendations | Worker secret | Worker | console.groq.com |
+| `LIVEKIT_URL` | **Required for calls** (var) | LiveKit websocket + room API host | Worker var | Worker | LiveKit Cloud project settings |
+| `LIVEKIT_API_KEY` | **Required for calls** | Mint room tokens, delete rooms | Worker secret | Worker | LiveKit Cloud API keys |
+| `LIVEKIT_API_SECRET` | **Required for calls** | Same as above | Worker secret | Worker | LiveKit Cloud API keys |
+| `ADMIN_API_KEY` | **Optional** | Internal test endpoints (404 in prod anyway) | Worker secret | Worker | Generate a random string |
+| `ALLOWED_ORIGINS` | **Conditional** | Cross-origin browser access | Worker var | Worker | Your deployed origin(s) |
+| `LLM_PROVIDER` / `LLM_MODEL` / `LLM_TIMEOUT_MS` | Optional | Provider overrides | Worker var | Worker | Defaults `groq` / `llama-3.1-8b-instant` / 20000 |
+| `LBV_MAX_TOTAL_TOKENS` / `LBV_MAX_REQUEST_TOKENS` | Optional | Token budget (0 = off) | Worker var | Worker | Your policy |
+| `GEMINI_API_KEY` | Conditional | Only if `LLM_PROVIDER=gemini` | Worker secret | Worker | Google AI Studio |
+| `LBV_SESSION_STORE` | Optional | Force D1 store outside prod | Worker var | Worker | `cloudflare-d1` |
+
+`ALLOWED_ORIGINS` is only needed when the browser calls the Worker from a **different origin** than the
+Worker itself. When the SPA is served by the same Worker (`[assets]`), same-origin requests are not
+subject to CORS. Set it explicitly for custom domains/Pages frontends.
+
+### B. LiveKit Cloud
+
+| Setting | Status | Purpose | Where |
+|---|---|---|---|
+| Project URL (`wss://…livekit.cloud`) | Required | Room transport | LiveKit Cloud → Project settings |
+| API key + secret | Required | Worker token minting + room deletion; agent auth | LiveKit Cloud → API keys |
+| Agent dispatch (automatic or room-name) | Required | Makes the agent join rooms | LiveKit Cloud agent settings / agent `agentName` |
+| Room/agent permissions | Default | Audio publish/subscribe | LiveKit Cloud |
+
+No LiveKit webhook is required by the current code.
+
+### C. AssemblyAI
+
+| Setting | Status | Purpose | Where |
+|---|---|---|---|
+| `ASSEMBLYAI_API_KEY` | **Required for STT** | Direct streaming STT (your own account/free tier) | **Agent runtime env only** — never the Worker or browser |
+| `ASSEMBLYAI_SPEECH_MODEL` | Optional | Speech model override | Agent runtime env |
+| Account/region + usage limits | Required | Free-tier concurrency/limits | assemblyai.com dashboard |
+
+Obtain the key at <https://www.assemblyai.com/dashboard>. The Worker does **not** read any AssemblyAI
+variable.
+
+### D. Agent hosting
+
+| Name | Status | Purpose | Where |
+|---|---|---|---|
+| `LIVEKIT_URL` | Required | Agent connects to the room | Agent env |
+| `LIVEKIT_API_KEY` | Required | Agent authentication | Agent env |
+| `LIVEKIT_API_SECRET` | Required | Agent authentication | Agent env |
+| `ASSEMBLYAI_API_KEY` | Required | Direct STT | Agent env |
+| `LIVEKIT_AGENT_ROOM` | Optional | Pin the agent to one room | Agent env |
+| Node.js 20+ host | Required | Persistent process | Fly.io / Railway / Render / VPS / `lk agent deploy` |
+
+---
+
+## 20. Shortest safe sequence
+
+1. **Install the agent**: `cd agent && npm install && npm run typecheck`.
+2. **Worker secrets**: `GROQ_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (+ `ADMIN_API_KEY`).
+3. **Worker vars**: `LIVEKIT_URL`, and `ALLOWED_ORIGINS` if using a custom domain.
+4. **D1**: `wrangler d1 migrations apply lbv-sales-sessions --remote`.
+5. **Agent env**: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `ASSEMBLYAI_API_KEY`.
+6. **Run the agent** on your host (`npm start` or `lk agent deploy`).
+7. **Deploy the Worker**: `npm run check:deploy && npm run deploy`.
+8. **Live test**: create a session → copy the invitation link → join on a phone → speak → confirm the
+   prospect transcript and an approved SAY THIS NEXT recommendation appear for the salesperson, and
+   that the prospect page shows no recommendations.
+9. **End Session** and confirm the invitation no longer validates (`404`) and `liveKitRoomClosed: true`.
+10. **Cloudflare Rate Limiting** rules for `/api/sessions`, `/api/livekit/invite-token`, `/api/copilot`.
+11. Review and merge PR #9, then re-run CI on `main`.

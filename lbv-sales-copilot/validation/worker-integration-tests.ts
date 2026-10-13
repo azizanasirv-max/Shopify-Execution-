@@ -538,6 +538,176 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   const dupStreamText = await dupStreamRes.text();
   assert(dupStreamRes.status === 200 && dupStreamText.includes('"duplicate":true'), "Streaming route also suppresses duplicate transcripts");
 
+  // -------------------------------------------------------------
+  // TEST 14: Scheduled session cleanup (cron handler)
+  // -------------------------------------------------------------
+  console.log("\n[14] Testing scheduled session cleanup...");
+  const cronDb = new MockD1Database();
+  const cronEnv: Env = { DB: cronDb, ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const cronBody = JSON.stringify({ productId: "shopify" });
+  const staleRes = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: cronBody }), cronEnv);
+  const staleSession = await staleRes.json() as any;
+  const freshRes = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: cronBody }), cronEnv);
+  const freshSession = await freshRes.json() as any;
+
+  const staleRow = cronDb.sessions.get(staleSession.sessionId);
+  assert(Boolean(staleRow), "Session row is stored in D1 before cleanup");
+  staleRow.last_activity_at = Date.now() - (25 * 60 * 60 * 1000);
+
+  await (worker as any).scheduled({ cron: "0 * * * *" }, cronEnv, {});
+  assert(!cronDb.sessions.has(staleSession.sessionId), "Scheduled handler removes sessions idle beyond the retention window");
+  assert(cronDb.sessions.has(freshSession.sessionId), "Scheduled handler retains active sessions");
+
+  const inMemoryCronEnv: Env = { ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  let scheduledThrew = false;
+  try {
+    await (worker as any).scheduled({ cron: "0 * * * *" }, inMemoryCronEnv, {});
+  } catch {
+    scheduledThrew = true;
+  }
+  assert(!scheduledThrew, "Scheduled handler is safe when no D1 store is configured");
+
+  const brokenCronEnv: Env = { DB: { prepare() { throw new Error("boom"); } }, ADMIN_API_KEY: adminToken, NODE_ENV: "test" } as any;
+  let brokenThrew = false;
+  try {
+    await (worker as any).scheduled({ cron: "0 * * * *" }, brokenCronEnv, {});
+  } catch {
+    brokenThrew = true;
+  }
+  assert(!brokenThrew, "Scheduled handler swallows cleanup errors (never throws)");
+
+  // -------------------------------------------------------------
+  // TEST 15: Prospect invitation flow (invite token, prospect-only token)
+  // -------------------------------------------------------------
+  console.log("\n[15] Testing prospect invitation flow...");
+  const invCreateRes = await worker.fetch(new Request("https://worker.local/api/sessions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ productId: "shopify" })
+  }), testEnv);
+  const invSession = await invCreateRes.json() as any;
+  assert(typeof invSession.inviteToken === "string" && invSession.inviteToken.length >= 32, "Session creation returns a high-entropy invite token");
+  assert(invSession.inviteToken !== invSession.sessionToken, "Invite token is distinct from the session auth token");
+
+  const invValidateRes = await worker.fetch(new Request(`https://worker.local/api/livekit/invite?sessionId=${encodeURIComponent(invSession.sessionId)}&token=${encodeURIComponent(invSession.inviteToken)}`, { method: "GET" }), testEnv);
+  const invValidate = await invValidateRes.json() as any;
+  assert(invValidateRes.status === 200 && invValidate.valid === true, "Valid invitation is accepted");
+  assert(invValidate.sessionToken === undefined && invValidate.inviteToken === undefined && invValidate.recommendation === undefined, "Invitation validation leaks no private data");
+
+  const invWrongRes = await worker.fetch(new Request(`https://worker.local/api/livekit/invite?sessionId=${encodeURIComponent(invSession.sessionId)}&token=wrong-token-value`, { method: "GET" }), testEnv);
+  assert(invWrongRes.status === 403, "Invitation with a wrong token is rejected (403)");
+  const invWrongData = await invWrongRes.json() as any;
+  assert(invWrongData.code === "INVALID_INVITATION", "Wrong invitation returns INVALID_INVITATION");
+
+  const invMissingRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite", { method: "GET" }), testEnv);
+  assert(invMissingRes.status === 400, "Invitation without parameters is rejected (400)");
+
+  const invUnknownRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite?sessionId=sess_does_not_exist&token=abc", { method: "GET" }), testEnv);
+  assert(invUnknownRes.status === 404, "Unknown invitation session is rejected (404)");
+
+  const invTokenRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite-token", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: invSession.sessionId, inviteToken: invSession.inviteToken, identity: "salesperson" })
+  }), testEnv);
+  const invTokenData = await invTokenRes.json() as any;
+  assert(invTokenRes.status === 200, "Valid invitation issues a prospect token");
+  assert(invTokenData.identity === "prospect", "Invite flow always issues a prospect identity (client identity is ignored)");
+  assert(typeof invTokenData.token === "string" && invTokenData.token.length > 0, "Invite flow returns a room token");
+
+  const invTokenBadRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite-token", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: invSession.sessionId, inviteToken: "nope" })
+  }), testEnv);
+  assert(invTokenBadRes.status === 403, "Invite token endpoint rejects an invalid invitation");
+
+  const invListRes = await worker.fetch(new Request(`https://worker.local/api/sessions?sessionId=${encodeURIComponent(invSession.sessionId)}`, {
+    method: "GET", headers: { "x-session-token": invSession.sessionToken }
+  }), testEnv);
+  const invList = await invListRes.json() as any;
+  assert(invList?.sessions?.[0]?.inviteToken === invSession.inviteToken, "Authenticated owner can recover the invite token");
+
+  const invListUnauthRes = await worker.fetch(new Request(`https://worker.local/api/sessions?sessionId=${encodeURIComponent(invSession.sessionId)}`, { method: "GET" }), testEnv);
+  assert(invListUnauthRes.status === 401, "Unauthenticated session listing is rejected");
+
+  // -------------------------------------------------------------
+  // TEST 16: Request-size validation without a Content-Length header
+  // -------------------------------------------------------------
+  console.log("\n[16] Testing streamed oversized body rejection...");
+  const oversizedStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(JSON.stringify({ prompt: "a".repeat(70000) })));
+      controller.close();
+    }
+  });
+  const streamedOversizeReq = new Request("https://worker.local/api/copilot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: oversizedStream,
+    duplex: "half"
+  } as any);
+  assert(streamedOversizeReq.headers.get("Content-Length") === null, "Streamed body has no Content-Length header");
+  const streamedOversizeRes = await worker.fetch(streamedOversizeReq, testEnv);
+  assert(streamedOversizeRes.status === 413, "Oversized streamed body is rejected with 413 even without Content-Length");
+  const streamedOversizeData = await streamedOversizeRes.json() as any;
+  assert(streamedOversizeData.code === "PAYLOAD_TOO_LARGE", "Streamed oversize returns PAYLOAD_TOO_LARGE");
+
+  // -------------------------------------------------------------
+  // TEST 17: Durable session-creation rate limit
+  // -------------------------------------------------------------
+  console.log("\n[17] Testing durable session-creation limit...");
+  const rateEnv: Env = { DB: new MockD1Database(), ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const rateBody = JSON.stringify({ productId: "shopify" });
+  const firstCreate = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: rateBody }), rateEnv);
+  assert(firstCreate.status === 200, "Session creation succeeds below the limit");
+  let sawRateLimit = false;
+  let rateLimitCode = "";
+  for (let i = 0; i < 70; i++) {
+    const r = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: rateBody }), rateEnv);
+    if (r.status === 429) {
+      sawRateLimit = true;
+      const d = await r.json() as any;
+      rateLimitCode = d.code;
+      break;
+    }
+  }
+  assert(sawRateLimit, "Abusive session creation is rejected with 429");
+  assert(rateLimitCode === "RATE_LIMITED", "Rate-limited creation returns RATE_LIMITED");
+
+  // -------------------------------------------------------------
+  // TEST 18: PR #9 fixes — copilot abuse guard, call revocation, token hygiene
+  // -------------------------------------------------------------
+  console.log("\n[18] Testing copilot abuse guard, call revocation, and token hygiene...");
+
+  // 18a: unauthenticated /api/copilot creation is bounded by the same limit
+  const copilotRateEnv: Env = { DB: new MockD1Database(), ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const copilotBody = JSON.stringify({ productId: "shopify", prompt: "What is the price?" });
+  let copilotRateLimited = false;
+  for (let i = 0; i < 70; i++) {
+    const r = await worker.fetch(new Request("https://worker.local/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: copilotBody }), copilotRateEnv);
+    if (r.status === 429) { copilotRateLimited = true; break; }
+  }
+  assert(copilotRateLimited, "Unauthenticated /api/copilot session creation is rate-limited (no bypass)");
+
+  // 18b: ending a session revokes the invitation
+  const endCreateRes = await worker.fetch(new Request("https://worker.local/api/sessions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ productId: "shopify" })
+  }), testEnv);
+  const endSession = await endCreateRes.json() as any;
+  const endDeleteRes = await worker.fetch(new Request(`https://worker.local/api/sessions/${encodeURIComponent(endSession.sessionId)}`, {
+    method: "DELETE", headers: { "x-session-token": endSession.sessionToken }
+  }), testEnv);
+  const endDeleteData = await endDeleteRes.json() as any;
+  assert(endDeleteRes.status === 200 && endDeleteData.invitationRevoked === true, "Ending a session revokes the invitation");
+  assert(endDeleteData.liveKitRoomClosed === false, "Room teardown reports false when LiveKit is not configured (no false claim)");
+
+  const afterEndInviteRes = await worker.fetch(new Request(`https://worker.local/api/livekit/invite?sessionId=${encodeURIComponent(endSession.sessionId)}&token=${encodeURIComponent(endSession.inviteToken)}`, { method: "GET" }), testEnv);
+  assert(afterEndInviteRes.status === 404, "Invitation no longer validates after the session is ended");
+
+  const afterEndTokenRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite-token", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: endSession.sessionId, inviteToken: endSession.inviteToken })
+  }), testEnv);
+  assert(afterEndTokenRes.status === 404, "A revoked invitation cannot mint a new prospect token");
+
+  // 18c: token hygiene headers on invitation responses
+  assert(invValidateRes.headers.get("Referrer-Policy") === "no-referrer", "Invitation responses set Referrer-Policy: no-referrer");
+  assert(invValidateRes.headers.get("Cache-Control") === "no-store", "Invitation responses set Cache-Control: no-store");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");

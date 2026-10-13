@@ -11,7 +11,7 @@
  * - Broadcasts recommendations as text/data payloads only (NO AI voice/audio track).
  */
 
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, TrackSource } from "livekit-server-sdk";
 import { GenericSalesEngine } from "./generic-sales-engine.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import {
@@ -69,6 +69,11 @@ export interface ParticipantTokenRequest {
   requestedPermissions?: Record<string, any>;
   requestedProductId?: string;
   forceSimulated?: boolean;
+  /**
+   * When true, the issued token may publish ONLY microphone audio (no camera
+   * or screen share). Used for the prospect invitation flow.
+   */
+  audioOnly?: boolean;
 }
 
 export interface ParticipantTokenResponse {
@@ -205,7 +210,8 @@ export class LiveKitRealtimeAdapter {
       clientRoomName,
       requestedPermissions,
       requestedProductId,
-      forceSimulated
+      forceSimulated,
+      audioOnly
     } = paramsOrRoomName;
 
     // 1. Session check
@@ -291,7 +297,9 @@ export class LiveKitRealtimeAdapter {
         room: trustedRoomName,
         canPublish: true, // Human participant voice
         canPublishData: true,
-        canSubscribe: true
+        canSubscribe: true,
+        // Least privilege: audio-only tokens cannot publish camera/screen tracks.
+        ...(audioOnly ? { canPublishSources: [TrackSource.MICROPHONE] } : {})
       });
 
       const token = await at.toJwt();
