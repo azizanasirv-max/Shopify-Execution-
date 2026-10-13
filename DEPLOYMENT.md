@@ -418,3 +418,76 @@ a real microphone. They have **not** been run yet.
 
 > Do not mark live-audio integration as verified until steps 1–10 have been executed against the
 deployed service with real credentials.
+
+---
+
+## 17. Sales call, prospect invitation, and transcription architecture
+
+### 17a. Flow and endpoints
+
+| Step | Endpoint | Auth | Notes |
+|---|---|---|---|
+| Salesperson creates a session | `POST /api/sessions` | none (rate-limited) | Returns `sessionId`, `sessionToken`, **`inviteToken`**, `roomName` |
+| Prospect link validation | `GET /api/livekit/invite?sessionId=&token=` | invite token | Returns `{valid, productName, status}` only — no private data |
+| Prospect joins | `POST /api/livekit/invite-token` | invite token | Issues a **prospect-fixed, audio-only** room token |
+| Salesperson joins | `POST /api/livekit/token` | session token | Salesperson identity only |
+| Transcript ingress | `POST /api/livekit/transcript[/stream]` | session token | Salesperson client forwards final prospect segments |
+| End session | `DELETE /api/sessions/:id` | session token | Revokes the session and its invitation |
+
+Invitation link format: `https://<host>/?join=1&sessionId=<id>&token=<inviteToken>`
+
+- Renders the **prospect-only** audio page (`lbv-sales-copilot/app/ProspectCall.tsx`); the salesperson
+dashboard is never rendered for a prospect (`src/App.tsx` routes on `?join=1`).
+- Carries only the scoped invite token — **never** the session auth token.
+- Audio only: no camera/video is requested or published; prospect tokens grant the microphone source only.
+- Revoked on `DELETE /api/sessions/:id` (End Session) or when the session TTL expires.
+
+### 17b. Which component produces the transcript
+
+- **Producer:** LiveKit room transcription, delivered to the **salesperson's browser** as
+`RoomEvent.TranscriptionReceived`. The salesperson client filters final prospect segments and POSTs them
+to the Worker.
+- **The Worker does not run speech-to-text.** It validates, de-duplicates, and feeds the segment to the
+sales engine (approval gate → salesperson-only recommendation).
+- **AssemblyAI:** not integrated in this repository and **no `ASSEMBLYAI_API_KEY` is read by the Worker**.
+If AssemblyAI is the chosen STT engine it must be configured **inside LiveKit / a LiveKit agent**
+(e.g. an agent worker using the AssemblyAI STT plugin). The browser then receives the resulting
+transcription events with no change to this codebase.
+
+### 17c. Credentials and where to configure them
+
+| Credential | Purpose | Where |
+|---|---|---|
+| `GROQ_API_KEY` | Default LLM provider | Worker secret (`wrangler secret put`) |
+| `ADMIN_API_KEY` | Internal test endpoints | Worker secret |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Mint room tokens (server-side) | Worker secrets |
+| `LIVEKIT_URL` | LiveKit websocket URL | Worker var |
+| `ALLOWED_ORIGINS` | CORS allow-list | Worker var |
+| AssemblyAI key (if used) | Speech-to-text | **LiveKit / agent configuration** — not the Worker |
+| Cloudflare API token | CI deploy (optional) | GitHub secret |
+
+### 17d. Abuse protection
+
+- Session creation is bounded by a **durable, D1-backed** limit (60 creations/minute across isolates),
+returning `429 RATE_LIMITED`. It is a coarse global guard, not a substitute for platform protection.
+- For production traffic shaping, add a **Cloudflare Rate Limiting rule** on `/api/sessions` and
+`/api/livekit/invite-token`. Do not rely on an isolate-local counter.
+
+### 17e. Testing the call and transcription workflow
+
+**Automated (CI, offline)** — session creation + invite token issuance, invitation validation
+(valid/wrong/expired/unknown), prospect-only identity enforcement, transcript validation and
+deduplication, approval gates, salesperson-only visibility, session cleanup, request-size validation
+(including bodies without `Content-Length`), and the session-creation limit.
+
+**Requires a real microphone and a deployed environment** — two-party audio, real LiveKit tokens,
+real STT (LiveKit/AssemblyAI), reconnection behaviour, and end-to-end recommendation latency.
+
+Manual live-call test:
+1. Deploy (section 10) and confirm the health checks (section 11).
+2. Open the dashboard, create a session, and tap **Copy Prospect Invitation Link**.
+3. Open that link on a phone; confirm it shows the prospect audio page (no salesperson content).
+4. Tap **Join Call**, allow the microphone, and speak as the prospect.
+5. Confirm the salesperson dashboard shows “Prospect joined”, the prospect transcript, and an
+   approved **SAY THIS NEXT** recommendation; confirm the prospect page shows no recommendations.
+6. Toggle mute, leave, rejoin, and finally tap **End Session**; confirm the invitation link is revoked.

@@ -576,6 +576,99 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   }
   assert(!brokenThrew, "Scheduled handler swallows cleanup errors (never throws)");
 
+  // -------------------------------------------------------------
+  // TEST 15: Prospect invitation flow (invite token, prospect-only token)
+  // -------------------------------------------------------------
+  console.log("\n[15] Testing prospect invitation flow...");
+  const invCreateRes = await worker.fetch(new Request("https://worker.local/api/sessions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ productId: "shopify" })
+  }), testEnv);
+  const invSession = await invCreateRes.json() as any;
+  assert(typeof invSession.inviteToken === "string" && invSession.inviteToken.length >= 32, "Session creation returns a high-entropy invite token");
+  assert(invSession.inviteToken !== invSession.sessionToken, "Invite token is distinct from the session auth token");
+
+  const invValidateRes = await worker.fetch(new Request(`https://worker.local/api/livekit/invite?sessionId=${encodeURIComponent(invSession.sessionId)}&token=${encodeURIComponent(invSession.inviteToken)}`, { method: "GET" }), testEnv);
+  const invValidate = await invValidateRes.json() as any;
+  assert(invValidateRes.status === 200 && invValidate.valid === true, "Valid invitation is accepted");
+  assert(invValidate.sessionToken === undefined && invValidate.inviteToken === undefined && invValidate.recommendation === undefined, "Invitation validation leaks no private data");
+
+  const invWrongRes = await worker.fetch(new Request(`https://worker.local/api/livekit/invite?sessionId=${encodeURIComponent(invSession.sessionId)}&token=wrong-token-value`, { method: "GET" }), testEnv);
+  assert(invWrongRes.status === 403, "Invitation with a wrong token is rejected (403)");
+  const invWrongData = await invWrongRes.json() as any;
+  assert(invWrongData.code === "INVALID_INVITATION", "Wrong invitation returns INVALID_INVITATION");
+
+  const invMissingRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite", { method: "GET" }), testEnv);
+  assert(invMissingRes.status === 400, "Invitation without parameters is rejected (400)");
+
+  const invUnknownRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite?sessionId=sess_does_not_exist&token=abc", { method: "GET" }), testEnv);
+  assert(invUnknownRes.status === 404, "Unknown invitation session is rejected (404)");
+
+  const invTokenRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite-token", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: invSession.sessionId, inviteToken: invSession.inviteToken, identity: "salesperson" })
+  }), testEnv);
+  const invTokenData = await invTokenRes.json() as any;
+  assert(invTokenRes.status === 200, "Valid invitation issues a prospect token");
+  assert(invTokenData.identity === "prospect", "Invite flow always issues a prospect identity (client identity is ignored)");
+  assert(typeof invTokenData.token === "string" && invTokenData.token.length > 0, "Invite flow returns a room token");
+
+  const invTokenBadRes = await worker.fetch(new Request("https://worker.local/api/livekit/invite-token", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: invSession.sessionId, inviteToken: "nope" })
+  }), testEnv);
+  assert(invTokenBadRes.status === 403, "Invite token endpoint rejects an invalid invitation");
+
+  const invListRes = await worker.fetch(new Request(`https://worker.local/api/sessions?sessionId=${encodeURIComponent(invSession.sessionId)}`, {
+    method: "GET", headers: { "x-session-token": invSession.sessionToken }
+  }), testEnv);
+  const invList = await invListRes.json() as any;
+  assert(invList?.sessions?.[0]?.inviteToken === invSession.inviteToken, "Authenticated owner can recover the invite token");
+
+  const invListUnauthRes = await worker.fetch(new Request(`https://worker.local/api/sessions?sessionId=${encodeURIComponent(invSession.sessionId)}`, { method: "GET" }), testEnv);
+  assert(invListUnauthRes.status === 401, "Unauthenticated session listing is rejected");
+
+  // -------------------------------------------------------------
+  // TEST 16: Request-size validation without a Content-Length header
+  // -------------------------------------------------------------
+  console.log("\n[16] Testing streamed oversized body rejection...");
+  const oversizedStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(JSON.stringify({ prompt: "a".repeat(70000) })));
+      controller.close();
+    }
+  });
+  const streamedOversizeReq = new Request("https://worker.local/api/copilot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: oversizedStream,
+    duplex: "half"
+  } as any);
+  assert(streamedOversizeReq.headers.get("Content-Length") === null, "Streamed body has no Content-Length header");
+  const streamedOversizeRes = await worker.fetch(streamedOversizeReq, testEnv);
+  assert(streamedOversizeRes.status === 413, "Oversized streamed body is rejected with 413 even without Content-Length");
+  const streamedOversizeData = await streamedOversizeRes.json() as any;
+  assert(streamedOversizeData.code === "PAYLOAD_TOO_LARGE", "Streamed oversize returns PAYLOAD_TOO_LARGE");
+
+  // -------------------------------------------------------------
+  // TEST 17: Durable session-creation rate limit
+  // -------------------------------------------------------------
+  console.log("\n[17] Testing durable session-creation limit...");
+  const rateEnv: Env = { DB: new MockD1Database(), ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const rateBody = JSON.stringify({ productId: "shopify" });
+  const firstCreate = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: rateBody }), rateEnv);
+  assert(firstCreate.status === 200, "Session creation succeeds below the limit");
+  let sawRateLimit = false;
+  let rateLimitCode = "";
+  for (let i = 0; i < 70; i++) {
+    const r = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: rateBody }), rateEnv);
+    if (r.status === 429) {
+      sawRateLimit = true;
+      const d = await r.json() as any;
+      rateLimitCode = d.code;
+      break;
+    }
+  }
+  assert(sawRateLimit, "Abusive session creation is rejected with 429");
+  assert(rateLimitCode === "RATE_LIMITED", "Rate-limited creation returns RATE_LIMITED");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");

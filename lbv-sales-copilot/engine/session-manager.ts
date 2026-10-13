@@ -335,6 +335,17 @@ export class CloudflareD1SessionStore implements SessionStore {
     return Number(res.meta?.changes || 0);
   }
 
+  /**
+   * Durable count of sessions created since `sinceMs`. Backed by the D1 table,
+   * so it is consistent across Worker isolates (unlike an in-memory counter).
+   * Used to bound abusive session creation.
+   */
+  public async countSessionsCreatedSince(sinceMs: number): Promise<number> {
+    const db = this.ensureDb();
+    const row = await db.prepare("SELECT COUNT(*) as count FROM sessions WHERE created_at > ?").bind(sinceMs).first();
+    return Number(row?.count || 0);
+  }
+
   public async findByTokenAsync(token: string, sessionId?: string): Promise<SalesSession | undefined> {
     const db = this.ensureDb();
     let row: any = null;
