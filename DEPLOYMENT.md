@@ -538,7 +538,16 @@ The `agent/` directory is now a complete LiveKit Cloud deployment unit:
 | `agent/Dockerfile` | glibc (Debian slim) base, `ca-certificates` (required by the LiveKit SDK), non-root `appuser`, `WORKDIR /app`, `npm ci --omit=dev`, `livekit-agents download-files`, `CMD ["node", "--import", "tsx", "agent.ts", "start"]` |
 | `agent/.dockerignore` | excludes `node_modules` and all `.env*` from the build context |
 | `agent/livekit.toml.example` | template for the deployment config (real file is generated on first registration) |
-| `.github/workflows/deploy-agent.yml` | `livekit/deploy-action@v2` with `WORKING_DIRECTORY: agent` |
+| `.github/workflows/deploy-agent.yml` | `livekit/deploy-action@v2` with `WORKING_DIRECTORY: agent` — currently **staged** at `agent/deploy/deploy-agent.yml`, see below |
+
+**Workflow file is staged, not installed:** GitHub rejected pushing
+`.github/workflows/deploy-agent.yml` because the automation account used for this
+branch is a GitHub App installation **without the `workflows` permission**
+(`refusing to allow a GitHub App to create or update workflow ... without
+workflows permission`). The workflow and an optional `agent/` typecheck CI job are
+therefore committed to `agent/deploy/` together with install instructions
+(`agent/deploy/README.md`). Copy `agent/deploy/deploy-agent.yml` to
+`.github/workflows/deploy-agent.yml` (web UI or `git mv`) to activate deployment.
 
 **Why `livekit.toml` is a template, not the real file:** LiveKit Cloud assigns the agent ID when the
 agent is first registered, so `[agent] id` cannot be fabricated. Register with the workflow

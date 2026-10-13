@@ -1,0 +1,187 @@
+name: Deploy LiveKit Agent
+
+# Deploys the existing LiveKit agent in `agent/` to LiveKit Cloud using the
+# official `livekit/deploy-action`.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   LIVEKIT_URL         wss://<project>.livekit.cloud   (deploy-time only)
+#   LIVEKIT_API_KEY     LiveKit Cloud API key           (deploy-time only)
+#   LIVEKIT_API_SECRET  LiveKit Cloud API secret        (deploy-time only)
+#   ASSEMBLYAI_API_KEY  AssemblyAI key -> stored as a LiveKit Cloud agent secret
+#                       and injected into the agent at RUNTIME as ASSEMBLYAI_API_KEY
+#
+# The LiveKit credentials are used ONLY to authenticate the deploy call. The
+# deployed agent receives LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+# automatically from LiveKit Cloud (these can never be set as agent secrets),
+# and ASSEMBLYAI_API_KEY from LiveKit Cloud secrets management.
+#
+# First run: Actions -> "Deploy LiveKit Agent" -> Run workflow -> operation: create.
+# `create` registers the agent, deploys it, and opens a PR containing the
+# generated `agent/livekit.toml`. Merge that PR, after which pushes touching
+# `agent/**` deploy automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'LiveKit agent operation (auto = create if not yet registered, otherwise deploy)'
+        required: true
+        type: choice
+        options:
+          - auto
+          - create
+          - deploy
+        default: auto
+      region:
+        description: 'LiveKit Cloud region (optional; empty = nearest region)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/deploy-agent.yml'
+
+# `create` pushes a branch + PR for the generated livekit.toml.
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: livekit-agent-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-agent:
+    name: Build and deploy LiveKit Cloud agent
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolves what to do without ever inventing an agent ID: `create` is only
+      # used when no livekit.toml exists AND a human explicitly triggered the
+      # workflow; a push without a registered agent is skipped (never fails CI).
+      - name: Resolve operation
+        id: op
+        env:
+          REQUESTED: ${{ github.event.inputs.operation }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ -f agent/livekit.toml ]; then registered=true; else registered=false; fi
+          requested="${REQUESTED:-auto}"
+          if [ "$requested" = "auto" ]; then
+            if [ "$registered" = "true" ]; then
+              requested=deploy
+            elif [ "$EVENT" = "workflow_dispatch" ]; then
+              requested=create
+            else
+              requested=skip
+            fi
+          fi
+          if [ "$requested" = "deploy" ] && [ "$registered" != "true" ]; then
+            echo "::error::agent/livekit.toml is missing, so the agent is not registered yet. Run this workflow with operation=create first."
+            exit 1
+          fi
+          echo "operation=$requested" >> "$GITHUB_OUTPUT"
+          echo "Resolved operation: $requested (livekit.toml present: $registered)"
+
+      - name: Skip (agent not registered yet)
+        if: steps.op.outputs.operation == 'skip'
+        run: echo "::notice::agent/livekit.toml not found - skipping deploy. Run this workflow manually with operation=create to register the agent."
+
+      - name: Verify deployment credentials are configured
+        if: steps.op.outputs.operation != 'skip'
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          ASSEMBLYAI_API_KEY: ${{ secrets.ASSEMBLYAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${LIVEKIT_URL:-}" ] || missing="$missing LIVEKIT_URL"
+          [ -n "${LIVEKIT_API_KEY:-}" ] || missing="$missing LIVEKIT_API_KEY"
+          [ -n "${LIVEKIT_API_SECRET:-}" ] || missing="$missing LIVEKIT_API_SECRET"
+          [ -n "${ASSEMBLYAI_API_KEY:-}" ] || missing="$missing ASSEMBLYAI_API_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repository secret(s):$missing"
+            exit 1
+          fi
+          echo "All required deployment secrets are present."
+
+      # Guard against accidentally baking credentials into the image.
+      - name: Assert no credentials are baked into the image
+        if: steps.op.outputs.operation != 'skip'
+        run: |
+          set -euo pipefail
+          if grep -nE '^[[:space:]]*(ENV|ARG)[[:space:]]+.*(LIVEKIT_API_KEY|LIVEKIT_API_SECRET|ASSEMBLYAI_API_KEY)' agent/Dockerfile; then
+            echo "::error::agent/Dockerfile must not define LIVEKIT_API_KEY / LIVEKIT_API_SECRET / ASSEMBLYAI_API_KEY. Runtime secrets come from LiveKit Cloud."
+            exit 1
+          fi
+          echo "Dockerfile does not bake credentials into the image."
+
+      - name: Create LiveKit Cloud agent
+        if: steps.op.outputs.operation == 'create'
+        uses: livekit/deploy-action@v2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          # LiveKit Cloud stores these and injects them into the agent at runtime.
+          SECRET_LIST: ASSEMBLYAI_API_KEY=${{ secrets.ASSEMBLYAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          OPERATION: create
+          WORKING_DIRECTORY: agent
+          REGION: ${{ github.event.inputs.region }}
+
+      - name: Open PR with generated livekit.toml
+        if: steps.op.outputs.operation == 'create'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          add-paths: |
+            agent/livekit.toml
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: livekit-agent-config-${{ github.run_id }}
+          title: 'Add LiveKit agent config (livekit.toml)'
+          commit-message: 'Add LiveKit agent config'
+          body: |
+            Generated by `.github/workflows/deploy-agent.yml` (operation: create).
+
+            This file contains only the LiveKit Cloud project subdomain and the
+            agent ID - no credentials. Merge it so future pushes to `main` that
+            touch `agent/**` can deploy the agent automatically.
+          base: main
+          delete-branch: true
+
+      - name: Deploy LiveKit Cloud agent
+        if: steps.op.outputs.operation == 'deploy'
+        uses: livekit/deploy-action@v2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          # Updates the agent's runtime secret; triggers a rolling restart.
+          SECRET_LIST: ASSEMBLYAI_API_KEY=${{ secrets.ASSEMBLYAI_API_KEY }}
+        with:
+          OPERATION: deploy
+          WORKING_DIRECTORY: agent
+
+      - name: Wait for the agent to reach the Running state
+        if: steps.op.outputs.operation != 'skip'
+        uses: livekit/deploy-action@v2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+        with:
+          OPERATION: status-retry
+          WORKING_DIRECTORY: agent
+          TIMEOUT: 5m

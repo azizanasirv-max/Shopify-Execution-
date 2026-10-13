@@ -27,3 +27,6 @@ npm-debug.log
 
 # Docs
 README.md
+
+# Staged deployment workflow / install instructions (not needed at runtime)
+deploy/

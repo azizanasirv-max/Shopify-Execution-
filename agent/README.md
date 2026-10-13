@@ -70,6 +70,12 @@ This directory is a complete deployment unit for LiveKit Cloud
 
 ### 1. Register the agent (one time)
 
+> **Install the workflow first:** the deploy workflow is staged at
+> [`agent/deploy/deploy-agent.yml`](./deploy/deploy-agent.yml) because the
+> automation token used to prepare this branch lacks GitHub's `workflows`
+> permission. Copy it to `.github/workflows/deploy-agent.yml` (see
+> [`agent/deploy/README.md`](./deploy/README.md)) before running it.
+
 LiveKit Cloud issues the agent ID on first registration; it cannot be guessed.
 Either run the GitHub Actions workflow `.github/workflows/deploy-agent.yml`
 (**Actions → Deploy LiveKit Agent → Run workflow → operation: `create`**), which
