@@ -44,6 +44,26 @@ export interface LiveKitSalesRoomProps {
   productId?: string;
 }
 
+/**
+ * Minimal Server-Sent Events parser for the streaming recommendation endpoint.
+ * Returns null for keep-alive/comment frames.
+ */
+function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
+  const lines = rawEvent.split("\n");
+  let event = "message";
+  const dataLines: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  try {
+    return { event, data: JSON.parse(dataLines.join("\n")) };
+  } catch {
+    return null;
+  }
+}
+
 export default function LiveKitSalesRoom({
   sessionId: propSessionId,
   sessionToken: propSessionToken,
@@ -59,6 +79,9 @@ export default function LiveKitSalesRoom({
   const [activeProductId, setActiveProductId] = useState<string>(propProductId);
   const [isSimulatedMode, setIsSimulatedMode] = useState<boolean>(false);
   const [inviteCopied, setInviteCopied] = useState<boolean>(false);
+  const [inviteToken, setInviteToken] = useState<string | null>(null);
+  const [prospectTranscripts, setProspectTranscripts] = useState<{ text: string; timestamp: number }[]>([]);
+  const [callEnded, setCallEnded] = useState<boolean>(false);
   const [showManualSession, setShowManualSession] = useState<boolean>(false);
   const [manualSessionIdInput, setManualSessionIdInput] = useState<string>("");
   const [manualSessionTokenInput, setManualSessionTokenInput] = useState<string>("");
@@ -123,6 +146,7 @@ export default function LiveKitSalesRoom({
   const [isProcessingTranscript, setIsProcessingTranscript] = useState<boolean>(false);
   const processedSegmentIdsRef = useRef<Set<string>>(new Set());
   const monotonicReqSeqRef = useRef<number>(0);
+  const activeAbortRef = useRef<AbortController | null>(null);
 
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -196,6 +220,7 @@ export default function LiveKitSalesRoom({
 
   const handleJoinRoom = async () => {
     setErrorMessage(null);
+    setCallEnded(false);
     setIsConnecting(true);
 
     try {
@@ -218,6 +243,7 @@ export default function LiveKitSalesRoom({
         currentSessionToken = sessData.sessionToken;
         setActiveSessionId(sessData.sessionId);
         setActiveSessionToken(sessData.sessionToken);
+        if (sessData.inviteToken) setInviteToken(sessData.inviteToken);
         if (sessData.roomName) setRoomName(sessData.roomName);
       }
 
@@ -365,52 +391,141 @@ export default function LiveKitSalesRoom({
             if (isFinal && text.trim().length > 0 && speakerRole === "prospect") {
               if (processedSegmentIdsRef.current.has(segmentId)) continue;
               processedSegmentIdsRef.current.add(segmentId);
+              setProspectTranscripts((prev) => [...prev.slice(-49), { text: text.trim(), timestamp: Date.now() }]);
 
               // Defect 3: Monotonic request sequence counter for stale-response rejection
               monotonicReqSeqRef.current += 1;
               const currentReqSeq = monotonicReqSeqRef.current;
 
+              // Cancel any in-flight recommendation request: a newer transcript supersedes it.
+              if (activeAbortRef.current) {
+                activeAbortRef.current.abort();
+              }
+              const abortController = new AbortController();
+              activeAbortRef.current = abortController;
+
               setIsProcessingTranscript(true);
               setErrorMessage(null);
 
-              try {
-                const transcriptRes = await fetch("/api/livekit/transcript", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
-                  },
-                  body: JSON.stringify({
-                    sessionId: currentSessionId,
-                    sessionToken: currentSessionToken,
-                    text: text.trim(),
-                    isFinal: true,
-                    speaker: "prospect"
-                  })
-                });
+              const requestHeaders = {
+                "Content-Type": "application/json",
+                ...(currentSessionToken ? { "x-session-token": currentSessionToken } : {})
+              };
+              const requestBody = JSON.stringify({
+                sessionId: currentSessionId,
+                sessionToken: currentSessionToken,
+                text: text.trim(),
+                isFinal: true,
+                speaker: "prospect"
+              });
 
-                if (!transcriptRes.ok) {
-                  const errData = await transcriptRes.json().catch(() => ({}));
-                  // Defect 3: Unmark failed request so retries can occur safely
-                  processedSegmentIdsRef.current.delete(segmentId);
-                  setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
-                } else {
-                  const data = await transcriptRes.json();
-                  // Defect 3: Monotonic check for out-of-order response rejection
-                  if (currentReqSeq === monotonicReqSeqRef.current && data.recommendation) {
-                    setCurrentRecommendation({
-                      statement: data.recommendation.statement,
-                      status: data.recommendation.status,
-                      timestamp: Date.now(),
-                      toolsUsed: data.recommendation.toolsUsed
-                    });
+              try {
+                let streamingSucceeded = false;
+
+                // Preferred path: stream VALIDATED recommendation text (SSE).
+                try {
+                  const streamRes = await fetch("/api/livekit/transcript/stream", {
+                    method: "POST",
+                    headers: requestHeaders,
+                    body: requestBody,
+                    signal: abortController.signal
+                  });
+
+                  if (streamRes.ok && streamRes.body) {
+                    const reader = streamRes.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = "";
+                    let accumulated = "";
+                    let streamDone = false;
+
+                    while (!streamDone) {
+                      const chunk = await reader.read();
+                      streamDone = chunk.done;
+                      if (chunk.value) {
+                        buffer += decoder.decode(chunk.value, { stream: true });
+                      }
+                      const frames = buffer.split("\n\n");
+                      buffer = frames.pop() || "";
+
+                      for (const frame of frames) {
+                        const parsed = parseSseEvent(frame);
+                        if (!parsed) continue;
+                        if (parsed.event === "delta") {
+                          if (currentReqSeq === monotonicReqSeqRef.current && parsed.data?.text) {
+                            accumulated += parsed.data.text;
+                            setCurrentRecommendation({
+                              statement: accumulated,
+                              status: "APPROVED",
+                              timestamp: Date.now()
+                            });
+                            setIsProcessingTranscript(false);
+                            streamingSucceeded = true;
+                          }
+                        } else if (parsed.event === "final") {
+                          const rec = parsed.data?.recommendation;
+                          if (currentReqSeq === monotonicReqSeqRef.current && rec) {
+                            setCurrentRecommendation({
+                              statement: rec.statement,
+                              status: rec.status,
+                              timestamp: Date.now(),
+                              toolsUsed: rec.toolsUsed
+                            });
+                            streamingSucceeded = true;
+                          }
+                        } else if (parsed.event === "error") {
+                          throw new Error(parsed.data?.error || "Streaming recommendation failed.");
+                        }
+                      }
+                    }
+                  }
+
+                  if (!streamingSucceeded) {
+                    throw new Error("Streaming response produced no recommendation.");
+                  }
+                } catch (streamErr: any) {
+                  if (streamErr?.name === "AbortError") {
+                    // Superseded by a newer transcript; do not surface an error.
+                    throw streamErr;
+                  }
+                  console.warn("Streaming recommendation unavailable, falling back:", streamErr?.message || streamErr);
+                }
+
+                // Non-streaming fallback (retained for unsupported/failed streaming).
+                if (!streamingSucceeded) {
+                  const transcriptRes = await fetch("/api/livekit/transcript", {
+                    method: "POST",
+                    headers: requestHeaders,
+                    body: requestBody,
+                    signal: abortController.signal
+                  });
+
+                  if (!transcriptRes.ok) {
+                    const errData = await transcriptRes.json().catch(() => ({}));
+                    // Defect 3: Unmark failed request so retries can occur safely
+                    processedSegmentIdsRef.current.delete(segmentId);
+                    setErrorMessage(errData.error || errData.message || `Transcript processing failed with status ${transcriptRes.status}`);
+                  } else {
+                    const data = await transcriptRes.json();
+                    // Defect 3: Monotonic check for out-of-order response rejection
+                    if (currentReqSeq === monotonicReqSeqRef.current && data.recommendation) {
+                      setCurrentRecommendation({
+                        statement: data.recommendation.statement,
+                        status: data.recommendation.status,
+                        timestamp: Date.now(),
+                        toolsUsed: data.recommendation.toolsUsed
+                      });
+                    }
                   }
                 }
               } catch (txErr: any) {
-                console.error("Failed to process LiveKit transcript:", txErr);
-                // Defect 3: Unmark failed network request so retries can occur
-                processedSegmentIdsRef.current.delete(segmentId);
-                setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
+                if (txErr?.name === "AbortError") {
+                  // Cancelled by a newer transcript; intentionally silent.
+                } else {
+                  console.error("Failed to process LiveKit transcript:", txErr);
+                  // Defect 3: Unmark failed network request so retries can occur
+                  processedSegmentIdsRef.current.delete(segmentId);
+                  setErrorMessage("Network connection error processing transcript: " + (txErr.message || txErr));
+                }
               } finally {
                 if (currentReqSeq === monotonicReqSeqRef.current) {
                   setIsProcessingTranscript(false);
@@ -516,34 +631,66 @@ export default function LiveKitSalesRoom({
   const handleCopyInviteLink = async () => {
     try {
       let curId = activeSessionId;
-      let curToken = activeSessionToken;
-      if (!curId || !curToken) {
+      let curInvite = inviteToken;
+
+      // Ensure a session exists and we hold its invitation token.
+      if (!curId || !curInvite) {
         const sessRes = await fetch("/api/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ productId: activeProductId })
         });
-        if (sessRes.ok) {
-          const sessData = await sessRes.json();
-          curId = sessData.sessionId;
-          curToken = sessData.sessionToken;
-          setActiveSessionId(curId);
-          setActiveSessionToken(curToken);
-          if (sessData.roomName) setRoomName(sessData.roomName);
-        }
+        if (!sessRes.ok) throw new Error("Failed to create a session for the invitation.");
+        const sessData = await sessRes.json();
+        curId = sessData.sessionId;
+        curInvite = sessData.inviteToken;
+        setActiveSessionId(curId);
+        setActiveSessionToken(sessData.sessionToken);
+        setInviteToken(sessData.inviteToken || null);
+        if (sessData.roomName) setRoomName(sessData.roomName);
       }
-      if (curId && curToken) {
-        const inviteUrl = `${window.location.origin}${window.location.pathname}?tab=livekit&sessionId=${encodeURIComponent(
-          curId
-        )}&sessionToken=${encodeURIComponent(curToken)}&productId=${encodeURIComponent(
-          activeProductId
-        )}&role=salesperson`;
-        await navigator.clipboard.writeText(inviteUrl);
-        setInviteCopied(true);
-        setTimeout(() => setInviteCopied(false), 3500);
+
+      if (!curId || !curInvite) {
+        setErrorMessage("Could not generate an invitation link. Start a new session and try again.");
+        return;
       }
+
+      // SECURITY: the prospect link carries ONLY the scoped invitation token,
+      // never the salesperson session token.
+      const inviteUrl = `${window.location.origin}${window.location.pathname}?join=1&sessionId=${encodeURIComponent(
+        curId
+      )}&token=${encodeURIComponent(curInvite)}`;
+      await navigator.clipboard.writeText(inviteUrl);
+      setInviteCopied(true);
+      setTimeout(() => setInviteCopied(false), 3500);
     } catch (e: any) {
       console.error("Failed to copy invite link:", e);
+      setErrorMessage(e?.message || "Failed to copy the invitation link.");
+    }
+  };
+
+  /**
+   * Ends the session safely: disconnects audio and revokes the session (and its
+   * invitation) server-side so the prospect link can no longer be used.
+   */
+  const handleEndSession = async () => {
+    const sid = activeSessionId;
+    const tok = activeSessionToken;
+    disconnectRoom();
+    setCallEnded(true);
+    setProspectTranscripts([]);
+    setActiveSessionId(null);
+    setActiveSessionToken(null);
+    setInviteToken(null);
+    if (sid && tok) {
+      try {
+        await fetch(`/api/sessions/${encodeURIComponent(sid)}`, {
+          method: "DELETE",
+          headers: { "x-session-token": tok }
+        });
+      } catch {
+        /* best effort: session may already be expired */
+      }
     }
   };
 
@@ -559,6 +706,7 @@ export default function LiveKitSalesRoom({
         const sessData = await sessRes.json();
         setActiveSessionId(sessData.sessionId);
         setActiveSessionToken(sessData.sessionToken);
+        if (sessData.inviteToken) setInviteToken(sessData.inviteToken);
         setManualSessionIdInput(sessData.sessionId);
         setManualSessionTokenInput(sessData.sessionToken);
         if (sessData.roomName) setRoomName(sessData.roomName);
@@ -580,6 +728,9 @@ export default function LiveKitSalesRoom({
   };
 
   const isConnected = connectionState === ConnectionState.Connected;
+  const prospectParticipant = participants.find(
+    (pt) => !pt.isLocal && pt.identity.toLowerCase().startsWith("prospect")
+  );
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 shadow-2xl backdrop-blur-sm">
@@ -685,6 +836,64 @@ export default function LiveKitSalesRoom({
         </div>
       )}
 
+      {/* Prospect call status & transcript (salesperson-only, never sent to the prospect) */}
+      <div className="mt-5 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="bg-slate-950/70 border border-slate-800 rounded-2xl p-4 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+              <Radio className="w-3.5 h-3.5 text-indigo-400" /> Call Status
+            </span>
+            <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${
+              callEnded
+                ? "bg-slate-700/30 text-slate-300 border-slate-600"
+                : isConnected
+                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                : isConnecting
+                ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
+                : "bg-slate-800 text-slate-300 border-slate-700"
+            }`}>
+              {callEnded
+                ? "Ended"
+                : connectionState === ConnectionState.Reconnecting
+                ? "Reconnecting"
+                : isConnected
+                ? "Connected"
+                : isConnecting
+                ? "Connecting"
+                : "Waiting"}
+            </span>
+          </div>
+          <div className="text-xs text-slate-400 flex items-center gap-2">
+            <Users className="w-3.5 h-3.5" />
+            {prospectParticipant ? (
+              <span className="text-emerald-300">
+                Prospect joined ({prospectParticipant.name || prospectParticipant.identity})
+              </span>
+            ) : (
+              <span>Waiting for the prospect to join…</span>
+            )}
+          </div>
+          <div className="text-[11px] text-slate-500">
+            Room: <span className="text-indigo-300">{roomName}</span>
+          </div>
+        </div>
+
+        <div className="bg-slate-950/70 border border-slate-800 rounded-2xl p-4 space-y-2">
+          <span className="text-xs font-bold text-slate-300 uppercase tracking-wider block">Prospect Transcript</span>
+          <div className="max-h-40 overflow-y-auto space-y-1.5">
+            {prospectTranscripts.length === 0 ? (
+              <p className="text-[11px] text-slate-500">Finalized prospect speech will appear here.</p>
+            ) : (
+              prospectTranscripts.map((t, i) => (
+                <p key={i} className="text-xs text-slate-200 bg-slate-900/70 border border-slate-800 rounded-lg p-2">
+                  {t.text}
+                </p>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* Live "SAY THIS NEXT" Silent Copilot Banner */}
       {(currentRecommendation || isProcessingTranscript) && (
         <div className="mt-5 bg-gradient-to-r from-indigo-950/80 via-slate-900 to-purple-950/80 border border-indigo-500/40 rounded-2xl p-5 shadow-2xl animate-fadeIn">
@@ -769,10 +978,10 @@ export default function LiveKitSalesRoom({
                       ? "bg-emerald-600/20 text-emerald-300 border-emerald-500/40"
                       : "bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-700 hover:text-white"
                   }`}
-                  title="Copy direct invite link with session token for second browser"
+                  title="Copy the prospect invitation link (audio-only call)"
                 >
                   <Sparkles className="w-3 h-3 text-indigo-400" />
-                  {inviteCopied ? "Invite Link Copied!" : "Copy 2-Browser Invite Link"}
+                  {inviteCopied ? "Invitation Link Copied!" : "Copy Prospect Invitation Link"}
                 </button>
 
                 <button
@@ -911,14 +1120,25 @@ export default function LiveKitSalesRoom({
                   {isConnecting ? "Connecting to LiveKit..." : "Join Sales Room"}
                 </button>
               ) : (
-                <button
-                  type="button"
-                  onClick={disconnectRoom}
-                  className="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-bold py-2.5 px-4 rounded-xl text-xs flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-950/40 cursor-pointer"
-                >
-                  <PhoneOff className="w-4 h-4" />
-                  Leave Room
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={disconnectRoom}
+                    className="flex-1 bg-slate-700 hover:bg-slate-600 text-white font-bold py-2.5 px-4 rounded-xl text-xs flex items-center justify-center gap-2 transition-all cursor-pointer"
+                  >
+                    <PhoneOff className="w-4 h-4" />
+                    Leave Room
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleEndSession}
+                    className="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-bold py-2.5 px-4 rounded-xl text-xs flex items-center justify-center gap-2 transition-all shadow-lg shadow-rose-950/40 cursor-pointer"
+                    title="End the session and revoke the prospect invitation link"
+                  >
+                    <PhoneOff className="w-4 h-4" />
+                    End Session
+                  </button>
+                </>
               )}
 
               {/* Microphone Toggle */}

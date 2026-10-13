@@ -28,6 +28,13 @@ import {
 } from "./types.js";
 import { validateToolCall } from "./schema-validator.js";
 import { AdapterRegistry } from "./adapter-registry.js";
+import {
+  TokenBudget,
+  UsageTracker,
+  TokenUsage,
+  estimateTokens
+} from "./llm/token-budget.js";
+import { withConciseDirective, decideRouting } from "./llm/routing.js";
 
 export type { ConversationTurn } from "./types.js";
 
@@ -38,6 +45,16 @@ export interface SalesEngineConfig {
   defaultAdapter?: SalesApiAdapter;
   adapterRegistry?: AdapterRegistry;
   logger?: (level: "info" | "warn" | "error", message: string, meta?: any) => void;
+  /** Stable id of the active LLM provider (observability only). */
+  providerId?: string;
+  /** Optional cumulative token budget enforced around every model call. */
+  tokenBudget?: TokenBudget;
+  /** Optional cross-provider usage aggregator. */
+  usageTracker?: UsageTracker;
+  /** When true, deterministic routing may skip model calls for non-actionable utterances. */
+  deterministicRouting?: boolean;
+  /** When enabled, a brevity constraint is appended to the system instruction. */
+  conciseOutput?: { enabled: boolean; minWords?: number; maxWords?: number };
 }
 
 export interface GenerateRecommendationOptions {
@@ -56,6 +73,11 @@ export class GenericSalesEngine {
   private logger: (level: "info" | "warn" | "error", message: string, meta?: any) => void;
   private recentTranscripts = new Map<string, number>();
   private readonly maxHistoryTurns: number = 100;
+  private readonly providerId: string;
+  private readonly tokenBudget?: TokenBudget;
+  private readonly usageTracker?: UsageTracker;
+  private readonly deterministicRouting: boolean;
+  private readonly conciseOutput: { enabled: boolean; minWords?: number; maxWords?: number };
 
   private pushBoundedHistory(historyArray: ConversationTurn[] | undefined, userTurn: ConversationTurn, modelTurn: ConversationTurn): void {
     if (!historyArray) return;
@@ -79,6 +101,11 @@ export class GenericSalesEngine {
     this.modelName = config.modelName || "gemini-3.1-flash-lite";
     this.defaultAdapter = config.defaultAdapter;
     this.adapterRegistry = config.adapterRegistry;
+    this.providerId = config.providerId || "unknown";
+    this.tokenBudget = config.tokenBudget;
+    this.usageTracker = config.usageTracker;
+    this.deterministicRouting = config.deterministicRouting === true;
+    this.conciseOutput = config.conciseOutput || { enabled: false };
     this.logger = config.logger || ((level, msg, meta) => {
       if (level === "error") {
         console.error(`[SalesEngine:${level.toUpperCase()}] ${msg}`, meta || "");
@@ -119,6 +146,56 @@ export class GenericSalesEngine {
    */
   public getHistory(): ConversationTurn[] {
     return [...this.conversationHistory];
+  }
+
+  /**
+   * Invokes the model through a single choke point that applies the concise
+   * output directive, enforces the token budget, optionally streams deltas, and
+   * records usage. All model traffic flows through here.
+   */
+  private async invokeModel(
+    contents: any[],
+    systemInstruction: string,
+    functionDeclarations: any[],
+    onTextDelta?: (delta: string) => void
+  ): Promise<{ text?: string; functionCalls?: any[]; candidates?: any[]; usage?: TokenUsage }> {
+    const effectiveSystemInstruction = this.conciseOutput.enabled
+      ? withConciseDirective(systemInstruction, {
+          minWords: this.conciseOutput.minWords,
+          maxWords: this.conciseOutput.maxWords
+        })
+      : systemInstruction;
+
+    if (this.tokenBudget) {
+      const estimated =
+        estimateTokens(effectiveSystemInstruction) + estimateTokens(JSON.stringify(contents));
+      this.tokenBudget.assertWithinBudget(estimated);
+    }
+
+    const params = {
+      model: this.modelName,
+      contents,
+      config: {
+        systemInstruction: effectiveSystemInstruction,
+        tools: functionDeclarations.length > 0 ? [{ functionDeclarations }] : undefined
+      }
+    };
+
+    const streamFn = (this.modelProvider as any).generateContentStream;
+    let result: any;
+    if (onTextDelta && typeof streamFn === "function") {
+      result = await streamFn.call(this.modelProvider, params, onTextDelta);
+    } else {
+      result = await this.modelProvider.generateContent(params);
+    }
+
+    const usage: TokenUsage | undefined = result?.usage;
+    if (usage) {
+      if (this.tokenBudget) this.tokenBudget.record(usage);
+      if (this.usageTracker) this.usageTracker.record(this.providerId, usage);
+    }
+
+    return { text: result?.text, functionCalls: result?.functionCalls, candidates: result?.candidates, usage };
   }
 
   /**
@@ -179,6 +256,7 @@ export class GenericSalesEngine {
     const toolsLogged: ToolCallResult[] = [];
     const modelStart = Date.now();
     let modelExecutionMs = 0;
+    let lastUsage: TokenUsage | undefined;
     let approvalGateStart = 0;
     let approvalGateMs = 0;
 
@@ -212,14 +290,12 @@ export class GenericSalesEngine {
 
     try {
       // 1st Model Turn: Determine need for business tools
-      let response = await this.modelProvider.generateContent({
-        model: this.modelName,
-        contents: currentContents,
-        config: {
-          systemInstruction: activeAdapter.getSystemInstructions(),
-          tools: functionDeclarations.length > 0 ? [{ functionDeclarations }] : undefined
-        }
-      });
+      let response = await this.invokeModel(
+        currentContents,
+        activeAdapter.getSystemInstructions(),
+        functionDeclarations
+      );
+      lastUsage = response.usage || lastUsage;
 
       const functionCalls = response.functionCalls;
 
@@ -277,14 +353,12 @@ export class GenericSalesEngine {
         });
 
         // 2nd Model Turn: Synthesize grounded response using tool results
-        response = await this.modelProvider.generateContent({
-          model: this.modelName,
-          contents: currentContents,
-          config: {
-            systemInstruction: activeAdapter.getSystemInstructions(),
-            tools: functionDeclarations.length > 0 ? [{ functionDeclarations }] : undefined
-          }
-        });
+        response = await this.invokeModel(
+          currentContents,
+          activeAdapter.getSystemInstructions(),
+          functionDeclarations
+        );
+        lastUsage = response.usage || lastUsage;
       }
 
       modelExecutionMs = Date.now() - modelStart;
@@ -316,13 +390,12 @@ export class GenericSalesEngine {
         ];
 
         try {
-          const recoveryResponse = await this.modelProvider.generateContent({
-            model: this.modelName,
-            contents: recoveryContents,
-            config: {
-              systemInstruction: activeAdapter.getSystemInstructions()
-            }
-          });
+          const recoveryResponse = await this.invokeModel(
+            recoveryContents,
+            activeAdapter.getSystemInstructions(),
+            []
+          );
+          lastUsage = recoveryResponse.usage || lastUsage;
 
           const recoveredStatement = recoveryResponse.text || "";
           const recoveryValidation = activeAdapter.validateResponse(recoveredStatement, prospectPrompt);
@@ -393,7 +466,8 @@ export class GenericSalesEngine {
           recoveryAttempts,
           isFallback: status === "BLOCKED",
           rawUnapprovedStatement,
-          sessionId: session?.id
+          sessionId: session?.id,
+          usage: lastUsage
         } as any
       };
 
@@ -440,6 +514,47 @@ export class GenericSalesEngine {
   }
 
   /**
+   * Streaming recommendation pipeline.
+   *
+   * SECURITY: raw, unvalidated model tokens are NEVER forwarded to the caller.
+   * The full model output is produced and run through the deterministic approval
+   * gate first; only the validated statement (or the safe fallback for BLOCKED
+   * results) is then emitted incrementally via `onValidatedDelta`. This gives the
+   * UI incremental rendering without ever exposing unapproved claims.
+   */
+  public async generateRecommendationStream(
+    prospectPrompt: string,
+    adapterOrOptions: SalesApiAdapter | GenerateRecommendationOptions | undefined,
+    onValidatedDelta: (delta: string) => void
+  ): Promise<SalesRecommendation> {
+    const recommendation = await this.generateRecommendation(prospectPrompt, adapterOrOptions);
+    for (const chunk of GenericSalesEngine.chunkForStreaming(recommendation.statement || "")) {
+      onValidatedDelta(chunk);
+    }
+    return recommendation;
+  }
+
+  /** Splits validated text into small chunks for incremental UI rendering. */
+  public static chunkForStreaming(text: string, wordsPerChunk: number = 5): string[] {
+    if (!text) return [];
+    const tokens = text.split(/(\s+)/);
+    const chunks: string[] = [];
+    let current = "";
+    let words = 0;
+    for (const tok of tokens) {
+      current += tok;
+      if (/\S/.test(tok)) words++;
+      if (words >= wordsPerChunk) {
+        chunks.push(current);
+        current = "";
+        words = 0;
+      }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  /**
    * Realtime transcript hook:
    * Called when a new spoken turn or transcript segment arrives from a live room.
    */
@@ -465,6 +580,18 @@ export class GenericSalesEngine {
 
       this.recentTranscripts.set(trimmedText, now);
       this.logger("info", `Realtime prospect statement received: "${trimmedText}"`);
+
+      if (this.deterministicRouting) {
+        const decision = decideRouting(trimmedText);
+        if (!decision.invokeModel) {
+          this.logger(
+            "info",
+            `Deterministic routing skipped model call (${decision.reason}): "${trimmedText}"`
+          );
+          return;
+        }
+      }
+
       const rec = await this.generateRecommendation(trimmedText);
       onRecommendationReady(rec);
     }
