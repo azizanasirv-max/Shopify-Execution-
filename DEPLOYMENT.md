@@ -522,12 +522,58 @@ The agent is a persistent Node.js process, so it does **not** run on Cloudflare 
 
 | Option | Notes |
 |---|---|
-| LiveKit Cloud agent deploy (`lk agent deploy`) | Managed; simplest if you use LiveKit Cloud |
+| LiveKit Cloud agent deploy (`lk agent deploy` / `livekit/deploy-action`) | Managed; simplest if you use LiveKit Cloud — **prepared in this repo** (§18b-1) |
 | Fly.io / Railway / Render | Long-running container; `npm start` in `agent/` |
 | A VPS / Docker host | Full control |
 
 Requirements: Node.js 20+, outbound network to LiveKit and `api.assemblyai.com`, and the agent env
 vars below. Run `cd agent && npm install && npm run typecheck && npm run dev` locally first.
+
+### 18b-1. LiveKit Cloud deployment artifacts (prepared, not deployed)
+
+The `agent/` directory is now a complete LiveKit Cloud deployment unit:
+
+| File | Role |
+|---|---|
+| `agent/Dockerfile` | glibc (Debian slim) base, `ca-certificates` (required by the LiveKit SDK), non-root `appuser`, `WORKDIR /app`, `npm ci --omit=dev`, `livekit-agents download-files`, `CMD ["node", "--import", "tsx", "agent.ts", "start"]` |
+| `agent/.dockerignore` | excludes `node_modules` and all `.env*` from the build context |
+| `agent/livekit.toml.example` | template for the deployment config (real file is generated on first registration) |
+| `.github/workflows/deploy-agent.yml` | `livekit/deploy-action@v2` with `WORKING_DIRECTORY: agent` — currently **staged** at `agent/deploy/deploy-agent.yml`, see below |
+
+**Workflow file is staged, not installed:** GitHub rejected pushing
+`.github/workflows/deploy-agent.yml` because the automation account used for this
+branch is a GitHub App installation **without the `workflows` permission**
+(`refusing to allow a GitHub App to create or update workflow ... without
+workflows permission`). The workflow and an optional `agent/` typecheck CI job are
+therefore committed to `agent/deploy/` together with install instructions
+(`agent/deploy/README.md`). Copy `agent/deploy/deploy-agent.yml` to
+`.github/workflows/deploy-agent.yml` (web UI or `git mv`) to activate deployment.
+
+**Why `livekit.toml` is a template, not the real file:** LiveKit Cloud assigns the agent ID when the
+agent is first registered, so `[agent] id` cannot be fabricated. Register with the workflow
+(`workflow_dispatch`, operation `create`) or `lk agent create`; both write `agent/livekit.toml` and
+deploy. The `deploy` operation fails with `livekit.toml not found` until it exists.
+
+**Credential handling:** the four GitHub secrets (`LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+`LIVEKIT_API_SECRET`, `ASSEMBLYAI_API_KEY`) are used only at deploy time. The deployed agent receives
+`LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` automatically from LiveKit Cloud — they
+cannot be set as agent secrets and are never written into the image. `ASSEMBLYAI_API_KEY` is passed
+through `SECRET_LIST`, stored by LiveKit Cloud secrets management, and injected into the container at
+runtime as a plain environment variable. The workflow fails fast if a secret is missing and asserts
+that the Dockerfile defines no credential variables.
+
+**Free (Build) plan:** production agents scale to zero when idle, so the first caller after an idle
+period waits 10–20 s for the cold start. Instant rollback is paid-plan only — revert and redeploy.
+
+**Dispatch:** `LIVEKIT_AGENT_ROOM` is left unset, so the worker registers with an empty agent name and
+uses **automatic dispatch** — it joins every new room in the project. Rooms are created per session by
+the Worker, so the agent joins the sales room and publishes `RoomEvent.TranscriptionReceived`
+segments carrying the speaker's participant identity; the salesperson UI keeps working unchanged.
+
+**Verification status:** the agent typechecks and the container entrypoint was executed locally (it
+starts and fails only on the missing LiveKit credentials that LiveKit Cloud injects). **No real audio
+has been transcribed end-to-end**; that requires a deployed agent, a live two-party room, and a valid
+AssemblyAI key (§20 step 8).
 
 ### 18c. Call termination semantics (important)
 
@@ -615,6 +661,22 @@ variable.
 | `LIVEKIT_AGENT_ROOM` | Optional | Pin the agent to one room | Agent env |
 | Node.js 20+ host | Required | Persistent process | Fly.io / Railway / Render / VPS / `lk agent deploy` |
 
+### E. GitHub Actions secrets (LiveKit Cloud deploy only)
+
+Set in **Settings → Secrets and variables → Actions**. None of these are ever committed; the deployed
+agent gets its LiveKit credentials from LiveKit Cloud and `ASSEMBLYAI_API_KEY` from LiveKit Cloud
+secrets management.
+
+| Secret | Status | Purpose |
+|---|---|---|
+| `LIVEKIT_URL` | Required | Deploy-time authentication (`livekit/deploy-action`) |
+| `LIVEKIT_API_KEY` | Required | Deploy-time authentication |
+| `LIVEKIT_API_SECRET` | Required | Deploy-time authentication |
+| `ASSEMBLYAI_API_KEY` | Required | Passed via `SECRET_LIST` → runtime env var `ASSEMBLYAI_API_KEY` in the agent container |
+
+Do **not** create `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` as agent secrets — LiveKit
+Cloud injects them automatically and rejects them as secrets.
+
 ---
 
 ## 20. Shortest safe sequence
@@ -623,8 +685,13 @@ variable.
 2. **Worker secrets**: `GROQ_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (+ `ADMIN_API_KEY`).
 3. **Worker vars**: `LIVEKIT_URL`, and `ALLOWED_ORIGINS` if using a custom domain.
 4. **D1**: `wrangler d1 migrations apply lbv-sales-sessions --remote`.
-5. **Agent env**: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `ASSEMBLYAI_API_KEY`.
-6. **Run the agent** on your host (`npm start` or `lk agent deploy`).
+5. **Agent env**: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `ASSEMBLYAI_API_KEY`
+   (local/Fly/Railway) — for LiveKit Cloud these are GitHub secrets instead, see §19 E.
+6. **Register + deploy the agent to LiveKit Cloud** (free Build plan): add the four GitHub secrets
+   (§19 E), then run **Actions → Deploy LiveKit Agent → Run workflow → operation: `create`**. This
+   registers the agent, deploys it, and opens a PR adding `agent/livekit.toml` — **merge that PR**
+   (it contains no credentials). Later pushes to `main` touching `agent/**` deploy automatically.
+   Alternatively run `lk cloud auth && lk agent create` in `agent/`.
 7. **Deploy the Worker**: `npm run check:deploy && npm run deploy`.
 8. **Live test**: create a session → copy the invitation link → join on a phone → speak → confirm the
    prospect transcript and an approved SAY THIS NEXT recommendation appear for the salesperson, and
@@ -632,3 +699,6 @@ variable.
 9. **End Session** and confirm the invitation no longer validates (`404`) and `liveKitRoomClosed: true`.
 10. **Cloudflare Rate Limiting** rules for `/api/sessions`, `/api/livekit/invite-token`, `/api/copilot`.
 11. Review and merge PR #9, then re-run CI on `main`.
+12. **Confirm the deployed agent** joined the room: `lk agent status` / `lk agent logs` should show
+    `[lbv-agent] connected to room <name>` and `final transcript received (speaker=..., chars=...)`.
+    Until that is observed, speech-to-text must be treated as unverified.

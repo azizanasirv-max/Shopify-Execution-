@@ -55,3 +55,82 @@ cd agent && npm run typecheck
 > The agent code targets the LiveKit Agents JS SDK (`@livekit/agents`) with the
 > AssemblyAI plugin. If your installed SDK version differs, the import names may
 > need a small adjustment; run `npm run typecheck` after install to confirm.
+
+## Deploy to LiveKit Cloud
+
+This directory is a complete deployment unit for LiveKit Cloud
+([agent deployment docs](https://docs.livekit.io/deploy/agents/)):
+
+| File | Purpose |
+|---|---|
+| `Dockerfile` | glibc base image, non-root user, `ca-certificates`, fixed `CMD` |
+| `.dockerignore` | keeps the build context small and excludes `.env*` / `node_modules` |
+| `package.json` | `start` script = `node --import tsx agent.ts start` |
+| `livekit.toml.example` | template for the agent config generated on first registration |
+
+### 1. Register the agent (one time)
+
+> **Install the workflow first:** the deploy workflow is staged at
+> [`agent/deploy/deploy-agent.yml`](./deploy/deploy-agent.yml) because the
+> automation token used to prepare this branch lacks GitHub's `workflows`
+> permission. Copy it to `.github/workflows/deploy-agent.yml` (see
+> [`agent/deploy/README.md`](./deploy/README.md)) before running it.
+
+LiveKit Cloud issues the agent ID on first registration; it cannot be guessed.
+Either run the GitHub Actions workflow `.github/workflows/deploy-agent.yml`
+(**Actions → Deploy LiveKit Agent → Run workflow → operation: `create`**), which
+registers the agent, deploys it, and opens a PR containing the generated
+`agent/livekit.toml`; or use the CLI from this directory:
+
+```bash
+lk cloud auth
+lk agent create          # creates Dockerfile/livekit.toml if missing
+```
+
+Commit the generated `livekit.toml` (it holds only the project subdomain and the
+agent ID — no credentials). Afterwards, pushes to `main` that touch `agent/**`
+deploy automatically.
+
+### 2. Required GitHub Actions secrets
+
+| Secret | Used for |
+|---|---|
+| `LIVEKIT_URL` | deploy-time authentication only |
+| `LIVEKIT_API_KEY` | deploy-time authentication only |
+| `LIVEKIT_API_SECRET` | deploy-time authentication only |
+| `ASSEMBLYAI_API_KEY` | passed via `SECRET_LIST` → stored as a LiveKit Cloud agent secret and injected at **runtime** |
+
+Never commit these. The agent image contains no credentials: LiveKit Cloud
+injects `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` automatically
+(they cannot be set as agent secrets), and `ASSEMBLYAI_API_KEY` comes from
+LiveKit Cloud secrets management.
+
+### 3. Room dispatch behaviour
+
+The worker is started with **no agent name** (`LIVEKIT_AGENT_ROOM` unset), which
+means LiveKit's **automatic dispatch**: the agent joins every new room in the
+project. The sales room is created per session by the Worker
+(`POST /api/livekit/token` / `invite-token`), so the agent joins it and forwards
+`RoomEvent.TranscriptionReceived` segments — with the speaker's participant
+identity (`prospect` / `salesperson`) — to every participant. The salesperson UI
+(`lbv-sales-copilot/app/LiveKitSalesRoom.tsx`) consumes final `prospect`
+segments and posts them to the Worker.
+
+To pin the agent to explicit dispatch instead, set `LIVEKIT_AGENT_ROOM` as an
+agent secret (it becomes `agentName`) and dispatch it per room.
+
+### 4. Free (Build) plan behaviour
+
+On the Build plan, idle agents scale to zero replicas, so the first caller after
+an idle period waits **10–20 s** for the cold start before the agent joins the
+room. Deployment uses a rolling strategy; instant rollback requires a paid plan
+(revert the code and redeploy instead).
+
+### 5. Verification status
+
+`npm run typecheck` and the container entrypoint are verified locally (the
+worker starts and fails only on missing LiveKit credentials, which LiveKit Cloud
+injects). **Real audio transcription has not been exercised end-to-end** — that
+requires a deployed agent, a live room, and a valid AssemblyAI key. See
+`DEPLOYMENT.md` §18 for the live verification steps.
+
