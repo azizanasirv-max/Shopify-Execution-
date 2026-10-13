@@ -334,7 +334,7 @@ async function validateTranscriptIngress(
   | { ok: true; session: any; targetAdapter: any; text: string; speaker: string }
   | { ok: false; response: Response }
 > {
-  const body = (await request.json().catch(() => ({}))) as any;
+  const body = (await readJsonBody(request, 65536, {})) as any;
   const { sessionId, sessionToken, text, isFinal, speaker } = body;
   const tokenHeader =
     request.headers.get("x-session-token") ||
@@ -401,6 +401,107 @@ function isDuplicateTranscript(sessionId: string, text: string): boolean {
   return false;
 }
 
+/**
+ * Length-constant string comparison for secret material (invite tokens).
+ * Avoids early-exit timing differences.
+ */
+function safeEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length || a.length === 0) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/** Thrown when a request body exceeds the allowed size. */
+export class PayloadTooLargeError extends Error {
+  public readonly code = "PAYLOAD_TOO_LARGE";
+  constructor(public readonly limitBytes: number) {
+    super(`Payload Too Large: maximum request size is ${Math.floor(limitBytes / 1024)}KB.`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+/**
+ * Reads and parses a JSON request body while enforcing a hard byte cap that does
+ * NOT depend on the Content-Length header (a chunked/streamed body may omit it).
+ * Returns `fallback` for empty or malformed bodies, matching the previous
+ * `.json().catch(...)` behaviour.
+ */
+async function readJsonBody(request: Request, maxBytes: number, fallback: any = {}): Promise<any> {
+  const declared = request.headers.get("Content-Length");
+  if (declared && parseInt(declared, 10) > maxBytes) {
+    throw new PayloadTooLargeError(maxBytes);
+  }
+  if (!request.body) return fallback;
+  const reader = (request.body as any).getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        received += value.byteLength;
+        if (received > maxBytes) throw new PayloadTooLargeError(maxBytes);
+        text += decoder.decode(value, { stream: true });
+      }
+    }
+    text += decoder.decode();
+  } finally {
+    if (typeof reader.releaseLock === "function") reader.releaseLock();
+  }
+  if (!text.trim()) return fallback;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * High-entropy invitation token. Stored server-side in the session metadata and
+ * shared with the prospect via the invitation link. It grants ONLY the ability
+ * to validate the invitation and obtain a prospect-scoped, audio-only room
+ * token - never the salesperson session token or any recommendation data.
+ */
+function generateInviteToken(): string {
+  const bytes = new Uint8Array(24);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sessionInviteToken(session: any): string | undefined {
+  const token = session?.metadata?.inviteToken;
+  return typeof token === "string" && token.length > 0 ? token : undefined;
+}
+
+function isValidInvite(session: any, provided: unknown): boolean {
+  const expected = sessionInviteToken(session);
+  return Boolean(expected) && safeEqual(provided, expected);
+}
+
+/**
+ * Retention window for scheduled session cleanup.
+ *
+ * Sessions idle beyond the SessionManager TTL (1h) are already rejected on
+ * read; this longer window is used only by the cron handler to delete stale
+ * rows so the D1 tables cannot grow without bound.
+ */
+const SESSION_CLEANUP_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Durable session-creation limit (D1-backed, consistent across isolates).
+ * This is a coarse global abuse guard; Cloudflare Rate Limiting rules remain
+ * the recommended platform-level control for production traffic shaping.
+ */
+const SESSION_CREATION_WINDOW_MS = 60 * 1000;
+const SESSION_CREATION_MAX_PER_WINDOW = 60;
+
 export default {
   async fetch(request: Request, env: Env, ctx?: any): Promise<Response> {
     const corsHeaders = handleCorsHeaders(request, env);
@@ -436,7 +537,7 @@ export default {
       // ROUTE: POST /api/copilot
       // =========================================================================
       if (pathname === "/api/copilot" && request.method === "POST") {
-        const body = (await request.json().catch(() => null)) as any;
+        const body = (await readJsonBody(request, 65536, null)) as any;
         if (!body || typeof body !== "object") {
           return errorResponse("Malformed request: valid JSON body is required.", "INVALID_REQUEST", 400, corsHeaders);
         }
@@ -454,41 +555,38 @@ export default {
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
           sessionToken;
 
-        let targetProductId = productId;
-        let session = sessionId ? await sessionManager.getSessionAsync(sessionId) : undefined;
-
-        if (sessionId && !session) {
-          return errorResponse(`Session '${sessionId}' not found or expired.`, "SESSION_NOT_FOUND", 404, corsHeaders);
-        }
-
-        if (session) {
-          if (!tokenHeader || tokenHeader !== session.authToken) {
-            return errorResponse(
-              `Unauthorized access: Valid session authorization token is required for session '${sessionId}'.`,
-              "UNAUTHORIZED_SESSION_ACCESS",
-              403,
-              corsHeaders
-            );
-          }
-
-          if (targetProductId) {
-            try {
-              await sessionManager.validateSessionProductAsync(session.id, targetProductId, adapterRegistry);
-            } catch (mismatchErr: any) {
-              return errorResponse(mismatchErr.message, "MISMATCHED_SESSION_PRODUCT", 400, corsHeaders);
-            }
-          } else {
-            targetProductId = session.productId;
-          }
-        }
-
-        if (!targetProductId) {
+        if (!sessionId || typeof sessionId !== "string") {
           return errorResponse(
-            "Product identifier ('productId') or valid 'sessionId' is required to resolve product adapter. Silent fallback is prohibited.",
-            "MISSING_PRODUCT_ID",
+            "sessionId and valid session authorization token are required for copilot execution. Unauthenticated LLM invocation is forbidden.",
+            "SESSION_REQUIRED",
             400,
             corsHeaders
           );
+        }
+
+        const session = await sessionManager.getSessionAsync(sessionId);
+        if (!session) {
+          return errorResponse(`Session '${sessionId}' not found or expired.`, "SESSION_NOT_FOUND", 404, corsHeaders);
+        }
+
+        if (!tokenHeader || tokenHeader !== session.authToken) {
+          return errorResponse(
+            `Unauthorized access: Valid session authorization token is required for session '${sessionId}'.`,
+            "UNAUTHORIZED_SESSION_ACCESS",
+            403,
+            corsHeaders
+          );
+        }
+
+        let targetProductId = productId;
+        if (targetProductId) {
+          try {
+            await sessionManager.validateSessionProductAsync(session.id, targetProductId, adapterRegistry);
+          } catch (mismatchErr: any) {
+            return errorResponse(mismatchErr.message, "MISMATCHED_SESSION_PRODUCT", 400, corsHeaders);
+          }
+        } else {
+          targetProductId = session.productId;
         }
 
         if (!adapterRegistry.has(targetProductId)) {
@@ -501,10 +599,6 @@ export default {
         }
 
         const targetAdapter = adapterRegistry.resolve(targetProductId);
-
-        if (!session) {
-          session = await sessionManager.createSessionAsync(targetAdapter.id);
-        }
 
         const recommendation = await salesEngine.generateRecommendation(prompt, {
           adapter: targetAdapter,
@@ -585,7 +679,7 @@ export default {
       // ROUTE: POST /api/engine/adapters/switch
       // =========================================================================
       if (pathname === "/api/engine/adapters/switch" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const { adapterId } = body;
         if (!adapterId || typeof adapterId !== "string") {
           return errorResponse("adapterId is required.", "INVALID_ADAPTER_ID", 400, corsHeaders);
@@ -626,7 +720,7 @@ export default {
       // ROUTE: POST /api/sessions (Create Session)
       // =========================================================================
       if (pathname === "/api/sessions" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const { productId } = body;
         if (!productId || !adapterRegistry.has(productId)) {
           return errorResponse(
@@ -638,12 +732,36 @@ export default {
         }
 
         const adapter = adapterRegistry.resolve(productId);
-        const session = await sessionManager.createSessionAsync(adapter.id);
 
+        // Durable abuse guard: bound how many sessions can be created per window.
+        const creationStore: any = sessionManager.getStore();
+        if (creationStore && typeof creationStore.countSessionsCreatedSince === "function") {
+          try {
+            const recent = await creationStore.countSessionsCreatedSince(Date.now() - SESSION_CREATION_WINDOW_MS);
+            if (recent >= SESSION_CREATION_MAX_PER_WINDOW) {
+              return errorResponse(
+                "Too many sessions created recently. Please retry shortly.",
+                "RATE_LIMITED",
+                429,
+                corsHeaders
+              );
+            }
+          } catch (limitErr) {
+            // Do not block all legitimate traffic on a transient limiter error.
+            console.error("[Worker] Session rate-limit check failed:", limitErr);
+          }
+        }
+
+        const inviteToken = generateInviteToken();
+        const session = await sessionManager.createSessionAsync(adapter.id, { inviteToken });
+
+        // `inviteToken` is returned ONLY to the creator (salesperson). It must
+        // never be included in prospect-facing responses.
         return jsonResponse(
           {
             sessionId: session.id,
             sessionToken: session.authToken,
+            inviteToken,
             productId: session.productId,
             roomName: session.roomName,
             createdAt: session.createdAt
@@ -691,7 +809,10 @@ export default {
                 roomName: authorizedSession.roomName,
                 createdAt: authorizedSession.createdAt,
                 lastActivityAt: authorizedSession.lastActivityAt,
-                historyCount: authorizedSession.conversationHistory.length
+                historyCount: authorizedSession.conversationHistory.length,
+                // Returned ONLY to the authenticated session owner (salesperson)
+                // so the invitation link can be recovered after a reload.
+                inviteToken: sessionInviteToken(authorizedSession)
               }
             ]
           },
@@ -744,7 +865,7 @@ export default {
       // =========================================================================
       if (pathname.startsWith("/api/sessions/") && pathname.endsWith("/clear") && request.method === "POST") {
         const sessionId = pathname.replace("/api/sessions/", "").replace("/clear", "");
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const token =
           request.headers.get("x-session-token") ||
           request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
@@ -782,9 +903,17 @@ export default {
         }
 
         try {
+          const session = await sessionManager.getSessionAsync(sessionId);
           const deleted = await sessionManager.deleteSessionAsync(sessionId, token);
           if (!deleted) {
             return errorResponse("Session not found or expired.", "SESSION_NOT_FOUND", 404, corsHeaders);
+          }
+          if (session) {
+            try {
+              await realtimeAdapter.revokeSessionRoom(session.roomName);
+            } catch {
+              /* best effort */
+            }
           }
           return jsonResponse({ success: true, message: `Session ${sessionId} deleted.` }, 200, corsHeaders);
         } catch (err: any) {
@@ -799,7 +928,7 @@ export default {
       // ROUTE: POST /api/livekit/token
       // =========================================================================
       if (pathname === "/api/livekit/token" && request.method === "POST") {
-        const body = (await request.json().catch(() => ({}))) as any;
+        const body = (await readJsonBody(request, 65536, {})) as any;
         const { sessionId, sessionToken, productId, roomName, identity, name, permissions, grants } = body;
         const tokenHeader =
           request.headers.get("x-session-token") ||
@@ -888,6 +1017,94 @@ export default {
         });
 
         return jsonResponse(tokenData, 200, corsHeaders);
+      }
+
+      // =========================================================================
+      // ROUTE: GET /api/livekit/invite (public invitation validation)
+      //
+      // Lets the prospect page validate an invitation link WITHOUT exposing any
+      // private data (no session auth token, no recommendations, no prompts).
+      // =========================================================================
+      if (pathname === "/api/livekit/invite" && request.method === "GET") {
+        const inviteSessionId = url.searchParams.get("sessionId") || "";
+        const inviteTokenParam = url.searchParams.get("token") || "";
+
+        if (!inviteSessionId || !inviteTokenParam) {
+          return errorResponse("A valid invitation requires a sessionId and token.", "INVALID_INVITATION", 400, corsHeaders);
+        }
+
+        const inviteSession = await sessionManager.getSessionAsync(inviteSessionId);
+        if (!inviteSession) {
+          return errorResponse("This invitation is invalid or has expired.", "INVITATION_NOT_FOUND", 404, corsHeaders);
+        }
+
+        if (!isValidInvite(inviteSession, inviteTokenParam)) {
+          return errorResponse("This invitation is invalid or has expired.", "INVALID_INVITATION", 403, corsHeaders);
+        }
+
+        const inviteAdapter = adapterRegistry.has(inviteSession.productId)
+          ? adapterRegistry.resolve(inviteSession.productId)
+          : undefined;
+
+        return jsonResponse(
+          {
+            valid: true,
+            sessionId: inviteSession.id,
+            status: "ready",
+            productName: inviteAdapter ? inviteAdapter.name : undefined,
+            livekitConfigured: realtimeAdapter.isConfigured()
+          },
+          200,
+          corsHeaders
+        );
+      }
+
+      // =========================================================================
+      // ROUTE: POST /api/livekit/invite-token (prospect-only, audio-only token)
+      //
+      // Issues a least-privilege LiveKit token for the prospect identified by a
+      // valid invitation. The identity is FIXED to "prospect" and video sources
+      // are not granted; clients cannot request the salesperson identity or
+      // elevate permissions.
+      // =========================================================================
+      if (pathname === "/api/livekit/invite-token" && request.method === "POST") {
+        const inviteBody = (await readJsonBody(request, 65536, {})) as any;
+        const inviteSessionId = inviteBody?.sessionId;
+        const inviteTokenParam = inviteBody?.inviteToken;
+        const inviteDisplayName = inviteBody?.displayName;
+
+        if (!inviteSessionId || typeof inviteSessionId !== "string" || !inviteTokenParam || typeof inviteTokenParam !== "string") {
+          return errorResponse("A valid invitation requires a sessionId and token.", "INVALID_INVITATION", 400, corsHeaders);
+        }
+
+        const inviteSession = await sessionManager.getSessionAsync(inviteSessionId);
+        if (!inviteSession) {
+          return errorResponse("This invitation is invalid or has expired.", "INVITATION_NOT_FOUND", 404, corsHeaders);
+        }
+
+        if (!isValidInvite(inviteSession, inviteTokenParam)) {
+          return errorResponse("This invitation is invalid or has expired.", "INVALID_INVITATION", 403, corsHeaders);
+        }
+
+        try {
+          const prospectToken = await realtimeAdapter.createParticipantToken({
+            session: inviteSession,
+            identity: "prospect",
+            displayName:
+              typeof inviteDisplayName === "string" && inviteDisplayName.trim()
+                ? inviteDisplayName.trim().slice(0, 60)
+                : "Prospect",
+            audioOnly: true
+          });
+          return jsonResponse({ ...prospectToken, sessionId: inviteSession.id }, 200, corsHeaders);
+        } catch (inviteErr: any) {
+          return errorResponse(
+            inviteErr?.message || "Failed to issue a prospect token for this invitation.",
+            "TOKEN_ISSUE_FAILED",
+            500,
+            corsHeaders
+          );
+        }
       }
 
       // =========================================================================
@@ -1127,6 +1344,14 @@ data: ${JSON.stringify(data)}
 
       return errorResponse(`Not Found: ${pathname}`, "NOT_FOUND", 404, corsHeaders);
     } catch (err: any) {
+      if (err?.code === "PAYLOAD_TOO_LARGE") {
+        return errorResponse(
+          err.message || "Payload Too Large: maximum request size is 64KB.",
+          "PAYLOAD_TOO_LARGE",
+          413,
+          corsHeaders
+        );
+      }
       console.error("[Worker Uncaught Error]", err);
       return errorResponse(
         "An unexpected internal error occurred while processing the request.",
@@ -1134,6 +1359,27 @@ data: ${JSON.stringify(data)}
         500,
         corsHeaders
       );
+    }
+  },
+
+  /**
+   * Cron handler (configured via [triggers] in wrangler.toml).
+   *
+   * Best-effort cleanup of sessions (and, via ON DELETE CASCADE, their
+   * conversation turns) that have been idle beyond the retention window.
+   * Failures are logged and never thrown, so a cleanup error cannot take the
+   * Worker down.
+   */
+  async scheduled(_controller: any, env: Env, _ctx?: any): Promise<void> {
+    try {
+      const services = getServices(env);
+      const store: any = services.sessionStore;
+      if (store && typeof store.cleanupExpired === "function") {
+        const removed = await store.cleanupExpired(SESSION_CLEANUP_RETENTION_MS);
+        console.log(`[Worker Scheduled] Removed ${removed} expired session(s).`);
+      }
+    } catch (err: any) {
+      console.error("[Worker Scheduled] Session cleanup failed:", err?.message || err);
     }
   }
 };
