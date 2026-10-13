@@ -21,6 +21,9 @@ real-time audio/transcription.
   Gemini remains selectable via `LLM_PROVIDER=gemini`.
 - **Persistence (production):** Cloudflare D1 via the `DB` binding (`CloudflareD1SessionStore`).
   The Worker **fails closed** (HTTP 500 `STARTUP_ERROR`) if `DB` is missing in production.
+- **Scheduled session cleanup:** an hourly cron trigger (`[triggers] crons` in `wrangler.toml`)
+  invokes the Worker's `scheduled` handler, which deletes sessions idle beyond a 24h retention window
+  (and, via `ON DELETE CASCADE`, their conversation turns).
 - **Persistence (local/tests):** in-memory store.
 
 ---
@@ -138,6 +141,10 @@ Creates two tables and four indexes:
 These columns exactly match the SQL used by `CloudflareD1SessionStore`
 (`lbv-sales-copilot/engine/session-manager.ts`). Migrations are **forward-only**; take a backup
 (`npx wrangler d1 export lbv-sales-sessions --remote --output backup.sql`) before future changes.
+
+**Automated cleanup:** sessions are rejected on read once idle beyond the 1h TTL, and the hourly cron
+(see §1) deletes rows idle beyond a 24h retention window so the tables do not grow without bound.
+No manual cleanup is required once the Worker (with its `[triggers]` config) is deployed.
 
 ---
 

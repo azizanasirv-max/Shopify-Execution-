@@ -401,6 +401,15 @@ function isDuplicateTranscript(sessionId: string, text: string): boolean {
   return false;
 }
 
+/**
+ * Retention window for scheduled session cleanup.
+ *
+ * Sessions idle beyond the SessionManager TTL (1h) are already rejected on
+ * read; this longer window is used only by the cron handler to delete stale
+ * rows so the D1 tables cannot grow without bound.
+ */
+const SESSION_CLEANUP_RETENTION_MS = 24 * 60 * 60 * 1000;
+
 export default {
   async fetch(request: Request, env: Env, ctx?: any): Promise<Response> {
     const corsHeaders = handleCorsHeaders(request, env);
@@ -1134,6 +1143,27 @@ data: ${JSON.stringify(data)}
         500,
         corsHeaders
       );
+    }
+  },
+
+  /**
+   * Cron handler (configured via [triggers] in wrangler.toml).
+   *
+   * Best-effort cleanup of sessions (and, via ON DELETE CASCADE, their
+   * conversation turns) that have been idle beyond the retention window.
+   * Failures are logged and never thrown, so a cleanup error cannot take the
+   * Worker down.
+   */
+  async scheduled(_controller: any, env: Env, _ctx?: any): Promise<void> {
+    try {
+      const services = getServices(env);
+      const store: any = services.sessionStore;
+      if (store && typeof store.cleanupExpired === "function") {
+        const removed = await store.cleanupExpired(SESSION_CLEANUP_RETENTION_MS);
+        console.log(`[Worker Scheduled] Removed ${removed} expired session(s).`);
+      }
+    } catch (err: any) {
+      console.error("[Worker Scheduled] Session cleanup failed:", err?.message || err);
     }
   }
 };

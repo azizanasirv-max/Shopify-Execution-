@@ -23,6 +23,13 @@ not_found_handling = "single-page-application"
 NODE_ENV = "production"
 
 # ---------------------------------------------------------------------------
+# Scheduled session cleanup (hourly). Invokes the Worker's `scheduled` handler,
+# which deletes sessions idle beyond the retention window (see worker.ts).
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["0 * * * *"]
+
+# ---------------------------------------------------------------------------
 # D1 session persistence
 #
 # Production database: lbv-sales-sessions (binding "DB").

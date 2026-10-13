@@ -538,6 +538,44 @@ export async function runWorkerIntegrationTests(): Promise<{ passed: number; fai
   const dupStreamText = await dupStreamRes.text();
   assert(dupStreamRes.status === 200 && dupStreamText.includes('"duplicate":true'), "Streaming route also suppresses duplicate transcripts");
 
+  // -------------------------------------------------------------
+  // TEST 14: Scheduled session cleanup (cron handler)
+  // -------------------------------------------------------------
+  console.log("\n[14] Testing scheduled session cleanup...");
+  const cronDb = new MockD1Database();
+  const cronEnv: Env = { DB: cronDb, ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  const cronBody = JSON.stringify({ productId: "shopify" });
+  const staleRes = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: cronBody }), cronEnv);
+  const staleSession = await staleRes.json() as any;
+  const freshRes = await worker.fetch(new Request("https://worker.local/api/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: cronBody }), cronEnv);
+  const freshSession = await freshRes.json() as any;
+
+  const staleRow = cronDb.sessions.get(staleSession.sessionId);
+  assert(Boolean(staleRow), "Session row is stored in D1 before cleanup");
+  staleRow.last_activity_at = Date.now() - (25 * 60 * 60 * 1000);
+
+  await (worker as any).scheduled({ cron: "0 * * * *" }, cronEnv, {});
+  assert(!cronDb.sessions.has(staleSession.sessionId), "Scheduled handler removes sessions idle beyond the retention window");
+  assert(cronDb.sessions.has(freshSession.sessionId), "Scheduled handler retains active sessions");
+
+  const inMemoryCronEnv: Env = { ADMIN_API_KEY: adminToken, NODE_ENV: "test" };
+  let scheduledThrew = false;
+  try {
+    await (worker as any).scheduled({ cron: "0 * * * *" }, inMemoryCronEnv, {});
+  } catch {
+    scheduledThrew = true;
+  }
+  assert(!scheduledThrew, "Scheduled handler is safe when no D1 store is configured");
+
+  const brokenCronEnv: Env = { DB: { prepare() { throw new Error("boom"); } }, ADMIN_API_KEY: adminToken, NODE_ENV: "test" } as any;
+  let brokenThrew = false;
+  try {
+    await (worker as any).scheduled({ cron: "0 * * * *" }, brokenCronEnv, {});
+  } catch {
+    brokenThrew = true;
+  }
+  assert(!brokenThrew, "Scheduled handler swallows cleanup errors (never throws)");
+
   console.log("\n--------------------------------------------------");
   console.log(`Worker Integration Tests Summary: Passed: ${passed}, Failed: ${failed}`);
   console.log("==================================================");
