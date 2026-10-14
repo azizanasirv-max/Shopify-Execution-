@@ -260,6 +260,47 @@ app.get("/api/engine/adapters", async (req, res) => {
   });
 });
 
+// Read-only, data-only service profiles (audience, pains, benefits, objections,
+// qualification, offer, constraints). No secrets are included. Mirrors the
+// production Worker route GET /api/service-profiles.
+app.get("/api/service-profiles", (_req, res) => {
+  const profiles = adapterRegistry
+    .getAll()
+    .map((adapter: any) => {
+      const getProfile = adapter?.getProfile;
+      const profile = typeof getProfile === "function" ? getProfile.call(adapter) : undefined;
+
+      return {
+        id: adapter.id,
+        name: adapter.name,
+        description: adapter.description,
+        aliases: profile?.aliases ?? [],
+        policies: typeof adapter.getBehavioralPolicies === "function" ? adapter.getBehavioralPolicies() : [],
+        profileAvailable: Boolean(profile),
+        idealCustomers: profile?.idealCustomers ?? [],
+        painPoints: profile?.painPoints ?? [],
+        benefits: profile?.benefits ?? [],
+        qualificationRules: profile?.qualificationRules ?? [],
+        discoveryQuestions: profile?.discoveryQuestions ?? [],
+        objections: profile?.objections ?? [],
+        buyingSignals: profile?.buyingSignals ?? [],
+        ctas: profile?.ctas ?? [],
+        offer: profile?.offer ?? null,
+        businessConstraints: profile?.businessConstraints ?? null,
+        persona: profile?.persona,
+        toolsCount: Array.isArray(profile?.tools)
+          ? profile.tools.length
+          : typeof adapter.getTools === "function"
+            ? adapter.getTools().length
+            : 0
+      };
+    })
+    .filter(Boolean);
+
+  res.json({ profiles });
+});
+
+
 // Switch active product adapter dynamically (session-scoped playground switch)
 app.post("/api/engine/adapters/switch", async (req, res) => {
   try {

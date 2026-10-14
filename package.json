@@ -18,6 +18,7 @@
     "test:stage2": "tsx run-tests.ts stage2",
     "test:llm": "tsx run-tests.ts llm",
     "test:service": "tsx run-tests.ts service",
+    "test:ui": "tsx run-tests.ts ui",
     "check:deploy": "node scripts/check-deploy-config.mjs",
     "deploy:dry-run": "npx wrangler deploy --dry-run",
     "deploy": "npx wrangler deploy",

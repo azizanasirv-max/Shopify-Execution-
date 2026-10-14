@@ -17,6 +17,7 @@ import { runD1PersistenceTests } from "./lbv-sales-copilot/validation/d1-persist
 import { runWorkerIntegrationTests } from "./lbv-sales-copilot/validation/worker-integration-tests.js";
 import { runLlmProviderTests } from "./lbv-sales-copilot/validation/llm-provider-tests.js";
 import { runServiceProfileTests } from "./lbv-sales-copilot/validation/service-profile-tests.js";
+import { runDashboardUiTests } from "./lbv-sales-copilot/validation/dashboard-ui-tests.js";
 
 dotenv.config();
 
@@ -146,6 +147,10 @@ if (command === "adversarial") {
   runServiceProfileTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "ui" || command === "dashboard") {
+  runDashboardUiTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
 } else if (command === "hardening" || command === "unit" || command === "engine") {
   Promise.all([
     runHardeningUnitTests(),
@@ -157,13 +162,14 @@ if (command === "adversarial") {
     runD1PersistenceTests(),
     runWorkerIntegrationTests(),
     runLlmProviderTests(),
-    runServiceProfileTests()
-  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10]) => {
-    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed + s10.failed;
+    runServiceProfileTests(),
+    runDashboardUiTests()
+  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed + s10.failed + s11.failed;
     process.exit(totalFailed === 0 ? 0 : 1);
   });
 } else {
-  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", "persistence", "d1", "worker", or "hardening".`);
+  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", "persistence", "d1", "worker", "ui", or "hardening".`);
   process.exit(1);
 }
 
