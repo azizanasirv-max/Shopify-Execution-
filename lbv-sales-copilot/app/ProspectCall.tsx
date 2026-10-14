@@ -5,8 +5,14 @@
  * link (?join=1&sessionId=...&token=...). It NEVER renders salesperson content:
  * no recommendations, no internal notes, no provider details, no session token.
  *
- * The call is AUDIO ONLY - no camera, no video, no screen share. The backend
+ * The call is AUDIO ONLY — no camera, no video, no screen share. The backend
  * issues a prospect-scoped, microphone-only LiveKit token for the invitation.
+ *
+ * SECURITY
+ * - The invitation token is captured once and removed from the visible URL as
+ *   soon as it is validated; it is never persisted to browser storage.
+ * - Only a prospect-scoped token is ever requested; the client cannot ask for
+ *   the salesperson identity or elevated permissions.
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -31,11 +37,13 @@ export default function ProspectCall() {
 
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<HTMLAudioElement[]>([]);
+  const joiningRef = useRef<boolean>(false);
 
   // Capture the invitation ONCE (the URL is rewritten after validation so the
   // token does not linger in the address bar / history / referrer).
   const [invite] = useState(() => {
-    const p = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
+    const p =
+      typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
     return { sessionId: p.get("sessionId") || "", token: p.get("token") || "" };
   });
   const sessionId = invite.sessionId;
@@ -51,7 +59,9 @@ export default function ProspectCall() {
         return;
       }
       try {
-        const res = await fetch(`/api/livekit/invite?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(inviteToken)}`);
+        const res = await fetch(
+          `/api/livekit/invite?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(inviteToken)}`
+        );
         const data = await res.json().catch(() => ({}));
         if (cancelled) return;
         if (!res.ok || !data.valid) {
@@ -66,9 +76,11 @@ export default function ProspectCall() {
           if (typeof window !== "undefined" && window.location.search.includes("token=")) {
             window.history.replaceState({}, "", `${window.location.pathname}?join=1`);
           }
-        } catch {}
+        } catch {
+          /* ignore history failures */
+        }
         setPhase("ready");
-      } catch (err: any) {
+      } catch {
         if (cancelled) return;
         setPhase("invalid");
         setErrorMessage("We could not verify this invitation. Please check your connection and try again.");
@@ -84,7 +96,9 @@ export default function ProspectCall() {
       try {
         el.pause();
         el.remove();
-      } catch {}
+      } catch {
+        /* ignore */
+      }
     });
     audioElementsRef.current = [];
   };
@@ -92,9 +106,12 @@ export default function ProspectCall() {
   const leaveCall = () => {
     try {
       roomRef.current?.disconnect();
-    } catch {}
+    } catch {
+      /* ignore */
+    }
     detachAllAudio();
     roomRef.current = null;
+    joiningRef.current = false;
     setPhase("ended");
   };
 
@@ -103,19 +120,26 @@ export default function ProspectCall() {
     return () => {
       try {
         roomRef.current?.disconnect();
-      } catch {}
+      } catch {
+        /* ignore */
+      }
       detachAllAudio();
     };
   }, []);
 
   const joinCall = async () => {
+    // Guard against accidental duplicate connections / repeated submissions.
+    if (joiningRef.current || phase === "connecting") return;
+    joiningRef.current = true;
+
     setErrorMessage(null);
     setPhase("connecting");
+
     try {
       const res = await fetch("/api/livekit/invite-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId, inviteToken })
+        body: JSON.stringify({ sessionId, inviteToken }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -125,6 +149,7 @@ export default function ProspectCall() {
       if (data.mode === "simulated") {
         setSimulated(true);
         setPhase("connected");
+        joiningRef.current = false;
         return;
       }
 
@@ -135,8 +160,8 @@ export default function ProspectCall() {
         audioCaptureDefaults: {
           autoGainControl: true,
           echoCancellation: true,
-          noiseSuppression: true
-        }
+          noiseSuppression: true,
+        },
       });
       roomRef.current = room;
 
@@ -157,23 +182,27 @@ export default function ProspectCall() {
         .on(RoomEvent.TrackUnsubscribed, (track) => {
           try {
             track.detach();
-          } catch {}
+          } catch {
+            /* ignore */
+          }
         })
         .on(RoomEvent.Disconnected, () => setPhase("ended"));
 
       await room.connect(data.serverUrl, data.token);
       try {
         await room.startAudio();
-      } catch {}
+      } catch {
+        /* autoplay may require a user gesture; the join tap provides one */
+      }
 
-      // Request microphone LAST so a denial produces a clear, specific error.
+      // Request the microphone LAST so a denial produces a clear, specific error.
       try {
         await room.localParticipant.setMicrophoneEnabled(true);
         setMicEnabled(true);
-      } catch (micErr: any) {
+      } catch {
         setMicEnabled(false);
         setErrorMessage(
-          "Microphone access was denied. Enable microphone permission for this site and tap Unmute to try again."
+          "Microphone access was denied. Enable microphone permission for this site, then tap Unmute."
         );
       }
       setPhase("connected");
@@ -185,18 +214,24 @@ export default function ProspectCall() {
         setErrorMessage(msg || "We could not connect to the call. Please try again.");
       }
       setPhase("ready");
+    } finally {
+      joiningRef.current = false;
     }
   };
 
   const toggleMic = async () => {
     const room = roomRef.current;
-    if (!room) return;
+    if (!room) {
+      // Simulated mode: toggle the visual state only.
+      setMicEnabled((prev) => !prev);
+      return;
+    }
     try {
       const next = !micEnabled;
       await room.localParticipant.setMicrophoneEnabled(next);
       setMicEnabled(next);
       setErrorMessage(null);
-    } catch (err: any) {
+    } catch {
       setErrorMessage("Microphone access was denied. Enable microphone permission and try again.");
     }
   };
@@ -218,80 +253,95 @@ export default function ProspectCall() {
     }
   };
 
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4">
-      <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-6">
-        <div className="text-center space-y-1">
-          <div className="flex items-center justify-center gap-2 text-indigo-400">
-            <ShieldCheck className="w-5 h-5" />
-            <span className="text-xs font-bold uppercase tracking-widest">Secure Sales Call</span>
-          </div>
-          <h1 className="text-xl font-bold">
+    <div className="flex min-h-screen flex-col items-center justify-center bg-canvas px-4 py-8 text-ink">
+      <div className="w-full max-w-md space-y-6 rounded-2xl border border-line bg-surface p-6 shadow-2xl sm:p-8">
+        <div className="flex items-center justify-center gap-2 text-brand">
+          <ShieldCheck className="h-4 w-4" />
+          <span className="text-[11px] font-semibold uppercase tracking-widest">Secure audio call</span>
+        </div>
+
+        <div className="space-y-1.5 text-center">
+          <h1 className="text-xl font-semibold tracking-tight text-ink">
             {productName ? `You're invited: ${productName}` : "You're invited to a call"}
           </h1>
-          <p className="text-xs text-slate-400">
+          <p className="text-[13px] text-ink-soft">
             A private, audio-only conversation. No camera or video is used.
           </p>
         </div>
 
-        <div className="flex items-center justify-center gap-2 text-sm">
+        <div className="flex items-center justify-center gap-2 text-[13px]">
           {(phase === "validating" || phase === "connecting" || phase === "reconnecting") && (
-            <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
+            <Loader2 className="h-4 w-4 animate-spin text-brand" />
           )}
-          {phase === "connected" && <span className="w-2.5 h-2.5 rounded-full bg-emerald-400" />}
-          {(phase === "invalid" || phase === "ended") && <span className="w-2.5 h-2.5 rounded-full bg-slate-500" />}
-          <span className="text-slate-300">{statusLabel()}</span>
+          {phase === "connected" && (
+            <span className="relative inline-block h-2.5 w-2.5 rounded-full bg-positive lbv-live-dot" />
+          )}
+          {(phase === "invalid" || phase === "ended") && (
+            <span className="inline-block h-2.5 w-2.5 rounded-full bg-ink-mute" />
+          )}
+          <span className="text-ink-soft">{statusLabel()}</span>
         </div>
 
         {errorMessage && (
-          <div className="bg-rose-500/10 border border-rose-500/30 rounded-xl p-3 text-xs text-rose-300 flex gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="flex items-start gap-2.5 rounded-lg border border-danger/35 bg-danger/10 px-3.5 py-3 text-[13px] text-danger">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
             <span>{errorMessage}</span>
           </div>
         )}
 
         {phase === "invalid" ? (
-          <div className="text-center text-xs text-slate-400">
+          <div className="rounded-lg border border-line bg-surface-2/50 px-4 py-4 text-center text-[13px] text-ink-soft">
             Ask the person who invited you to send a fresh invitation link.
           </div>
         ) : phase === "connected" || phase === "reconnecting" ? (
           <div className="space-y-3">
             <button
-              onClick={toggleMic}
-              className={`w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 ${
-                micEnabled ? "bg-slate-800 hover:bg-slate-700" : "bg-amber-600 hover:bg-amber-500"
+              type="button"
+              onClick={() => void toggleMic()}
+              aria-pressed={!micEnabled}
+              className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-semibold transition-colors cursor-pointer ${
+                micEnabled
+                  ? "border border-line-strong bg-surface-2 text-ink hover:bg-surface-3"
+                  : "border border-warn/40 bg-warn/15 text-warn"
               }`}
             >
-              {micEnabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
-              {micEnabled ? "Mute" : "Unmute"}
+              {micEnabled ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
+              {micEnabled ? "Mute microphone" : "Unmute microphone"}
             </button>
             <button
+              type="button"
               onClick={leaveCall}
-              className="w-full py-3 rounded-xl font-semibold bg-rose-600 hover:bg-rose-500 flex items-center justify-center gap-2"
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-danger bg-danger py-3.5 text-[15px] font-semibold text-[#2a0b12] transition-colors hover:brightness-110 cursor-pointer"
             >
-              <PhoneOff className="w-5 h-5" /> Leave call
+              <PhoneOff className="h-5 w-5" />
+              Leave call
             </button>
           </div>
         ) : (
           <button
-            onClick={joinCall}
+            type="button"
+            onClick={() => void joinCall()}
             disabled={phase === "validating" || phase === "connecting"}
-            className="w-full py-4 rounded-xl font-bold text-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 flex items-center justify-center gap-2"
+            className="flex w-full items-center justify-center gap-2 rounded-xl border border-brand-strong bg-brand-strong py-4 text-[16px] font-semibold text-white transition-colors hover:bg-brand disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
           >
-            {phase === "connecting" ? <Loader2 className="w-5 h-5 animate-spin" /> : <PhoneCall className="w-5 h-5" />}
-            {phase === "ended" ? "Rejoin call" : "Join Call"}
+            {phase === "connecting" ? <Loader2 className="h-5 w-5 animate-spin" /> : <PhoneCall className="h-5 w-5" />}
+            {phase === "connecting" ? "Connecting…" : phase === "ended" ? "Rejoin call" : "Join call"}
           </button>
         )}
 
         {simulated && (
-          <p className="text-[11px] text-amber-300 text-center">
-            Simulated mode (LiveKit not configured in this environment).
+          <p className="text-center text-[11px] text-warn">
+            Simulated mode — LiveKit is not configured in this environment.
           </p>
         )}
-        <p className="text-[11px] text-slate-500 text-center">
+
+        <p className="text-center text-[11px] text-ink-mute">
           Audio only. We never request camera or video access.
         </p>
       </div>
     </div>
   );
 }
+

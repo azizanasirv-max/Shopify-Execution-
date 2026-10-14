@@ -1,26 +1,118 @@
 @import "tailwindcss";
 
-:root {
-  --bg: #F8F7F4;
-  --ink: #111113;
-  --accent: #E15B35;
+/* ==========================================================================
+   LBV Sales Copilot — design tokens
+   A restrained, dark-navy product palette. Accent colour is used sparingly.
+   ========================================================================== */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, monospace;
+
+  --color-canvas: #0a0f1c;
+  --color-surface: #0f1628;
+  --color-surface-2: #16203a;
+  --color-surface-3: #1c2844;
+
+  --color-line: #1f2b47;
+  --color-line-strong: #2c3a5e;
+
+  --color-ink: #e8edf7;
+  --color-ink-soft: #9da9c2;
+  --color-ink-mute: #6b7896;
+
+  --color-brand: #5b8cff;
+  --color-brand-strong: #3f72f5;
+  --color-brand-tint: #14203c;
+
+  --color-positive: #3dd68c;
+  --color-warn: #f5b841;
+  --color-danger: #f76e7e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
 }
 
 body {
-  background-color: var(--bg);
-  color: var(--ink);
-  font-family: 'Inter', sans-serif;
   margin: 0;
   min-height: 100vh;
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 ::selection {
-  background: var(--accent);
-  color: var(--bg);
+  background: color-mix(in srgb, var(--color-brand) 40%, transparent);
+  color: #ffffff;
 }
 
-h1, h2, h3, h4, h5, h6, .font-mono {
-  font-family: 'Space Mono', monospace;
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
+/* Thin, unobtrusive scrollbars that match the dark surfaces. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a4c78;
+  background-clip: content-box;
+}
+
+@keyframes lbv-pulse-ring {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.lbv-live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: currentColor;
+  animation: lbv-pulse-ring 1.8s ease-out infinite;
+}
