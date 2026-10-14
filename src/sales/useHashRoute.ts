@@ -1,3 +1,5 @@
+import { useCallback, useEffect, useState } from "react";
+
 /**
  * Hash-based routing for the salesperson dashboard.
  *
@@ -32,8 +34,6 @@ export function parseRoute(hash: string): DashboardRoute {
 export function routeToHash(route: DashboardRoute): string {
   return `#/${route}`;
 }
-
-import { useCallback, useEffect, useState } from "react";
 
 export function useHashRoute(): [DashboardRoute, (route: DashboardRoute) => void] {
   const [route, setRoute] = useState<DashboardRoute>(() =>

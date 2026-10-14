@@ -747,6 +747,7 @@ export default {
           200,
           corsHeaders
         );
+      }
 
       // =========================================================================
       // ROUTE: GET /api/service-profiles (read-only, data-only service profiles)
@@ -795,8 +796,6 @@ export default {
           .filter(Boolean);
 
         return jsonResponse({ profiles }, 200, corsHeaders);
-      }
-
       }
 
       // =========================================================================

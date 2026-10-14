@@ -433,6 +433,7 @@ deployed service with real credentials.
 | Salesperson joins | `POST /api/livekit/token` | session token | Salesperson identity only |
 | Transcript ingress | `POST /api/livekit/transcript[/stream]` | session token | Salesperson client forwards final prospect segments |
 | End session | `DELETE /api/sessions/:id` | session token | Revokes the session and its invitation |
+| Service profiles | `GET /api/service-profiles` | none | Read-only, data-only service profiles (no secrets) for the dashboard |
 
 Invitation link format: `https://<host>/?join=1&sessionId=<id>&token=<inviteToken>`
 
@@ -441,6 +442,25 @@ dashboard is never rendered for a prospect (`src/App.tsx` routes on `?join=1`).
 - Carries only the scoped invite token — **never** the session auth token.
 - Audio only: no camera/video is requested or published; prospect tokens grant the microphone source only.
 - Revoked on `DELETE /api/sessions/:id` (End Session) or when the session TTL expires.
+
+### 17a.1 Salesperson dashboard (`src/`)
+
+The root route renders the salesperson dashboard (`src/sales/SalesDashboard.tsx`) with a persistent
+sidebar (Dashboard, New Sales Call, Live Sales Room, Call History, Service Profiles, Settings) and a
+mobile drawer. The Live Sales Room embeds `lbv-sales-copilot/app/LiveKitSalesRoom.tsx`.
+
+- Session authorization and invitation tokens are held **in memory only** (React refs) and are never
+  written to `localStorage`, `sessionStorage`, or cookies. Only a non-secret default-profile preference
+  is persisted locally.
+- **Call History is tab-scoped.** The Worker deliberately forbids global session enumeration
+  (`GLOBAL_LISTING_FORBIDDEN`), so there is no persistent cross-device history endpoint yet; the list
+  reflects sessions created in the current browser tab.
+- `GET /api/service-profiles` exposes the data-only `ServiceProfile` fields. Legacy adapters that do not
+  expose a structured profile (the non-profile `ShopifySalesAdapter` / `GhostwriterSalesAdapter`) are
+  returned with `profileAvailable: false` rather than a fabricated playbook.
+- The original Google AI Studio validation console (`lbv-sales-copilot/app/page.tsx`) is no longer
+  routed to and is not included in the production bundle.
+
 
 ### 17b. Which component produces the transcript
 
@@ -485,11 +505,13 @@ real STT (LiveKit/AssemblyAI), reconnection behaviour, and end-to-end recommenda
 
 Manual live-call test:
 1. Deploy (section 10) and confirm the health checks (section 11).
-2. Open the dashboard, create a session, and tap **Copy Prospect Invitation Link**.
+2. Open the dashboard (**New Sales Call**), select a service profile, and create the session, then tap
+   **Copy** / **Share** to distribute the prospect invitation link.
 3. Open that link on a phone; confirm it shows the prospect audio page (no salesperson content).
 4. Tap **Join Call**, allow the microphone, and speak as the prospect.
-5. Confirm the salesperson dashboard shows “Prospect joined”, the prospect transcript, and an
-   approved **SAY THIS NEXT** recommendation; confirm the prospect page shows no recommendations.
+5. Confirm the salesperson dashboard shows the prospect as connected in the Live Sales Room, the prospect
+   transcript, and an approved **Say this next** recommendation; confirm the prospect page shows no
+   recommendations.
 6. Toggle mute, leave, rejoin, and finally tap **End Session**; confirm the invitation link is revoked.
 
 ---
