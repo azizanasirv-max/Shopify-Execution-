@@ -39,6 +39,7 @@ import {
   Sparkles,
   Server,
 } from "lucide-react";
+import { segmentText, shouldForwardProspectSegment } from "../../src/sales/transcriptFilter";
 
 export interface LiveKitSalesRoomProps {
   sessionId?: string | null;
@@ -490,8 +491,7 @@ export default function LiveKitSalesRoom({
             if (!transcriptions || transcriptions.length === 0) return;
 
             for (const publication of transcriptions) {
-              const isFinal = publication.isFinal === true || publication.final === true;
-              const text: string = publication.text || publication.transcript || "";
+              const text = segmentText(publication);
               const segmentId =
                 publication.id ||
                 publication.segmentId ||
@@ -499,11 +499,10 @@ export default function LiveKitSalesRoom({
                   .toString(36)
                   .substring(2, 7)}`;
 
-              const rawIdentity = participant?.identity || publication.participantIdentity;
-              const lower = typeof rawIdentity === "string" ? rawIdentity.toLowerCase() : "";
-              const isProspect = lower === "prospect" || lower.startsWith("prospect_");
-
-              if (!isFinal || !text.trim() || !isProspect) continue;
+              // Only FINAL, non-empty segments spoken by the prospect are
+              // forwarded; the salesperson's own speech and interim segments are
+              // dropped. Rules live in src/sales/transcriptFilter.ts.
+              if (!shouldForwardProspectSegment(publication, participant?.identity)) continue;
               if (processedSegmentIdsRef.current.has(segmentId)) continue;
 
               processedSegmentIdsRef.current.add(segmentId);
