@@ -116,8 +116,37 @@ identity (`prospect` / `salesperson`) — to every participant. The salesperson 
 (`lbv-sales-copilot/app/LiveKitSalesRoom.tsx`) consumes final `prospect`
 segments and posts them to the Worker.
 
+**Dispatch mode is logged at startup** (credential-free): `dispatch=AUTOMATIC`
+when no agent name is resolved, or a warning `dispatch=EXPLICIT agentName=...`
+when one is. Resolution order matches the SDK
+(`@livekit/agents` `WorkerOptions.agentName`): `LIVEKIT_AGENT_NAME_OVERRIDE` →
+`LIVEKIT_AGENT_ROOM` → `LIVEKIT_AGENT_NAME` → `""`. **A non-empty agent name
+disables automatic dispatch**, and the Worker never dispatches agents, so the
+agent would then never join a room. Each job also logs the server-provided
+`ctx.job.agentName` (`dispatch=automatic|explicit(...)`), which is the
+authoritative runtime evidence of how the job was delivered.
+
 To pin the agent to explicit dispatch instead, set `LIVEKIT_AGENT_ROOM` as an
-agent secret (it becomes `agentName`) and dispatch it per room.
+agent secret (it becomes `agentName`) **and** add agent dispatch to the
+end-user's token or call `AgentDispatch.createDispatch`.
+
+### 3a. Participant linking (required for prospect transcription)
+
+The LiveKit Agents SDK links an `AgentSession` to exactly **one** participant and
+feeds only that participant's microphone to STT. `RoomInputOptions` documents
+this as *"The participant to link to. If not provided, link to the FIRST
+participant."* Because the salesperson joins the room before the prospect opens
+the invitation link, omitting it links the session to the **salesperson**:
+prospect audio never reaches AssemblyAI and the transcript that is produced is
+published under the `salesperson` identity, which the salesperson UI's
+prospect-only filter discards.
+
+`agent.ts` therefore pins `inputOptions: { participantIdentity: "prospect" }`,
+matching the identity the Worker always issues to the prospect
+(`worker.ts` → `POST /api/livekit/invite-token`). The agent logs the participant
+it actually linked to (`linked participant (...)`) so a mis-link is visible
+without any credentials. `lbv-sales-copilot/validation/transcription-pipeline-tests.ts`
+guards this contract.
 
 ### 4. Free (Build) plan behaviour
 
