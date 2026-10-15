@@ -40,6 +40,13 @@ import {
   Server,
 } from "lucide-react";
 import { segmentText, shouldForwardProspectSegment } from "../../src/sales/transcriptFilter";
+import {
+  TRANSCRIPTION_STREAM_TOPIC,
+  transcriptionHealth,
+  transcriptionStreamSegmentId,
+  shouldForwardTranscriptionStream,
+  type TranscriptionHealth,
+} from "../../src/sales/transcriptFilter";
 
 export interface LiveKitSalesRoomProps {
   sessionId?: string | null;
@@ -61,6 +68,21 @@ interface ParticipantAudioState {
   isLocal: boolean;
   isSpeaking: boolean;
   isAudioEnabled: boolean;
+}
+
+/** Shallow value-equality for the participant list (avoids needless re-renders). */
+function participantsEqual(a: ParticipantAudioState[], b: ParticipantAudioState[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((entry, index) => {
+    const other = b[index];
+    return (
+      entry.identity === other.identity &&
+      entry.name === other.name &&
+      entry.isLocal === other.isLocal &&
+      entry.isSpeaking === other.isSpeaking &&
+      entry.isAudioEnabled === other.isAudioEnabled
+    );
+  });
 }
 
 type RecommendationStatus = "APPROVED" | "RECOVERY_REQUIRED" | "BLOCKED";
@@ -140,6 +162,14 @@ export default function LiveKitSalesRoom({
   const [currentRecommendation, setCurrentRecommendation] = useState<Recommendation | null>(null);
   const [isProcessingTranscript, setIsProcessingTranscript] = useState(false);
   const [prospectTranscripts, setProspectTranscripts] = useState<TranscriptLine[]>([]);
+  /** Timestamp (ms) the prospect participant was first observed in the room. */
+  const [prospectJoinedAt, setProspectJoinedAt] = useState<number | null>(null);
+  /** Content-free counter of transcription streams ignored because they failed the filter. */
+  const [ignoredTranscriptionStreams, setIgnoredTranscriptionStreams] = useState(0);
+  /** Ticks while we wait for the first segment so a stalled pipeline becomes visible. */
+  const [, setTranscriptionTick] = useState(0);
+  /** Transcription-specific failure (never a generic room error). */
+  const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
 
   const processedSegmentIdsRef = useRef<Set<string>>(new Set());
   const monotonicReqSeqRef = useRef<number>(0);
@@ -157,6 +187,29 @@ export default function LiveKitSalesRoom({
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [prospectTranscripts.length]);
+
+  /**
+   * Track when the prospect first appears so a stalled transcription pipeline can
+   * be reported instead of leaving the panel silently empty.
+   */
+  const prospectPresent = participants.some(
+    (p) => !p.isLocal && p.identity.toLowerCase().startsWith("prospect")
+  );
+
+  useEffect(() => {
+    if (prospectPresent) {
+      setProspectJoinedAt((prev) => prev ?? Date.now());
+    } else {
+      setProspectJoinedAt(null);
+    }
+  }, [prospectPresent]);
+
+  // Re-evaluate the health label while we are still waiting for the first segment.
+  useEffect(() => {
+    if (!prospectPresent || prospectTranscripts.length > 0) return;
+    const timer = window.setInterval(() => setTranscriptionTick((n) => n + 1), 2000);
+    return () => window.clearInterval(timer);
+  }, [prospectPresent, prospectTranscripts.length]);
 
   const checkServerConfiguration = useCallback(async () => {
     setCheckingConfig(true);
@@ -199,7 +252,11 @@ export default function LiveKitSalesRoom({
       });
     });
 
-    setParticipants(list);
+    // `ActiveSpeakersChanged` fires continuously during a conversation. Replacing
+    // the state array on every tick re-renders the whole room (including the
+    // audio-attached tree) many times per second, which is wasted main-thread work
+    // in the middle of the audio path. Only update when the rendered values change.
+    setParticipants((prev) => (participantsEqual(prev, list) ? prev : list));
   }, []);
 
   const disconnectRoom = useCallback(() => {
@@ -324,10 +381,12 @@ export default function LiveKitSalesRoom({
           if (!res.ok) {
             const errData = await res.json().catch(() => ({}));
             processedSegmentIdsRef.current.delete(segmentId);
-            setErrorMessage(
-              errData.error || errData.message || `Transcript processing failed (status ${res.status}).`
-            );
+            const message =
+              errData.error || errData.message || `Transcript processing failed (status ${res.status}).`;
+            setErrorMessage(message);
+            setTranscriptionError(message);
           } else {
+            setTranscriptionError(null);
             const data = await res.json();
             if (reqSeq === monotonicReqSeqRef.current && data.recommendation) {
               setCurrentRecommendation({
@@ -341,7 +400,9 @@ export default function LiveKitSalesRoom({
       } catch (txErr: any) {
         if (txErr?.name !== "AbortError") {
           processedSegmentIdsRef.current.delete(segmentId);
-          setErrorMessage("Network error while processing the transcript: " + (txErr.message || txErr));
+          const message = "Network error while processing the transcript: " + (txErr.message || txErr);
+          setErrorMessage(message);
+          setTranscriptionError(message);
         }
       } finally {
         if (reqSeq === monotonicReqSeqRef.current) setIsProcessingTranscript(false);
@@ -512,6 +573,60 @@ export default function LiveKitSalesRoom({
         );
       }
 
+      /**
+       * Newer LiveKit Agents builds ALSO deliver transcription as a text stream on
+       * `lk.transcription` (with the speaker in `senderIdentity` and the FINAL
+       * marker in the `lk.transcription_final` attribute). `livekit-client` 2.22.x
+       * does not surface that stream as `RoomEvent.TranscriptionReceived`, so
+       * without this handler a future SDK/client protocol change would silently
+       * empty the transcript panel.
+       *
+       * SECURITY: the same fail-closed filter is applied - the sender must be the
+       * PROSPECT and the FINAL attribute must be set. Every stream is drained (so
+       * unread buffers cannot grow) but non-matching streams are never forwarded.
+       * Segments are de-duplicated by the provider segment id shared with the
+       * legacy delivery path, so a client that supports BOTH cannot double-render.
+       */
+      try {
+        room.registerTextStreamHandler(
+          TRANSCRIPTION_STREAM_TOPIC,
+          (reader: any, participantInfo?: { identity?: string }) => {
+            const info = {
+              topic: reader?.info?.topic,
+              senderIdentity: participantInfo?.identity,
+              attributes: reader?.info?.attributes,
+            };
+            const allowed = shouldForwardTranscriptionStream(info);
+            void (async () => {
+              let text = "";
+              try {
+                text = await reader.readAll();
+              } catch {
+                return; // a broken stream must never break the call
+              }
+              if (!allowed || !text.trim()) {
+                setIgnoredTranscriptionStreams((n) => n + 1);
+                return;
+              }
+              const segmentId =
+                transcriptionStreamSegmentId(info) || `stream_${reader?.info?.id ?? Date.now()}`;
+              if (processedSegmentIdsRef.current.has(segmentId)) return;
+              processedSegmentIdsRef.current.add(segmentId);
+              void processProspectTranscript(
+                text.trim(),
+                segmentId,
+                currentSessionId!,
+                currentSessionToken
+              );
+            })();
+          }
+        );
+      } catch {
+        // A client build that already handles `lk.transcription` internally (and
+        // therefore re-emits RoomEvent.TranscriptionReceived) will have claimed the
+        // topic; the legacy handler above then covers it.
+      }
+
       await room.connect(serverUrl, token);
 
       try {
@@ -654,6 +769,18 @@ export default function LiveKitSalesRoom({
     (p) => !p.isLocal && p.identity.toLowerCase().startsWith("prospect")
   );
 
+  /**
+   * Transcription health. This only decides what the panel SAYS - it never
+   * changes which segments are accepted (that stays in transcriptFilter.ts).
+   */
+  const transcriptHealth: TranscriptionHealth = transcriptionHealth({
+    connected: isConnected,
+    prospectPresent,
+    segmentCount: prospectTranscripts.length,
+    sinceProspectMs: prospectJoinedAt ? Date.now() - prospectJoinedAt : 0,
+    hasError: transcriptionError !== null,
+  });
+
   return (
     <div className="space-y-5">
       {/* Header */}
@@ -779,12 +906,55 @@ export default function LiveKitSalesRoom({
                 <Volume2 className="h-4 w-4 text-brand" />
                 <h3 className="text-sm font-semibold text-ink">Live transcript</h3>
               </div>
-              <span className="font-mono text-[11px] text-ink-mute">{prospectTranscripts.length} segments</span>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${
+                    transcriptHealth === "receiving"
+                      ? "border-positive/35 bg-positive/10 text-positive"
+                      : transcriptHealth === "stalled" || transcriptHealth === "error"
+                        ? "border-warn/35 bg-warn/10 text-warn"
+                        : "border-line-strong bg-surface-2 text-ink-soft"
+                  }`}
+                >
+                  {transcriptHealth === "receiving"
+                    ? "Receiving"
+                    : transcriptHealth === "waiting"
+                      ? "Listening"
+                      : transcriptHealth === "stalled"
+                        ? "No transcript yet"
+                        : transcriptHealth === "error"
+                          ? "Transcription error"
+                          : "Idle"}
+                </span>
+                <span className="font-mono text-[11px] text-ink-mute">{prospectTranscripts.length} segments</span>
+                {ignoredTranscriptionStreams > 0 && (
+                  <span
+                    className="font-mono text-[11px] text-ink-mute"
+                    title="Non-prospect or non-final transcription streams ignored by the identity filter (content-free counter)."
+                  >
+                    {ignoredTranscriptionStreams} filtered
+                  </span>
+                )}
+              </div>
             </div>
+
+            {(transcriptHealth === "stalled" || transcriptHealth === "error") && (
+              <div className="flex items-start gap-2.5 border-b border-line bg-warn/10 px-5 py-3 text-[12px] text-warn">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  {transcriptHealth === "error"
+                    ? transcriptionError
+                    : "The prospect is connected but no final transcript has arrived. The transcription agent may not have joined this room, or speech-to-text may be failing. Check the LiveKit agent deployment, its dispatch mode and the AssemblyAI key."}
+                </span>
+              </div>
+            )}
+
             <div className="max-h-[320px] min-h-[160px] space-y-2 overflow-y-auto px-5 py-4">
               {prospectTranscripts.length === 0 ? (
                 <p className="py-8 text-center text-[13px] text-ink-mute">
-                  Waiting for the prospect to speak. Final transcript segments appear here as they are produced.
+                  {transcriptHealth === "idle"
+                    ? "Waiting for the prospect to join. Final transcript segments appear here as they are produced."
+                    : "Waiting for the prospect to speak. Final transcript segments appear here as they are produced."}
                 </p>
               ) : (
                 prospectTranscripts.map((line, index) => (

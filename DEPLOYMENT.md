@@ -666,8 +666,16 @@ No LiveKit webhook is required by the current code.
 | Setting | Status | Purpose | Where |
 |---|---|---|---|
 | `ASSEMBLYAI_API_KEY` | **Required for STT** | Direct streaming STT (your own account/free tier) | **Agent runtime env only** — never the Worker or browser |
-| `ASSEMBLYAI_SPEECH_MODEL` | Optional | Speech model override | Agent runtime env |
+| `ASSEMBLYAI_SPEECH_MODEL` | Optional | Speech model override. When unset the agent pins `universal-streaming-english` (see `agent/agent.ts`). | Agent runtime env |
 | Account/region + usage limits | Required | Free-tier concurrency/limits | assemblyai.com dashboard |
+
+> **Model pinning (do not remove).** `@livekit/agents-plugin-assemblyai` 1.9.2 defaults its own
+> `speechModel` to `universal-3-5-pro`, a U3-Pro streaming model that this project never documented
+> and that is not guaranteed to be entitled for the project's AssemblyAI account. An unentitled or
+> unknown model makes AssemblyAI reject the streaming WebSocket, which produces **zero
+> transcription while the agent still reports healthy**. `agent/agent.ts` therefore pins
+> `universal-streaming-english` and logs `stt=assemblyai model=... modelSource=...` at startup.
+> If you need a different model, set `ASSEMBLYAI_SPEECH_MODEL` to a model your account is entitled to.
 
 Obtain the key at <https://www.assemblyai.com/dashboard>. The Worker does **not** read any AssemblyAI
 variable.

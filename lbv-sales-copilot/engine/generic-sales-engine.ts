@@ -73,6 +73,16 @@ export class GenericSalesEngine {
   private logger: (level: "info" | "warn" | "error", message: string, meta?: any) => void;
   private recentTranscripts = new Map<string, number>();
   private readonly maxHistoryTurns: number = 100;
+  /**
+   * How many most-recent turns are sent to the model as CONTEXT.
+   *
+   * Stored session history stays bounded by {@link maxHistoryTurns} (persistence
+   * and history views are unaffected); this only caps what is put on the wire for
+   * each recommendation. Model time-to-first-token is dominated by input size and
+   * the realtime path re-sends the context on EVERY final prospect segment, so an
+   * unbounded context directly adds to the visible "say this next" delay.
+   */
+  private readonly maxContextTurns: number = 20;
   private readonly providerId: string;
   private readonly tokenBudget?: TokenBudget;
   private readonly usageTracker?: UsageTracker;
@@ -274,7 +284,10 @@ export class GenericSalesEngine {
     const currentContents: any[] = [];
 
     if (effectiveHistory && effectiveHistory.length > 0) {
-      for (const turn of effectiveHistory) {
+      // Only the most recent turns go on the wire: the realtime path re-sends
+      // this context on every final prospect segment, so unbounded context is
+      // pure added latency. Stored history is not modified.
+      for (const turn of effectiveHistory.slice(-this.maxContextTurns)) {
         if (turn.text) {
           currentContents.push({
             role: turn.role === "user" ? "user" : "model",
