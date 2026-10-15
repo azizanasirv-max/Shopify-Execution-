@@ -59,6 +59,36 @@ import * as silero from "@livekit/agents-plugin-silero";
  */
 const PROSPECT_IDENTITY = "prospect";
 
+/**
+ * AssemblyAI streaming speech model used when `ASSEMBLYAI_SPEECH_MODEL` is unset.
+ *
+ * PINNED ON PURPOSE. The installed plugin
+ * (`@livekit/agents-plugin-assemblyai` 1.9.2) defaults to `universal-3-5-pro`,
+ * a U3-Pro streaming model. That is NOT the model this repository documents
+ * (`agent/.env.example`, `DEPLOYMENT.md`: "default: universal-streaming-english")
+ * and U3-Pro entitlement is not guaranteed for the project's AssemblyAI account.
+ * An unentitled / unknown model makes AssemblyAI reject the streaming WebSocket,
+ * which yields ZERO transcription while the agent still reports healthy - the
+ * exact silent-failure shape this pipeline must not have. Pinning the model makes
+ * the behaviour match the documentation and the startup log makes it observable.
+ * Override with `ASSEMBLYAI_SPEECH_MODEL` when a different model is entitled.
+ */
+const DEFAULT_ASSEMBLYAI_SPEECH_MODEL = "universal-streaming-english";
+
+/** Resolve the effective AssemblyAI model (env override wins). */
+function resolveSpeechModel(): string {
+  const override = process.env.ASSEMBLYAI_SPEECH_MODEL?.trim();
+  return override || DEFAULT_ASSEMBLYAI_SPEECH_MODEL;
+}
+
+/**
+ * How long to wait after the prospect's microphone track is published before
+ * reporting that no final transcript has been produced yet. Credential-free and
+ * content-free: it only distinguishes "STT produced nothing" from "the agent
+ * never saw prospect audio", which the salesperson's empty panel cannot.
+ */
+const NO_TRANSCRIPT_WARN_MS = 20000;
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -159,14 +189,34 @@ export default defineAgent({
     // Direct AssemblyAI STT (own API key). The session consumes room audio and
     // publishes transcription back into the room, which the salesperson client
     // receives as RoomEvent.TranscriptionReceived.
+    const speechModel = resolveSpeechModel();
+    log().info(
+      `[lbv-agent] stt=assemblyai model=${speechModel} ` +
+        `modelSource=${process.env.ASSEMBLYAI_SPEECH_MODEL?.trim() ? "env" : "pinned-default"}`
+    );
     const session = new voice.AgentSession({
       vad,
       stt: new assemblyai.STT({
         apiKey: assemblyAiKey,
-        ...(process.env.ASSEMBLYAI_SPEECH_MODEL
-          ? { speechModel: process.env.ASSEMBLYAI_SPEECH_MODEL as any }
-          : {}),
+        speechModel: speechModel as any,
       }),
+    });
+
+    /**
+     * Positive evidence that prospect audio actually reached the agent's
+     * subscription (the stage that sits BEFORE AssemblyAI). Content-free: only
+     * identities, track SIDs and sources are logged.
+     */
+    let sawProspectMicTrack = false;
+    let sawFinalTranscript = false;
+    ctx.room.on("trackSubscribed", (track, publication, participant) => {
+      log().info(
+        `[lbv-agent] track subscribed: participant=${participant.identity} ` +
+          `sid=${publication.sid} source=${publication.source}`
+      );
+      if (participant.identity === PROSPECT_IDENTITY) {
+        sawProspectMicTrack = true;
+      }
     });
 
     /**
@@ -197,6 +247,7 @@ export default defineAgent({
       // Log only non-content diagnostics so transcription can still be
       // confirmed as received/processed.
       const charCount = typeof event.transcript === "string" ? event.transcript.length : 0;
+      if (charCount > 0) sawFinalTranscript = true;
       log().info(
         `[lbv-agent] final transcript received (chars=${charCount}, ` +
           `linked=${linkedParticipantIdentity("final transcript")})`
@@ -233,6 +284,12 @@ export default defineAgent({
         // published transcript carries the salesperson identity, which the
         // salesperson UI's prospect-only filter discards.
         inputOptions: { participantIdentity: PROSPECT_IDENTITY },
+        // This agent NEVER speaks: disabling the audio output stops the SDK from
+        // publishing a silent microphone track (`roomio_audio`) that every client
+        // would otherwise auto-subscribe to and negotiate an extra media section
+        // for. Transcription output is a SEPARATE option and stays enabled (proven
+        // by agent/tests/roomio-transcription.integration.ts).
+        outputOptions: { audioEnabled: false },
       });
     } catch (error) {
       log().error(
@@ -243,10 +300,36 @@ export default defineAgent({
 
     linkedParticipantIdentity("session started");
 
+    /**
+     * Distinguish the two silent-failure shapes that an empty salesperson
+     * transcript panel cannot: prospect audio never reached the agent's
+     * subscription, vs. audio arrived but AssemblyAI produced no final segment.
+     * Credential-free, content-free, and only logged once.
+     */
+    const transcriptWatchdog = setTimeout(() => {
+      if (sawFinalTranscript) return;
+      if (!sawProspectMicTrack) {
+        log().warn(
+          `[lbv-agent] no prospect microphone track was subscribed ${NO_TRANSCRIPT_WARN_MS}ms after the ` +
+            `session started; the agent is not receiving prospect audio ` +
+            `(linked=${linkedParticipantIdentity("watchdog")})`
+        );
+      } else {
+        log().warn(
+          `[lbv-agent] prospect microphone audio WAS subscribed but no final transcript was produced ` +
+            `within ${NO_TRANSCRIPT_WARN_MS}ms; check the STT stage (model=${resolveSpeechModel()}) ` +
+            `and any stt_error logs above`
+        );
+      }
+    }, NO_TRANSCRIPT_WARN_MS);
+    // Never keep the job alive for a diagnostic.
+    transcriptWatchdog.unref?.();
+
     // Keep the job alive for the duration of the call.
     await new Promise<void>((resolve) => {
       ctx.room.on("disconnected", () => resolve());
     });
+    clearTimeout(transcriptWatchdog);
     linkedParticipantIdentity("room disconnected");
     await session.close();
   },

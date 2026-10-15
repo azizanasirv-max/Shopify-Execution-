@@ -8,7 +8,9 @@
     "dev": "tsx agent.ts dev",
     "start": "node --import tsx agent.ts start",
     "download-files": "livekit-agents download-files",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:transcription": "tsx tests/roomio-transcription.integration.ts",
+    "test": "tsx tests/roomio-transcription.integration.ts"
   },
   "engines": {
     "node": ">=20"
