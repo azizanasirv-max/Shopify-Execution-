@@ -20,6 +20,7 @@
     "test:service": "tsx run-tests.ts service",
     "test:ui": "tsx run-tests.ts ui",
     "test:transcription": "tsx run-tests.ts transcription",
+    "test:latency": "tsx run-tests.ts latency",
     "check:deploy": "node scripts/check-deploy-config.mjs",
     "deploy:dry-run": "npx wrangler deploy --dry-run",
     "deploy": "npx wrangler deploy",

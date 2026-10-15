@@ -224,6 +224,21 @@ export class GenericSalesEngine {
   }
 
   /**
+   * True when the deterministic router would invoke the model for `text`.
+   *
+   * Exposed so transport-level ingress (the Worker's transcript routes) can skip
+   * an entire model pipeline for an utterance that cannot yield an actionable
+   * next line - a backchannel or filler such as "mm-hmm" or "ok" - instead of
+   * paying for the call and discarding the result. Uses the SAME deterministic
+   * router that already guards the realtime path; no approval or validation
+   * behaviour changes.
+   */
+  public shouldInvokeModel(text: string): boolean {
+    if (!this.deterministicRouting) return true;
+    return decideRouting(text).invokeModel;
+  }
+
+  /**
    * Generates a grounded, policy-checked recommendation for the salesperson.
    *
    * @param prospectPrompt The statement, question, or objection from the prospect

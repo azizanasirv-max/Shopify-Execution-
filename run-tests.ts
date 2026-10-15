@@ -19,6 +19,7 @@ import { runLlmProviderTests } from "./lbv-sales-copilot/validation/llm-provider
 import { runServiceProfileTests } from "./lbv-sales-copilot/validation/service-profile-tests.js";
 import { runDashboardUiTests } from "./lbv-sales-copilot/validation/dashboard-ui-tests.js";
 import { runTranscriptionPipelineTests } from "./lbv-sales-copilot/validation/transcription-pipeline-tests.js";
+import { runRealtimeLatencyTests } from "./lbv-sales-copilot/validation/realtime-latency-tests.js";
 
 dotenv.config();
 
@@ -156,6 +157,10 @@ if (command === "adversarial") {
   runTranscriptionPipelineTests().then(summary => {
     process.exit(summary.failed === 0 ? 0 : 1);
   });
+} else if (command === "latency" || command === "realtime-latency") {
+  runRealtimeLatencyTests().then(summary => {
+    process.exit(summary.failed === 0 ? 0 : 1);
+  });
 } else if (command === "hardening" || command === "unit" || command === "engine") {
   Promise.all([
     runHardeningUnitTests(),
@@ -169,13 +174,14 @@ if (command === "adversarial") {
     runLlmProviderTests(),
     runServiceProfileTests(),
     runDashboardUiTests(),
-    runTranscriptionPipelineTests()
-  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12]) => {
-    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed + s10.failed + s11.failed + s12.failed;
+    runTranscriptionPipelineTests(),
+    runRealtimeLatencyTests()
+  ]).then(([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13]) => {
+    const totalFailed = s1.failed + s2.failed + s3.failed + s4.failed + s5.failed + s6.failed + s7.failed + s8.failed + s9.failed + s10.failed + s11.failed + s12.failed + s13.failed;
     process.exit(totalFailed === 0 ? 0 : 1);
   });
 } else {
-  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", "persistence", "d1", "worker", "ui", "transcription", or "hardening".`);
+  console.error(`Unknown command: ${command}. Use "adversarial", "stage2", "classification", "approval-gate", "isolation", "access-control", "realtime", "persistence", "d1", "worker", "ui", "transcription", "latency", or "hardening".`);
   process.exit(1);
 }
 

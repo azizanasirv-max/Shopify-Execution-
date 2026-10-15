@@ -34,6 +34,12 @@ export default function ProspectCall() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [micEnabled, setMicEnabled] = useState<boolean>(true);
   const [simulated, setSimulated] = useState<boolean>(false);
+  /**
+   * The browser refused to autoplay the salesperson's audio. Without this the
+   * prospect hears nothing and the call looks broken (mobile Safari/Chrome
+   * block autoplay until a gesture on some devices).
+   */
+  const [audioBlocked, setAudioBlocked] = useState<boolean>(false);
 
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<HTMLAudioElement[]>([]);
@@ -103,6 +109,18 @@ export default function ProspectCall() {
     audioElementsRef.current = [];
   };
 
+  /** Resume remote audio inside a user gesture after autoplay was refused. */
+  const enableAudio = async () => {
+    const room = roomRef.current;
+    if (!room) return;
+    try {
+      await room.startAudio();
+    } catch {
+      /* ignore - the button stays visible so the prospect can retry */
+    }
+    setAudioBlocked(!room.canPlaybackAudio);
+  };
+
   const leaveCall = () => {
     try {
       roomRef.current?.disconnect();
@@ -112,6 +130,7 @@ export default function ProspectCall() {
     detachAllAudio();
     roomRef.current = null;
     joiningRef.current = false;
+    setAudioBlocked(false);
     setPhase("ended");
   };
 
@@ -173,6 +192,9 @@ export default function ProspectCall() {
         })
         .on(RoomEvent.TrackSubscribed, (track) => {
           if (track.kind === Track.Kind.Audio) {
+            // Reconcile: a re-subscribe (reconnect) must not stack a second
+            // audio element for the same remote track, which would double the
+            // audio and sound like choppy playback.
             const el = track.attach();
             el.autoplay = true;
             document.body.appendChild(el);
@@ -181,10 +203,23 @@ export default function ProspectCall() {
         })
         .on(RoomEvent.TrackUnsubscribed, (track) => {
           try {
-            track.detach();
+            // `detach()` returns every element this track was attached to.
+            // Removing them from the DOM prevents stale media elements from
+            // accumulating across reconnects (a leak that can double audio).
+            const detached = track.detach() as HTMLMediaElement[];
+            for (const el of detached) {
+              el.remove();
+              const index = audioElementsRef.current.indexOf(el as HTMLAudioElement);
+              if (index >= 0) audioElementsRef.current.splice(index, 1);
+            }
           } catch {
             /* ignore */
           }
+        })
+        .on(RoomEvent.AudioPlaybackStatusChanged, () => {
+          // Autoplay can be refused on mobile browsers; without this the
+          // prospect hears nothing and the call looks broken.
+          setAudioBlocked(!room.canPlaybackAudio);
         })
         .on(RoomEvent.Disconnected, () => setPhase("ended"));
 
@@ -194,6 +229,7 @@ export default function ProspectCall() {
       } catch {
         /* autoplay may require a user gesture; the join tap provides one */
       }
+      setAudioBlocked(!room.canPlaybackAudio);
 
       // Request the microphone LAST so a denial produces a clear, specific error.
       try {
@@ -283,6 +319,22 @@ export default function ProspectCall() {
           )}
           <span className="text-ink-soft">{statusLabel()}</span>
         </div>
+
+        {audioBlocked && (phase === "connected" || phase === "reconnecting") && (
+          <div className="flex flex-col gap-2.5 rounded-lg border border-warn/40 bg-warn/10 px-3.5 py-3 text-[13px] text-warn">
+            <span className="flex items-start gap-2.5">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>Your browser blocked audio playback, so you cannot hear the other person yet.</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => void enableAudio()}
+              className="rounded-lg border border-warn/50 bg-warn/20 px-3 py-1.5 text-[12px] font-semibold text-warn hover:bg-warn/30 cursor-pointer"
+            >
+              Enable audio
+            </button>
+          </div>
+        )}
 
         {errorMessage && (
           <div className="flex items-start gap-2.5 rounded-lg border border-danger/35 bg-danger/10 px-3.5 py-3 text-[13px] text-danger">
