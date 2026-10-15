@@ -1237,6 +1237,23 @@ export default {
         let recommendation: any = null;
 
         if (transcriptSpeaker === "prospect" && finalFlag) {
+          // Deterministic routing: skip the whole model pipeline for utterances
+          // that cannot yield an actionable next line (backchannel / filler).
+          if (!salesEngine.shouldInvokeModel(transcriptText)) {
+            return jsonResponse(
+              {
+                success: true,
+                sessionId: session.id,
+                productId: session.productId,
+                speaker: transcriptSpeaker,
+                skipped: "non_actionable",
+                recommendation: null
+              },
+              200,
+              corsHeaders
+            );
+          }
+
           if (isDuplicateTranscript(session.id, transcriptText)) {
             return jsonResponse(
               {
@@ -1334,6 +1351,21 @@ data: ${JSON.stringify(data)}
                   sessionId: session.id,
                   productId: session.productId,
                   speaker: transcriptSpeaker,
+                  recommendation: null
+                });
+                return;
+              }
+
+              // Deterministic routing: a backchannel/filler cannot yield an
+              // actionable next line, so no model call is made at all. The
+              // terminal `final` frame tells the client not to fall back.
+              if (!salesEngine.shouldInvokeModel(transcriptText)) {
+                send("final", {
+                  success: true,
+                  sessionId: session.id,
+                  productId: session.productId,
+                  speaker: transcriptSpeaker,
+                  skipped: "non_actionable",
                   recommendation: null
                 });
                 return;

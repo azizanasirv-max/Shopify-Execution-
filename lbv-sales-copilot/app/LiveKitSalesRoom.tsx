@@ -25,6 +25,8 @@ import {
   RemoteParticipant,
   LocalParticipant,
   ConnectionState,
+  ConnectionQuality,
+  Participant,
 } from "livekit-client";
 import {
   Radio,
@@ -47,6 +49,15 @@ import {
   shouldForwardTranscriptionStream,
   type TranscriptionHealth,
 } from "../../src/sales/transcriptFilter";
+import {
+  RecommendationScheduler,
+  monotonicNow,
+  parseSseEvent,
+  requestRecommendation,
+  type EngineMetadata,
+  type RecommendationResult,
+  type RecommendationTiming,
+} from "../../src/sales/recommendationClient";
 
 export interface LiveKitSalesRoomProps {
   sessionId?: string | null;
@@ -93,25 +104,37 @@ interface Recommendation {
   timestamp: number;
 }
 
+/**
+ * Audio elements are keyed by participant identity so they can be reconciled.
+ */
+interface AttachedAudio {
+  track: RemoteTrack;
+  element: HTMLAudioElement;
+}
+
 interface TranscriptLine {
   text: string;
   timestamp: number;
 }
 
-/** Minimal Server-Sent Events parser for the streaming recommendation endpoint. */
-function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
-  const lines = rawEvent.split("\n");
-  let event = "message";
-  const dataLines: string[] = [];
-  for (const line of lines) {
-    if (line.startsWith("event:")) event = line.slice(6).trim();
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-  }
-  if (dataLines.length === 0) return null;
-  try {
-    return { event, data: JSON.parse(dataLines.join("\n")) };
-  } catch {
-    return null;
+/**
+ * Orders connection quality from best to worst so the UI can show the worst
+ * remote participant's quality (the one that affects the call).
+ */
+function qualityRank(quality: ConnectionQuality): number {
+  switch (quality) {
+    case ConnectionQuality.Excellent:
+      return 0;
+    case ConnectionQuality.Good:
+      return 1;
+    case ConnectionQuality.Unknown:
+      return 2;
+    case ConnectionQuality.Poor:
+      return 3;
+    case ConnectionQuality.Lost:
+      return 4;
+    default:
+      return 2;
   }
 }
 
@@ -171,11 +194,25 @@ export default function LiveKitSalesRoom({
   /** Transcription-specific failure (never a generic room error). */
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
 
+  /**
+   * Remote audio could not autoplay (browser policy). LiveKit reports this via
+   * RoomEvent.AudioPlaybackStatusChanged; without listening for it the call is
+   * silently one-way and looks like an audio dropout.
+   */
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  /** Worst observed remote connection quality (transport-health indicator). */
+  const [worstQuality, setWorstQuality] = useState<ConnectionQuality>(ConnectionQuality.Unknown);
+  /** Latency + server breakdown for the recommendation currently displayed. */
+  const [recommendationLatency, setRecommendationLatency] = useState<RecommendationTiming | null>(null);
+
   const processedSegmentIdsRef = useRef<Set<string>>(new Set());
   const monotonicReqSeqRef = useRef<number>(0);
-  const activeAbortRef = useRef<AbortController | null>(null);
+  /** In-flight recommendation policy (coalesce / cap / teardown-abort). */
+  const schedulerRef = useRef<RecommendationScheduler>(new RecommendationScheduler());
+  /** Guards against a double join creating a second Room and a second mic track. */
+  const joiningRef = useRef<boolean>(false);
   const roomRef = useRef<Room | null>(null);
-  const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const audioElementsRef = useRef<Map<string, AttachedAudio>>(new Map());
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
   // Keep parent-provided credentials in sync (the parent owns the session).
@@ -259,17 +296,99 @@ export default function LiveKitSalesRoom({
     setParticipants((prev) => (participantsEqual(prev, list) ? prev : list));
   }, []);
 
+  /**
+   * Attach a remote audio track, reconciling any element already held for that
+   * participant.
+   *
+   * The previous implementation overwrote the map entry without detaching the
+   * previous track, so a re-subscribe (reconnect, mic re-publish) left an
+   * orphaned, still-attached element playing a stale stream. LiveKit also
+   * recycles detached `<audio>` elements, so leaking one can hand a live
+   * `srcObject` to an unrelated track.
+   */
+  const attachRemoteAudio = useCallback(
+    (participant: RemoteParticipant, track: RemoteTrack) => {
+      const existing = audioElementsRef.current.get(participant.identity);
+      if (existing) {
+        try {
+          existing.track.detach(existing.element);
+        } catch {
+          /* a track that is already gone must never break the call */
+        }
+        audioElementsRef.current.delete(participant.identity);
+      }
+      const element = track.attach();
+      element.autoplay = true;
+      audioElementsRef.current.set(participant.identity, { track, element });
+    },
+    []
+  );
+
+  /** Detach and release every remote audio element (teardown only). */
+  const clearRemoteAudio = useCallback(() => {
+    audioElementsRef.current.forEach(({ track, element }) => {
+      try {
+        track.detach(element);
+      } catch {
+        /* ignore */
+      }
+      try {
+        element.remove();
+      } catch {
+        /* ignore */
+      }
+    });
+    audioElementsRef.current.clear();
+  }, []);
+
+  /** Detach and release the audio element held for one participant identity. */
+  const releaseRemoteAudio = useCallback((identity: string, track?: RemoteTrack) => {
+    const entry = audioElementsRef.current.get(identity);
+    if (!entry) return;
+    // When a specific track is given, only release the element holding it.
+    if (track && entry.track !== track) return;
+    try {
+      entry.track.detach(entry.element);
+    } catch {
+      /* ignore */
+    }
+    try {
+      entry.element.remove();
+    } catch {
+      /* ignore */
+    }
+    audioElementsRef.current.delete(identity);
+  }, []);
+
   const disconnectRoom = useCallback(() => {
     if (roomRef.current) {
       roomRef.current.disconnect();
       roomRef.current = null;
     }
-    audioElementsRef.current.forEach((el) => el.remove());
-    audioElementsRef.current.clear();
+    // Necessary cancellation: teardown. Nothing in flight can still be displayed.
+    schedulerRef.current.abortAll();
+    clearRemoteAudio();
+    joiningRef.current = false;
     setConnectionState(ConnectionState.Disconnected);
     setParticipants([]);
     setIsConnecting(false);
     setIsSimulatedMode(false);
+    setAudioBlocked(false);
+  }, [clearRemoteAudio]);
+
+  /**
+   * Resume remote audio after the browser blocked autoplay. Must run inside a
+   * user gesture, which is why it is wired to an explicit button.
+   */
+  const enableAudio = useCallback(async () => {
+    const room = roomRef.current;
+    if (!room) return;
+    try {
+      await room.startAudio();
+    } catch (audioErr) {
+      console.warn("[lbv] startAudio failed:", audioErr);
+    }
+    setAudioBlocked(!room.canPlaybackAudio);
   }, []);
 
   useEffect(() => {
@@ -281,122 +400,69 @@ export default function LiveKitSalesRoom({
 
   /**
    * Forward one final prospect segment to the Worker and render the
-   * approval-gated recommendation. Stale responses are discarded via a
-   * monotonic sequence counter and an AbortController.
+   * approval-gated recommendation.
+   *
+   * Stale responses are discarded by a monotonic sequence counter. A newer
+   * segment no longer cancels in-flight work: see `RecommendationScheduler` for
+   * the (narrow) conditions under which cancellation is still necessary.
    */
   const processProspectTranscript = useCallback(
     async (text: string, segmentId: string, sessionId: string, sessionToken: string | null) => {
       setProspectTranscripts((prev) => [...prev.slice(-49), { text, timestamp: Date.now() }]);
 
+      // Reserve a request slot BEFORE taking a sequence number: when an
+      // identical utterance is already in flight the existing request keeps its
+      // sequence authority, so its result is still allowed to render.
+      const controller = schedulerRef.current.start(text);
+      if (!controller) return;
+
       monotonicReqSeqRef.current += 1;
       const reqSeq = monotonicReqSeqRef.current;
 
-      activeAbortRef.current?.abort();
-      const controller = new AbortController();
-      activeAbortRef.current = controller;
+      // Monotonic mark for the moment the final transcript segment arrived.
+      // Everything after this is the latency the salesperson actually feels.
+      const startedAt = monotonicNow();
 
       setIsProcessingTranscript(true);
       setErrorMessage(null);
 
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        ...(sessionToken ? { "x-session-token": sessionToken } : {}),
+      const applyResult = (result: RecommendationResult, timing: RecommendationTiming) => {
+        if (reqSeq !== monotonicReqSeqRef.current) return;
+        setCurrentRecommendation({
+          statement: result.statement,
+          status: result.status,
+          timestamp: Date.now(),
+        });
+        // Preserve the measurement instead of discarding it (the previous
+        // implementation read only `statement` and `status` and dropped
+        // `engineMetadata`, which is the server's own latency breakdown).
+        setRecommendationLatency({
+          transcriptToFirstVisibleMs: timing.transcriptToFirstVisibleMs,
+          totalMs: timing.totalMs,
+          usedFallback: timing.usedFallback,
+          engineMetadata: result.engineMetadata,
+        });
+        setTranscriptionError(null);
       };
-      const body = JSON.stringify({ sessionId, sessionToken, text, isFinal: true, speaker: "prospect" });
 
       try {
-        let streamingSucceeded = false;
-
-        // Preferred path: stream text the backend has ALREADY validated.
-        try {
-          const streamRes = await fetch("/api/livekit/transcript/stream", {
-            method: "POST",
-            headers,
-            body,
-            signal: controller.signal,
-          });
-
-          if (streamRes.ok && streamRes.body) {
-            const reader = streamRes.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
-            let accumulated = "";
-            let streamDone = false;
-
-            while (!streamDone) {
-              const chunk = await reader.read();
-              streamDone = chunk.done;
-              if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
-
-              const frames = buffer.split("\n\n");
-              buffer = frames.pop() || "";
-
-              for (const frame of frames) {
-                const parsed = parseSseEvent(frame);
-                if (!parsed) continue;
-
-                if (parsed.event === "delta") {
-                  if (reqSeq === monotonicReqSeqRef.current && parsed.data?.text) {
-                    accumulated += parsed.data.text;
-                    setCurrentRecommendation({
-                      statement: accumulated,
-                      status: "APPROVED",
-                      timestamp: Date.now(),
-                    });
-                    setIsProcessingTranscript(false);
-                    streamingSucceeded = true;
-                  }
-                } else if (parsed.event === "final") {
-                  const rec = parsed.data?.recommendation;
-                  if (reqSeq === monotonicReqSeqRef.current && rec) {
-                    setCurrentRecommendation({
-                      statement: rec.statement,
-                      status: rec.status,
-                      timestamp: Date.now(),
-                    });
-                    streamingSucceeded = true;
-                  }
-                } else if (parsed.event === "error") {
-                  throw new Error(parsed.data?.error || "Streaming recommendation failed.");
-                }
-              }
-            }
+        await requestRecommendation(
+          { sessionId, sessionToken, text, startedAt, signal: controller.signal },
+          {
+            onFirstVisible: (result, timing) => {
+              applyResult(result, timing);
+              // Text is on screen; the spinner has done its job.
+              setIsProcessingTranscript(false);
+            },
+            onResult: applyResult,
+            onError: (message) => {
+              if (reqSeq !== monotonicReqSeqRef.current) return;
+              processedSegmentIdsRef.current.delete(segmentId);
+              setErrorMessage(message);
+              setTranscriptionError(message);
+            },
           }
-
-          if (!streamingSucceeded) throw new Error("Streaming response produced no recommendation.");
-        } catch (streamErr: any) {
-          if (streamErr?.name === "AbortError") throw streamErr;
-          console.warn("Streaming recommendation unavailable, falling back:", streamErr?.message || streamErr);
-        }
-
-        // Non-streaming fallback (same approval gate server-side).
-        if (!streamingSucceeded) {
-          const res = await fetch("/api/livekit/transcript", {
-            method: "POST",
-            headers,
-            body,
-            signal: controller.signal,
-          });
-
-          if (!res.ok) {
-            const errData = await res.json().catch(() => ({}));
-            processedSegmentIdsRef.current.delete(segmentId);
-            const message =
-              errData.error || errData.message || `Transcript processing failed (status ${res.status}).`;
-            setErrorMessage(message);
-            setTranscriptionError(message);
-          } else {
-            setTranscriptionError(null);
-            const data = await res.json();
-            if (reqSeq === monotonicReqSeqRef.current && data.recommendation) {
-              setCurrentRecommendation({
-                statement: data.recommendation.statement,
-                status: data.recommendation.status,
-                timestamp: Date.now(),
-              });
-            }
-          }
-        }
+        );
       } catch (txErr: any) {
         if (txErr?.name !== "AbortError") {
           processedSegmentIdsRef.current.delete(segmentId);
@@ -405,6 +471,7 @@ export default function LiveKitSalesRoom({
           setTranscriptionError(message);
         }
       } finally {
+        schedulerRef.current.settle(controller);
         if (reqSeq === monotonicReqSeqRef.current) setIsProcessingTranscript(false);
       }
     },
@@ -412,6 +479,13 @@ export default function LiveKitSalesRoom({
   );
 
   const handleJoinRoom = async () => {
+    // Idempotency guard. The button's `disabled` prop only applies on the next
+    // render, so a fast double activation could otherwise build a SECOND Room
+    // and publish a SECOND microphone track for the same identity - which
+    // sounds like echo/choppy audio on both sides.
+    if (joiningRef.current) return;
+    joiningRef.current = true;
+
     setErrorMessage(null);
     setCallEnded(false);
     setIsConnecting(true);
@@ -502,44 +576,60 @@ export default function LiveKitSalesRoom({
         })
         .on(RoomEvent.ParticipantConnected, () => updateParticipantsList(room, isMicEnabled))
         .on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
-          const el = audioElementsRef.current.get(participant.identity);
-          if (el) {
-            el.remove();
-            audioElementsRef.current.delete(participant.identity);
-          }
+          releaseRemoteAudio(participant.identity);
           updateParticipantsList(room, isMicEnabled);
         })
         .on(
           RoomEvent.TrackSubscribed,
           (track: RemoteTrack, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
-            if (track.kind === Track.Kind.Audio) {
-              const audioElement = track.attach();
-              audioElement.autoplay = true;
-              audioElementsRef.current.set(participant.identity, audioElement);
-            }
+            // Reconciles any element already held for this identity, so a
+            // re-subscribe (reconnect / mic re-publish) can never leave a stale
+            // stream attached and audible.
+            if (track.kind === Track.Kind.Audio) attachRemoteAudio(participant, track);
             updateParticipantsList(room, isMicEnabled);
           }
         )
         .on(
           RoomEvent.TrackUnsubscribed,
           (track: RemoteTrack, _publication: RemoteTrackPublication, participant: RemoteParticipant) => {
-            if (track.kind === Track.Kind.Audio) {
-              track.detach();
-              const el = audioElementsRef.current.get(participant.identity);
-              if (el) {
-                el.remove();
-                audioElementsRef.current.delete(participant.identity);
-              }
-            }
+            if (track.kind === Track.Kind.Audio) releaseRemoteAudio(participant.identity, track);
             updateParticipantsList(room, isMicEnabled);
           }
         )
         .on(RoomEvent.ActiveSpeakersChanged, () => updateParticipantsList(room, isMicEnabled))
         .on(RoomEvent.TrackMuted, () => updateParticipantsList(room, isMicEnabled))
         .on(RoomEvent.TrackUnmuted, () => updateParticipantsList(room, isMicEnabled))
+        .on(RoomEvent.AudioPlaybackStatusChanged, () => {
+          // Autoplay blocked by browser policy: remote audio is silent. Surfaced
+          // so the salesperson can resume it with a tap instead of losing the
+          // prospect's voice silently.
+          setAudioBlocked(!room.canPlaybackAudio);
+        })
+        .on(RoomEvent.ConnectionQualityChanged, (quality: ConnectionQuality, participant: Participant) => {
+          // Transport-health telemetry: timestamps make jitter/reconnect windows
+          // attributable after the fact.
+          console.debug("[lbv] connection quality", {
+            at: Date.now(),
+            identity: participant?.identity ?? "unknown",
+            quality,
+          });
+          if (!participant || participant.identity === room.localParticipant.identity) return;
+          setWorstQuality((prev) => (qualityRank(quality) > qualityRank(prev) ? quality : prev));
+        })
+        .on(RoomEvent.Reconnecting, () => {
+          console.warn("[lbv] LiveKit reconnecting", { at: Date.now() });
+        })
+        .on(RoomEvent.Reconnected, () => {
+          console.info("[lbv] LiveKit reconnected", { at: Date.now() });
+          setWorstQuality(ConnectionQuality.Unknown);
+        })
         .on(RoomEvent.Disconnected, () => {
           setConnectionState(ConnectionState.Disconnected);
           setParticipants([]);
+          // The room is gone: release audio and cancel in-flight work.
+          schedulerRef.current.abortAll();
+          clearRemoteAudio();
+          setAudioBlocked(false);
           onLeft?.();
         });
 
@@ -634,14 +724,15 @@ export default function LiveKitSalesRoom({
       } catch (audioErr) {
         console.warn("Audio autoplay restriction on startAudio:", audioErr);
       }
+      // Report immediately when autoplay was refused, instead of leaving the
+      // salesperson with a silently one-way call.
+      setAudioBlocked(!room.canPlaybackAudio);
 
       // Attach already-subscribed remote audio (prospect joined first).
       room.remoteParticipants.forEach((p) => {
         p.trackPublications.forEach((pub) => {
           if (pub.track && pub.track.kind === Track.Kind.Audio && !audioElementsRef.current.has(p.identity)) {
-            const el = pub.track.attach();
-            el.autoplay = true;
-            audioElementsRef.current.set(p.identity, el);
+            attachRemoteAudio(p, pub.track as RemoteTrack);
           }
         });
       });
@@ -677,6 +768,8 @@ export default function LiveKitSalesRoom({
       setErrorMessage(userFriendlyMessage);
       setIsConnecting(false);
       setConnectionState(ConnectionState.Disconnected);
+    } finally {
+      joiningRef.current = false;
     }
   };
 
@@ -852,6 +945,36 @@ export default function LiveKitSalesRoom({
         </div>
       )}
 
+      {isConnected && audioBlocked && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-[13px] text-warn">
+          <span className="flex items-start gap-3">
+            <Volume2 className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              Your browser blocked audio playback, so the prospect is currently silent for you. Audio is
+              unaffected for the prospect.
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => void enableAudio()}
+            className="rounded-lg border border-warn/50 bg-warn/20 px-3 py-1.5 text-[12px] font-semibold text-warn hover:bg-warn/30 cursor-pointer"
+          >
+            Enable audio
+          </button>
+        </div>
+      )}
+
+      {isConnected && (worstQuality === ConnectionQuality.Poor || worstQuality === ConnectionQuality.Lost) && (
+        <div className="flex items-start gap-3 rounded-lg border border-warn/35 bg-warn/10 px-4 py-3 text-[13px] text-warn">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            The remote connection quality is poor
+            {worstQuality === ConnectionQuality.Lost ? " (connection lost)" : ""}. Expect jitter or brief audio
+            dropouts until the network recovers.
+          </span>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
         {/* Main column */}
         <div className="space-y-5 lg:col-span-8">
@@ -896,6 +1019,22 @@ export default function LiveKitSalesRoom({
               <p className="mt-2 text-[11px] text-ink-mute">
                 Visible only to you. Never published to the prospect's room.
               </p>
+              {recommendationLatency && (
+                <p className="mt-1 font-mono text-[10px] text-ink-mute" data-testid="recommendation-latency">
+                  {recommendationLatency.transcriptToFirstVisibleMs !== null
+                    ? `first guidance in ${(recommendationLatency.transcriptToFirstVisibleMs / 1000).toFixed(1)}s`
+                    : "no guidance for the last utterance"}
+                  {recommendationLatency.usedFallback ? " (fallback)" : ""}
+                  {recommendationLatency.engineMetadata?.latencyMs !== undefined
+                    ? ` · server ${(recommendationLatency.engineMetadata.latencyMs / 1000).toFixed(1)}s` +
+                      (recommendationLatency.engineMetadata.turnsCount !== undefined
+                        ? ` / ${recommendationLatency.engineMetadata.turnsCount} turn${
+                            recommendationLatency.engineMetadata.turnsCount === 1 ? "" : "s"
+                          }`
+                        : "")
+                    : ""}
+                </p>
+              )}
             </div>
           )}
 
